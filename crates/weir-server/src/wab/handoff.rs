@@ -128,7 +128,10 @@ pub(crate) struct HandoffState {
 }
 
 impl HandoffState {
+    // Under `dst` without `test`, the only caller is Task 3.5's bounded-channel
+    // seed family; remove this allowance there.
     #[cfg(any(test, feature = "dst"))]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn new(
         shard_id: u16,
         shutting_down: Arc<AtomicBool>,

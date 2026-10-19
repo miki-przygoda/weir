@@ -28,7 +28,6 @@ pub(crate) trait BlockingClock {
     /// or a closed channel the value comes back inside the error, so the caller
     /// still owns it. Mirrors [`crossbeam_channel::Sender::send_timeout`]. The
     /// flusher's hand-off to the drain is the only caller (`wab::handoff`).
-    #[cfg_attr(not(test), allow(dead_code))] // Task 3.4 routes the flusher's sends here
     fn send_timeout<T>(
         &self,
         tx: &Sender<T>,
@@ -42,7 +41,6 @@ pub(crate) trait BlockingClock {
     /// Monotonic time since an arbitrary epoch. Only differences are
     /// meaningful. The hand-off measures its shutdown budget with it, so the
     /// DST clocks can make that budget virtual and deterministic.
-    #[cfg_attr(not(test), allow(dead_code))] // Task 3.4 routes the flusher's sends here
     fn now(&self) -> Duration;
 }
 

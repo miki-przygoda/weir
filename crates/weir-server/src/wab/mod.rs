@@ -2,10 +2,6 @@ pub(crate) mod cap;
 pub(crate) mod clock;
 #[cfg(any(test, feature = "dst"))]
 pub(crate) mod dst;
-// No production caller until Task 3.4 routes the flusher's three send sites
-// through `hand_off` (and Task 3.5's DST seeds use the detached builders);
-// remove this allowance there.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod handoff;
 pub(crate) mod lock;
 pub(crate) mod recovery;
@@ -37,6 +33,7 @@ use crate::metrics::{Metrics, SegmentState, SegmentStateLabel};
 use crate::models::{AckOutcome, Batch, RecordSlot};
 use crate::status::{ShardRegistry, ShardSlot, SupervisorExit};
 use clock::{BlockingClock, RealClock};
+use handoff::{HandoffConfig, HandoffSite, HandoffState, hand_off};
 use recovery::{check_confirmed, recover_open_segments};
 use segment::{FsSegmentStore, SegmentStore, ShardWriter, WriteFailure};
 use weir_core::Durability;
@@ -394,6 +391,7 @@ pub(crate) fn spawn_flushers(
     metrics: Arc<Metrics>,
     coalesce_hint: Arc<AtomicU64>,
     registry: Arc<ShardRegistry>,
+    handoff: HandoffConfig,
 ) -> io::Result<WabHandle> {
     // One flusher thread per shard.
     let core_ids = core_affinity::get_core_ids().unwrap_or_default();
@@ -418,6 +416,9 @@ pub(crate) fn spawn_flushers(
         let core_id = core_ids.get(shard_id % core_ids.len().max(1)).copied();
         let coalesce_hint_for_flusher = Arc::clone(&coalesce_hint);
         let slot = ShardSlot::new(Arc::clone(&registry), shard_id);
+        // One per flusher THREAD, outside the respawn factory: the shutdown
+        // budget is per flusher, shared by every respawn (wab::handoff).
+        let handoff_for_flusher = handoff.for_shard(shard_id as u16, Arc::clone(&metrics));
 
         let handle = thread::Builder::new()
             .name(format!("wab-flusher-{shard_id}"))
@@ -445,6 +446,7 @@ pub(crate) fn spawn_flushers(
                         let metrics_for_flusher = Arc::clone(&metrics_for_flusher);
                         let coalesce_hint = Arc::clone(&coalesce_hint_for_flusher);
                         let slot = slot.clone();
+                        let handoff = handoff_for_flusher.clone();
                         move || {
                             // Production filesystem backend; the DST harness drives
                             // `flusher_thread` directly with a fault-injecting store.
@@ -467,6 +469,7 @@ pub(crate) fn spawn_flushers(
                                 compression,
                                 compression_level,
                                 &slot,
+                                handoff,
                             )
                         }
                     },
@@ -855,12 +858,14 @@ fn due_timed_seal(
 /// none) — the caller's cue to stop the idle clock until the next write opens a
 /// fresh segment. Returns `false` when the seal failed and the segment is still
 /// active, so the next cycle retries instead of losing the attempt.
-fn seal_before_size_threshold(
+fn seal_before_size_threshold<C: BlockingClock>(
     writer: &mut ShardWriter,
     drain_tx: &Sender<PathBuf>,
     shard_id: u16,
     metrics: &Metrics,
     reason: TimedSeal,
+    clock: &C,
+    handoff: &HandoffState,
 ) -> bool {
     match writer.seal_current() {
         Ok(Some(sealed)) => {
@@ -870,15 +875,18 @@ fn seal_before_size_threshold(
                     state: SegmentState::sealed,
                 })
                 .inc();
-            if let Err(crossbeam_channel::SendError(unsent)) = drain_tx.send(sealed) {
-                error!(
-                    shard = shard_id,
-                    path = %unsent.display(),
-                    reason = reason.as_str(),
-                    "drain channel closed; timed-seal segment not handed off \
-                     (recovered on restart via replay)"
-                );
-            }
+            // Sealed (and fsynced) above; see wab::handoff for why any outcome
+            // of the hand-off leaves this segment's acks true. A segment not
+            // handed off is replayed on the next start.
+            let _ = hand_off(
+                clock,
+                drain_tx,
+                sealed,
+                handoff,
+                HandoffSite::TimedSeal {
+                    reason: reason.as_str(),
+                },
+            );
             true
         }
         Ok(None) => true,
@@ -913,6 +921,7 @@ fn flusher_thread<C: BlockingClock>(
     compression: Compression,
     compression_level: i32,
     slot: &ShardSlot,
+    handoff: HandoffState,
 ) -> FlusherExit {
     // Core affinity (fail-open: log and continue if denied)
     if let Some(id) = core_id
@@ -1034,6 +1043,8 @@ fn flusher_thread<C: BlockingClock>(
                         shard_id,
                         &metrics,
                         &coalesce_hint,
+                        clock,
+                        &handoff,
                     );
                     record_count = 0;
                     last_write_at = Some(Instant::now());
@@ -1054,6 +1065,8 @@ fn flusher_thread<C: BlockingClock>(
                             shard_id,
                             &metrics,
                             reason,
+                            clock,
+                            &handoff,
                         )
                     {
                         last_write_at = None;
@@ -1083,6 +1096,8 @@ fn flusher_thread<C: BlockingClock>(
             shard_id,
             &metrics,
             &coalesce_hint,
+            clock,
+            &handoff,
         );
         record_count = 0;
         // Records just hit the active segment — restart the idle-seal clock.
@@ -1108,7 +1123,15 @@ fn flusher_thread<C: BlockingClock>(
                 segment_max_lifetime,
                 writer.active_segment_age(),
             )
-            && seal_before_size_threshold(&mut writer, &drain_tx, shard_id, &metrics, reason)
+            && seal_before_size_threshold(
+                &mut writer,
+                &drain_tx,
+                shard_id,
+                &metrics,
+                reason,
+                clock,
+                &handoff,
+            )
         {
             last_write_at = None;
         }
@@ -1124,9 +1147,16 @@ fn flusher_thread<C: BlockingClock>(
                     state: SegmentState::sealed,
                 })
                 .inc();
-            if let Err(crossbeam_channel::SendError(unsent)) = drain_tx.send(sealed) {
-                warn!(shard = shard_id, sealed = %unsent.display(), "drain channel closed on shutdown; sealed segment is durable and will be delivered on restart");
-            }
+            // Bounded once shutting_down is set (spec §5.5): a full channel
+            // gives up after FINAL_HANDOFF_TIMEOUT and the segment, sealed and
+            // fsynced above, is replayed on the next start.
+            let _ = hand_off(
+                clock,
+                &drain_tx,
+                sealed,
+                &handoff,
+                HandoffSite::ShutdownSeal,
+            );
         }
         Ok(None) => {
             info!(
@@ -1141,13 +1171,16 @@ fn flusher_thread<C: BlockingClock>(
     FlusherExit::InputClosed
 }
 
-fn flush_batch(
+#[allow(clippy::too_many_arguments)]
+fn flush_batch<C: BlockingClock>(
     writer: &mut ShardWriter,
     batches: &mut Vec<Batch>,
     drain_tx: &Sender<PathBuf>,
     shard_id: u16,
     metrics: &Arc<Metrics>,
     coalesce_hint: &Arc<AtomicU64>,
+    clock: &C,
+    handoff: &HandoffState,
 ) {
     // Every Durable record rides a single group fsync at the end of the
     // flush (the per-record fsync was the herd-benchmark bottleneck). Their acks
@@ -1260,9 +1293,9 @@ fn flush_batch(
                         state: SegmentState::sealed,
                     })
                     .inc();
-                if let Err(crossbeam_channel::SendError(unsent)) = drain_tx.send(sealed) {
-                    warn!(shard = shard_id, sealed = %unsent.display(), "drain channel closed; sealed segment is durable and will be delivered on restart");
-                }
+                // INVARIANT (wab::handoff): hand off BEFORE promoting the acks
+                // below, and only a path the seal (with its fsync) returned.
+                let _ = hand_off(clock, drain_tx, sealed, handoff, HandoffSite::Rotation);
                 durable_acks.append(&mut pending_acks);
                 #[cfg(feature = "bench-trace")]
                 durable_ts.append(&mut pending_ts);
@@ -2345,6 +2378,7 @@ mod tests {
             Compression::None,
             1,
             &slot,
+            handoff::HandoffState::detached(0, Arc::new(crate::metrics::Metrics::new().0)),
         );
         assert_eq!(exit, FlusherExit::CounterScanFailed);
         assert_eq!(
@@ -2378,6 +2412,7 @@ mod tests {
             Compression::None,
             1,
             &slot,
+            handoff::HandoffState::detached(0, Arc::new(crate::metrics::Metrics::new().0)),
         );
         assert_eq!(exit, FlusherExit::InputClosed);
         assert_eq!(slot.registry().state(0), ShardState::Up);
@@ -2557,6 +2592,290 @@ mod tests {
         assert!(
             err.is_err(),
             "startup replay must not skip a shard it cannot list"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    // ── Hand-off tests A and B (spec §15) ─────────────────────────────────────
+
+    fn durable_unit(
+        payload: Vec<u8>,
+        ack_tx: oneshot::Sender<AckOutcome>,
+    ) -> crate::models::WorkUnit {
+        crate::models::WorkUnit {
+            shard_id: 0,
+            payload: weir_core::Payload::from(payload),
+            durability: Durability::Durable,
+            wants_coordinate: false,
+            ack_tx,
+            #[cfg(feature = "bench-trace")]
+            enqueued_at: Instant::now(),
+        }
+    }
+
+    /// One batch of `n` 32-byte Durable records, then the work channel closes,
+    /// so the flusher writes, group-fsyncs, acks, then runs its shutdown seal
+    /// and the final hand-off.
+    fn one_batch_then_close(n: u8) -> (Receiver<Batch>, Vec<oneshot::Receiver<AckOutcome>>) {
+        let (work_tx, work_rx) = crossbeam_channel::bounded::<Batch>(4);
+        let mut acks = Vec::new();
+        let mut units = Vec::new();
+        for i in 0..n {
+            let (tx, rx) = oneshot::channel();
+            acks.push(rx);
+            units.push(durable_unit(vec![i; 32], tx));
+        }
+        work_tx
+            .send(Batch {
+                shard_id: 0,
+                records: units,
+                #[cfg(feature = "bench-trace")]
+                flushed_at: Instant::now(),
+            })
+            .unwrap();
+        drop(work_tx);
+        (work_rx, acks)
+    }
+
+    /// The real flusher on the real filesystem with `RealClock`. PR 1's shard
+    /// slot is `ShardSlot::detached()`, as at the DST call sites.
+    fn run_real_flusher(
+        shard_dir: PathBuf,
+        work_rx: Receiver<Batch>,
+        drain_tx: Sender<PathBuf>,
+        segment_max_bytes: u64,
+        metrics: Arc<Metrics>,
+        handoff: handoff::HandoffState,
+    ) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            let _ = flusher_thread(
+                0,
+                shard_dir,
+                work_rx,
+                drain_tx,
+                64,
+                Duration::from_millis(5),
+                segment_max_bytes,
+                None,
+                None,
+                None,
+                metrics,
+                Arc::new(AtomicU64::new(200)),
+                &RealClock,
+                Arc::new(FsSegmentStore),
+                Compression::None,
+                1,
+                &ShardSlot::detached(),
+                handoff,
+            );
+        })
+    }
+
+    /// One `reason` series of `weir_wab_segments_not_handed_off_total` (README Q7).
+    fn not_handed_off_for(metrics: &Metrics, reason: crate::metrics::NotHandedOffReason) -> u64 {
+        metrics
+            .wab_segments_not_handed_off
+            .get_or_create(&crate::metrics::NotHandedOffLabel { reason })
+            .get()
+    }
+
+    fn sealed_files(shard_dir: &Path) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = fs::read_dir(shard_dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.to_string_lossy().ends_with(EXT_SEALED))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Test A: a full bounded(1) channel nobody consumes, flag already set.
+    /// The flusher returns within ~1 s; its segment is sealed with a valid
+    /// footer; every ack resolves true (they were fsynced before the hand-off).
+    #[test]
+    fn hand_off_test_a_full_channel_and_flag_already_set_returns_within_the_budget() {
+        let dir = tmp_dir("handoff_a");
+        let sd = shard_dir_path(&dir, 0);
+        crate::testutil::mkdir_p(&sd);
+        let metrics = Arc::new(Metrics::new().0);
+        let (drain_tx, drain_rx) = crossbeam_channel::bounded::<PathBuf>(1);
+        drain_tx.send(PathBuf::from("prefill")).unwrap();
+        let handoff = handoff::HandoffState::new(
+            0,
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            None,
+            Arc::clone(&metrics),
+        );
+        let (work_rx, acks) = one_batch_then_close(5);
+
+        let t0 = Instant::now();
+        run_real_flusher(
+            sd.clone(),
+            work_rx,
+            drain_tx,
+            64 * 1024 * 1024,
+            Arc::clone(&metrics),
+            handoff,
+        )
+        .join()
+        .unwrap();
+        let took = t0.elapsed();
+
+        assert!(
+            took >= Duration::from_millis(900) && took < Duration::from_millis(1700),
+            "the final hand-off must give up after the 1 s budget, took {took:?}"
+        );
+        for (i, mut rx) in acks.into_iter().enumerate() {
+            assert!(
+                rx.try_recv().unwrap().durable,
+                "record {i}: acks precede and do not depend on the hand-off"
+            );
+        }
+        let sealed = sealed_files(&sd);
+        assert_eq!(sealed.len(), 1);
+        assert_eq!(read_segment_record_count(&sealed[0]).unwrap(), 5);
+        assert_eq!(SegmentReader::open(&sealed[0]).unwrap().count(), 5);
+        assert_eq!(
+            not_handed_off_for(&metrics, crate::metrics::NotHandedOffReason::budget),
+            1
+        );
+        assert_eq!(
+            metrics.wab_segments_not_handed_off_total(),
+            1,
+            "budget only, nothing disconnected"
+        );
+        assert_eq!(
+            drain_rx.try_iter().collect::<Vec<_>>(),
+            vec![PathBuf::from("prefill")]
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// Test B: the same channel, but the flag is raised 500 ms AFTER the
+    /// flusher blocked: the blocked send re-reads it within one slice.
+    #[test]
+    fn hand_off_test_b_a_flag_raised_while_blocked_bounds_the_join() {
+        let dir = tmp_dir("handoff_b");
+        let sd = shard_dir_path(&dir, 0);
+        crate::testutil::mkdir_p(&sd);
+        let metrics = Arc::new(Metrics::new().0);
+        let (drain_tx, _drain_rx) = crossbeam_channel::bounded::<PathBuf>(1);
+        drain_tx.send(PathBuf::from("prefill")).unwrap();
+        let flag = Arc::new(AtomicBool::new(false));
+        let handoff = handoff::HandoffState::new(
+            0,
+            Arc::clone(&flag),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            None,
+            Arc::clone(&metrics),
+        );
+        let (work_rx, acks) = one_batch_then_close(3);
+
+        let t0 = Instant::now();
+        let flusher = run_real_flusher(
+            sd.clone(),
+            work_rx,
+            drain_tx,
+            64 * 1024 * 1024,
+            Arc::clone(&metrics),
+            handoff,
+        );
+        thread::sleep(Duration::from_millis(500));
+        assert!(
+            !flusher.is_finished(),
+            "outside shutdown the hand-off must keep blocking"
+        );
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        flusher.join().unwrap();
+        let took = t0.elapsed();
+
+        assert!(
+            took >= Duration::from_millis(1400) && took < Duration::from_millis(2400),
+            "≈500 ms + 1 s budget (+ ≤ one slice), took {took:?}"
+        );
+        for mut rx in acks {
+            assert!(rx.try_recv().unwrap().durable);
+        }
+        assert_eq!(sealed_files(&sd).len(), 1);
+        assert_eq!(
+            not_handed_off_for(&metrics, crate::metrics::NotHandedOffReason::budget),
+            1
+        );
+        assert_eq!(metrics.wab_segments_not_handed_off_total(), 1);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// Rotation goes through the hand-off too, and the shard's blocked marker
+    /// is set while it waits and cleared when the slow drain catches up.
+    #[test]
+    fn a_rotation_waits_out_a_slow_drain_and_marks_then_clears_the_shard() {
+        #[derive(Default)]
+        struct Marks(std::sync::Mutex<Vec<(u16, u64)>>);
+        impl handoff::HandoffMarker for Marks {
+            fn set_handoff_blocked_since_ms(&self, shard: u16, ms: u64) {
+                self.0.lock().unwrap().push((shard, ms));
+            }
+        }
+        let dir = tmp_dir("handoff_rotation");
+        let sd = shard_dir_path(&dir, 0);
+        crate::testutil::mkdir_p(&sd);
+        let metrics = Arc::new(Metrics::new().0);
+        let (drain_tx, drain_rx) = crossbeam_channel::bounded::<PathBuf>(1);
+        drain_tx.send(PathBuf::from("prefill")).unwrap();
+        let marks = Arc::new(Marks::default());
+        let handoff = handoff::HandoffState::new(
+            0,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            Some(Arc::clone(&marks) as Arc<dyn handoff::HandoffMarker>),
+            Arc::clone(&metrics),
+        );
+        // 32-byte records over a 100-byte segment rotate every second record.
+        let (work_rx, acks) = one_batch_then_close(4);
+        let consumer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(350));
+            drain_rx.iter().collect::<Vec<_>>()
+        });
+        run_real_flusher(
+            sd.clone(),
+            work_rx,
+            drain_tx,
+            100,
+            Arc::clone(&metrics),
+            handoff,
+        )
+        .join()
+        .unwrap();
+        let delivered = consumer.join().unwrap();
+
+        assert_eq!(
+            metrics.wab_segments_not_handed_off_total(),
+            0,
+            "outside shutdown nothing is given up"
+        );
+        let sealed = sealed_files(&sd);
+        assert!(
+            sealed.len() >= 2,
+            "the 100-byte segment must rotate at least once before the shutdown seal: {sealed:?}"
+        );
+        assert_eq!(
+            delivered.len(),
+            1 + sealed.len(),
+            "prefill + every sealed segment"
+        );
+        for mut rx in acks {
+            assert!(rx.try_recv().unwrap().durable);
+        }
+        let marks = marks.0.lock().unwrap().clone();
+        assert!(
+            marks.first().is_some_and(|(s, ms)| *s == 0 && *ms > 0),
+            "{marks:?}"
+        );
+        assert_eq!(
+            marks.last(),
+            Some(&(0, 0)),
+            "the marker must end cleared: {marks:?}"
         );
         fs::remove_dir_all(dir).ok();
     }

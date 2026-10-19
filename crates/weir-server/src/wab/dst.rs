@@ -972,6 +972,7 @@ fn drive_sync_flusher_with(
 
     let shard_dir = env.shard_dir(0);
     let metrics = Arc::clone(&env.metrics);
+    let handoff = super::handoff::HandoffState::detached(0, Arc::clone(&env.metrics));
     let handle = std::thread::spawn(move || {
         super::flusher_thread(
             0,
@@ -991,6 +992,7 @@ fn drive_sync_flusher_with(
             compression,
             1,
             &crate::status::ShardSlot::detached(),
+            handoff,
         );
     });
     handle.join().expect("flusher thread join");
@@ -1194,6 +1196,7 @@ fn run_panic_during_flush(
     let ledger_for_store = ledger.clone();
     let clock = SimClock::new();
     let slot = crate::status::ShardSlot::detached();
+    let handoff = super::handoff::HandoffState::detached(0, Arc::clone(&env.metrics));
 
     let handle = std::thread::spawn(move || {
         // Mirror production: the flusher body runs under panic supervision, which
@@ -1211,6 +1214,7 @@ fn run_panic_during_flush(
             ));
             let clock = clock.clone();
             let slot = slot.clone();
+            let handoff = handoff.clone();
             move || {
                 super::flusher_thread(
                     0,
@@ -1230,6 +1234,7 @@ fn run_panic_during_flush(
                     compression,
                     1,
                     &slot,
+                    handoff,
                 )
             }
         });
@@ -1524,6 +1529,7 @@ fn run_interleaved_flush(
     let sched_f = Arc::clone(&sched);
     let shard_dir = env.shard_dir(0);
     let metrics = Arc::clone(&env.metrics);
+    let handoff = super::handoff::HandoffState::detached(0, Arc::clone(&env.metrics));
     let flusher = std::thread::spawn(move || {
         let clock = SchedClock {
             sched: Arc::clone(&sched_f),
@@ -1549,6 +1555,7 @@ fn run_interleaved_flush(
             compression,
             1,
             &crate::status::ShardSlot::detached(),
+            handoff,
         );
         sched_f.finish(FLUSHER);
     });
@@ -1731,6 +1738,7 @@ mod tests {
 
         let shard_dir = env.shard_dir(0);
         let metrics = Arc::clone(&env.metrics);
+        let handoff = crate::wab::handoff::HandoffState::detached(0, Arc::clone(&env.metrics));
         let handle = std::thread::spawn(move || {
             crate::wab::flusher_thread(
                 0,
@@ -1750,6 +1758,7 @@ mod tests {
                 Compression::None,
                 1,
                 &crate::status::ShardSlot::detached(),
+                handoff,
             );
         });
         handle.join().expect("flusher join");

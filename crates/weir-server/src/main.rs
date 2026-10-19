@@ -474,6 +474,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         elapsed_ms = recovery.elapsed.as_millis() as u64,
         "WAB recovery complete"
     );
+    // The flushers' shutdown flag (spec §5.5). The Lifecycle (PR 4) owns it and
+    // sets it at T0; until then nothing sets it, so every hand-off behaves as
+    // the blocking send it replaces.
+    let flushers_shutting_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let handoff = wab::handoff::HandoffConfig {
+        shutting_down: Arc::clone(&flushers_shutting_down),
+        drain_depth: Arc::clone(&board.drain_depth),
+        marker: Some(Arc::clone(&board) as Arc<dyn wab::handoff::HandoffMarker>),
+    };
     // The status board's shard registry: flusher supervisors and worker drop
     // guards record each shard's and worker's state on it (spec §5.3).
     let wab_handle = wab::spawn_flushers(
@@ -483,6 +492,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&metrics),
         Arc::clone(&coalesce_hint),
         Arc::clone(&board.shards),
+        handoff,
     )?;
 
     // ── Workers (queue → per-shard Batch channels → flusher directly) ────────
