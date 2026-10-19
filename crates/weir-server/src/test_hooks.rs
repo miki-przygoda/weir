@@ -68,9 +68,6 @@ pub(crate) fn warn_if_compiled_in() {
 
 /// `WEIR_TEST_STARTUP_DELAY_MS`: how long main sleeps at the start of the
 /// `recovering` phase, so a test can observe it.
-// Called from the observable-startup restructure (PR 4 Task 4.10, step 8);
-// remove this allowance there.
-#[allow(dead_code)]
 #[inline]
 pub(crate) fn startup_delay() -> Option<Duration> {
     #[cfg(feature = "test-hooks")]

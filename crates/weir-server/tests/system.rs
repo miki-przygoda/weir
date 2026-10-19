@@ -3163,36 +3163,55 @@ fn lock_file_stolen_by_second_daemon_fails_closed() {
     let _ = fs::remove_dir_all(&b_tmp);
 }
 
-/// conf-durability-3: the integrity check must run through the whole startup,
-/// not only once the runtime is up. During a long startup replay the daemon
-/// has bound neither its socket nor its metrics port, so a second daemon with
-/// an identical config would pass preflight; if the lock file is deleted then,
-/// that daemon takes a fresh lock and starts a second drain over the same
-/// backlog. The first daemon must see it within a tick and exit 3, before it
-/// ever serves.
-///
-/// The replay is held with the black-hole sink of
-/// `sighup_during_startup_replay_is_ignored`: a 300-segment backlog, a sink
-/// that accepts and never answers, `sink_timeout_secs = 300`.
-#[test]
-fn lock_stolen_during_startup_replay_fails_closed_before_serving() {
-    const TOTAL: usize = 300;
-    let wab = std::env::temp_dir().join(format!("weir_sys_lock_replay_{}", std::process::id()));
-    let _ = fs::remove_dir_all(&wab);
-    fs::create_dir_all(&wab).unwrap();
-    seed_sealed_backlog("lock_replay_seed", &wab);
-    pad_sealed_backlog(&wab, TOTAL);
+/// A fresh, empty wab_dir outside the harness temp dir, so it survives a
+/// restart with a second `WeirServer`.
+fn fresh_wab_dir(tag: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("weir_sys_{tag}_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&d);
+    fs::create_dir_all(&d).unwrap();
+    d
+}
 
-    let hole = RecordingSink::start_hanging();
-    let mut srv_a = weir_server!("lock_replay_a")
+/// Polls `/metrics` until `weir_startup_phase{phase="recovering"}` reads 1, or
+/// panics after `within`. The test-hooks startup delay holds the phase.
+#[cfg(feature = "test-hooks")]
+fn wait_for_phase_recovering(srv: &weir_testkit::WeirServer, within: Duration) {
+    let t0 = Instant::now();
+    loop {
+        if let Some(b) = srv.try_scrape_metrics()
+            && parse_metric_f64(&b, "weir_startup_phase{phase=\"recovering\"} ") == 1.0
+        {
+            return;
+        }
+        assert!(
+            t0.elapsed() < within,
+            "never observed phase recovering\nlog:\n{}",
+            read_log(srv)
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// conf-durability-3, after Foundations §6: the lock-integrity thread runs
+/// from acquisition to exit, so a steal while recovery is still running (A is
+/// held in `recovering` by the test-hooks startup delay) is seen within a
+/// tick: A exits 3 and never binds or serves its producer socket. Replaces
+/// `lock_stolen_during_startup_replay_fails_closed_before_serving`, whose
+/// blocking replay no longer exists. B gets its own socket and metrics port
+/// (`steal_wab_dir_lock`), so A's early `/metrics` bind does not refuse it.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn lock_stolen_during_startup_recovery_fails_closed_before_serving() {
+    let wab = fresh_wab_dir("lock_recovery");
+    let mut srv_a = weir_server!("lock_recovery_a")
         .wab_dir(&wab)
-        .extra_config("sink_type = \"http\"\nsink_timeout_secs = 300")
-        .env("WEIR_SINK_URL", hole.url())
+        .env("WEIR_TEST_HOOKS", "1")
+        .env("WEIR_TEST_STARTUP_DELAY_MS", "10000")
         .log_level("info")
         .spawn();
-    wait_for_blocked_replay(&srv_a, &hole, TOTAL);
+    wait_for_phase_recovering(&srv_a, Duration::from_secs(5));
 
-    let (mut child_b, b_tmp) = steal_wab_dir_lock("lock_replay_b", &wab);
+    let (mut child_b, b_tmp) = steal_wab_dir_lock("lock_recovery_b", &wab);
     let b_pid = child_b.id();
     let status = srv_a.wait_for_exit(Duration::from_secs(10));
     let _ = child_b.kill();
@@ -3200,23 +3219,22 @@ fn lock_stolen_during_startup_replay_fails_closed_before_serving() {
     let log_a = read_log(&srv_a);
     let Some(status) = status else {
         panic!(
-            "A is still running 10 s after B took its wab_dir during A's startup replay \
-             (the integrity check is not running yet)\nA log:\n{log_a}"
+            "A is still running 10 s after B took its wab_dir during A's recovery \
+             (the integrity thread is not running yet)\nA log:\n{log_a}"
         );
     };
-
     assert_eq!(
         status.code(),
         Some(3),
-        "proven ownership loss during the replay exits 3 (got {status})\nA log:\n{log_a}"
+        "proven ownership loss during recovery exits 3 (got {status})\nA log:\n{log_a}"
     );
     assert!(
-        !replay_handed_off(&log_a),
-        "the steal must have landed while the replay was still blocked\nA log:\n{log_a}"
-    );
-    assert!(
-        !log_a.contains("metrics endpoint listening"),
+        !log_a.contains("weir serving"),
         "A must exit before it serves anything\nA log:\n{log_a}"
+    );
+    assert!(
+        !srv_a.socket_path.exists(),
+        "A never bound its producer socket\nA log:\n{log_a}"
     );
     assert!(
         log_a.contains("CRITICAL")
@@ -3225,7 +3243,6 @@ fn lock_stolen_during_startup_replay_fails_closed_before_serving() {
         "A's CRITICAL line must name B (pid {b_pid})\nA log:\n{log_a}"
     );
 
-    drop(hole);
     drop(srv_a);
     let _ = fs::remove_dir_all(&b_tmp);
     let _ = fs::remove_dir_all(&wab);
@@ -3364,119 +3381,6 @@ fn pad_sealed_backlog(wab_dir: &Path, total: usize) -> usize {
     total
 }
 
-/// `wab::scan_replay` logs this once per backlog segment, all of them before
-/// the replay sends the first one, so the count says how much the scan found,
-/// not how far the sends got.
-fn replay_queued(log: &str) -> usize {
-    log.matches("queuing segment for drain replay").count()
-}
-
-/// `wab::replay_unconfirmed` logs this once its last send returned: the replay
-/// phase is over. Its absence while the daemon runs means the replay is still
-/// handing segments to the drain.
-const REPLAY_HANDED_OFF: &str = "startup replay handed to the drain";
-
-fn replay_handed_off(log: &str) -> bool {
-    log.contains(REPLAY_HANDED_OFF)
-}
-
-/// Waits until the startup replay of a `total`-segment backlog is blocked
-/// behind `hole`: the scan has queued the whole backlog, the drain holds a hung
-/// request, and the replay has not finished its sends. With `total` above the
-/// drain channel's capacity (256) plus the one segment the drain holds, the
-/// replay cannot finish while the sink hangs, so from here it stays blocked
-/// until `hole` is dropped.
-fn wait_for_blocked_replay(srv: &weir_testkit::WeirServer, hole: &RecordingSink, total: usize) {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let log = read_log(srv);
-        let queued = replay_queued(&log);
-        assert!(
-            !replay_handed_off(&log),
-            "the replay finished instead of blocking (queued {queued} of {total})\nlog:\n{log}"
-        );
-        if queued == total && hole.connections() > 0 {
-            return;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the replay never blocked (queued {queued} of {total}, sink connections {})\nlog:\n{log}",
-            hole.connections()
-        );
-        thread::sleep(Duration::from_millis(250));
-    }
-}
-
-/// spec §3.2 test 3 (revised): a HUP while `replay_unconfirmed` is blocked,
-/// before the runtime (and so before any tokio handler) exists, must be
-/// ignored.
-///
-/// The sink is a black hole that accepts and never answers, with the maximum
-/// `sink_timeout_secs`, so the drain sits in its first `commit` and stops
-/// taking segments. A backlog larger than the drain channel (256) plus that one
-/// then blocks the replay on its send. A connection-refused sink would not do:
-/// it fails fast and the drain's retry wait pulls the channel into `pending`,
-/// so the replay never blocks.
-#[test]
-fn sighup_during_startup_replay_is_ignored() {
-    const TOTAL: usize = 300;
-    let wab = std::env::temp_dir().join(format!("weir_sys_hup_replay_{}", std::process::id()));
-    let _ = fs::remove_dir_all(&wab);
-    fs::create_dir_all(&wab).unwrap();
-    seed_sealed_backlog("hup_replay_seed", &wab);
-    pad_sealed_backlog(&wab, TOTAL);
-
-    let hole = RecordingSink::start_hanging();
-    let mut srv = weir_server!("hup_replay")
-        .wab_dir(&wab)
-        .extra_config("sink_type = \"http\"\nsink_timeout_secs = 300")
-        .env("WEIR_SINK_URL", hole.url())
-        .log_level("info")
-        .spawn();
-    wait_for_blocked_replay(&srv, &hole, TOTAL);
-
-    send_sighup(srv.child_pid());
-    if let Some(status) = srv.wait_for_exit(Duration::from_millis(300)) {
-        panic!(
-            "a SIGHUP during the replay killed the daemon ({status})\nlog:\n{}",
-            read_log(&srv)
-        );
-    }
-    // The HUP landed in the replay phase: it was still blocked afterwards, and
-    // the runtime (whose first act is the metrics bind) did not exist yet.
-    let log = read_log(&srv);
-    assert!(
-        !replay_handed_off(&log),
-        "the replay must still be blocked after the HUP\nlog:\n{log}"
-    );
-    assert!(
-        !log.contains("metrics endpoint listening"),
-        "the HUP must land before the runtime\nlog:\n{log}"
-    );
-
-    // Close the black hole: the hung commit fails, the drain's retry wait
-    // drains the channel, the replay finishes and the socket binds.
-    drop(hole);
-    srv.wait_ready(Duration::from_secs(30));
-    assert_alive_and_acking(&mut srv, "the SIGHUP during the replay");
-    let log = read_log(&srv);
-    assert_eq!(
-        replay_queued(&log),
-        TOTAL,
-        "the whole backlog must be queued"
-    );
-    assert!(
-        log.contains(&format!("{REPLAY_HANDED_OFF} segments={TOTAL}")),
-        "the whole backlog must be handed to the drain\nlog:\n{log}"
-    );
-    assert!(
-        !log.contains("SIGHUP received"),
-        "a HUP before the runtime is dropped, not served late\nlog:\n{log}"
-    );
-    drop(srv);
-    let _ = fs::remove_dir_all(&wab);
-}
-
 /// The per-segment "recovery complete sealed=<path>" lines of
 /// `recover_open_segments`, one per unsealed segment it sealed. The `sealed=`
 /// field keeps `wab::recover`'s one-off "WAB recovery complete" summary out of
@@ -3485,10 +3389,12 @@ fn segments_recovered(log: &str) -> usize {
     log.matches("recovery complete sealed=").count()
 }
 
-/// spec §3.2, the recovery-phase variant: a HUP while `recover_open_segments`
-/// is sealing a pile of unsealed segments, long before the runtime exists.
+/// spec §3.2, the recovery-phase variant, after Foundations §6: the runtime
+/// and its SIGHUP handler now exist BEFORE recovery, so a HUP while
+/// `wab::recover` is sealing a pile of unsealed segments is served as a
+/// (noop) reload instead of being dropped, and recovery is not disturbed.
 #[test]
-fn sighup_during_startup_recovery_is_ignored() {
+fn sighup_during_startup_recovery_is_served() {
     const TOTAL: usize = 400;
     let wab = std::env::temp_dir().join(format!("weir_sys_hup_recov_{}", std::process::id()));
     let _ = fs::remove_dir_all(&wab);
@@ -3532,8 +3438,8 @@ fn sighup_during_startup_recovery_is_ignored() {
         thread::sleep(Duration::from_millis(1));
     }
     send_sighup(srv.child_pid());
-    // An ignored signal is discarded when it is sent, so a log read now that
-    // still shows recovery unfinished proves the HUP landed during it.
+    // A log read now that still shows recovery unfinished proves the HUP
+    // landed during it.
     let log = read_log(&srv);
     let done = segments_recovered(&log);
     assert!(
@@ -3555,8 +3461,150 @@ fn sighup_during_startup_recovery_is_ignored() {
             .any(|l| l.contains("WAB recovery complete") && l.contains("quarantined=0 failed=0")),
         "recovery must report no quarantined or failed segment\nlog:\n{log}"
     );
+    assert_eq!(
+        wait_for_sighup_reloads(&srv, "noop", 1),
+        1,
+        "the HUP during recovery is served exactly once (it used to be dropped)"
+    );
     drop(srv);
     let _ = fs::remove_dir_all(&wab);
+}
+
+// ── Observable startup (Foundations §6) ───────────────────────────────────────
+
+/// Spec §16 system test 2: the metrics listener answers DURING recovery,
+/// before the producer socket exists, and reports the phase.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn metrics_answer_during_recovery_before_the_socket_binds() {
+    let mut srv = weir_server!("startup_recovering")
+        .env("WEIR_TEST_HOOKS", "1")
+        .env("WEIR_TEST_STARTUP_DELAY_MS", "3000")
+        .spawn();
+    let t0 = Instant::now();
+    let body = loop {
+        if let Some(b) = srv.try_scrape_metrics() {
+            break b;
+        }
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "/metrics must answer within 2 s of start, during recovery\nlog:\n{}",
+            read_log(&srv)
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        parse_metric_f64(&body, "weir_startup_phase{phase=\"recovering\"} "),
+        1.0,
+        "{body}"
+    );
+    assert!(
+        !srv.socket_path.exists(),
+        "the producer socket must not exist before recovery has finished"
+    );
+    srv.wait_ready(Duration::from_secs(15));
+    let body = srv.scrape_metrics();
+    assert_eq!(
+        parse_metric_f64(&body, "weir_startup_phase{phase=\"serving\"} "),
+        1.0
+    );
+    srv.shutdown();
+}
+
+/// Spec §16 system test 1: a 300-segment backlog behind a 100 ms/POST sink
+/// (README Q13) does not hold the producer socket: it accepts within 3 s while
+/// nearly the whole backlog is still undelivered (`sink_http_concurrency = 1`
+/// and the sink's delay is a floor: ~3 records per segment is ~300 ms per
+/// segment, so at most ~10 segments can be delivered in those 3 s on any
+/// machine), a live push is acked, and a SIGHUP in that window is served (the
+/// runtime now exists before recovery). Everything is delivered eventually
+/// (~90 s).
+#[test]
+fn a_slow_sink_backlog_does_not_delay_the_producer_socket() {
+    const TOTAL: usize = 300;
+    let wab = fresh_wab_dir("backlog_socket");
+    seed_sealed_backlog("backlog_socket_seed", &wab);
+    pad_sealed_backlog(&wab, TOTAL);
+    let sink = RecordingSink::start_slow(Duration::from_millis(100));
+    let mut srv = weir_server!("backlog_socket")
+        .wab_dir(&wab)
+        .extra_config("sink_type = \"http\"\nsink_http_concurrency = 1")
+        .env("WEIR_SINK_URL", sink.url())
+        .log_level("info")
+        .spawn();
+    let t0 = Instant::now();
+    srv.wait_ready(Duration::from_secs(3));
+    let ready_after = t0.elapsed();
+    let undelivered = count_wab_files(&wab, ".wab.sealed");
+    assert!(
+        undelivered > 250,
+        "the socket must accept while the backlog is still undelivered: only {undelivered} \
+         of {TOTAL} left after {ready_after:?}"
+    );
+    srv.client()
+        .push(b"live-during-backlog", Durability::Durable)
+        .expect("a live push must ack while the backlog drains");
+    send_sighup(srv.child_pid());
+    assert!(
+        wait_for_sighup_reloads(&srv, "noop", 1) >= 1,
+        "a HUP during the backlog must be served as a reload, not dropped"
+    );
+    let deadline = Instant::now() + Duration::from_secs(150);
+    while count_wab_files(&wab, ".wab.sealed") > 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the backlog was not delivered: {} sealed left",
+            count_wab_files(&wab, ".wab.sealed")
+        );
+        thread::sleep(Duration::from_millis(250));
+    }
+    srv.shutdown();
+    assert!(
+        sink.bodies()
+            .iter()
+            .any(|b| b.as_slice() == b"live-during-backlog"),
+        "the live record must be delivered too"
+    );
+    let _ = fs::remove_dir_all(&wab);
+}
+
+/// Spec §6 "A signal before serving": SIGTERM while recovery runs lets the
+/// step finish, never binds or serves the producer socket, and exits 0
+/// within the bound. Before this test only the chaos campaign (PR 9,
+/// `sigterm_in_recovery`) exercised this path.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn sigterm_during_recovery_exits_zero_without_ever_serving() {
+    let mut srv = weir_server!("sigterm_recovering")
+        .env("WEIR_TEST_HOOKS", "1")
+        .env("WEIR_TEST_STARTUP_DELAY_MS", "2000")
+        .log_level("info")
+        .spawn();
+    wait_for_phase_recovering(&srv, Duration::from_secs(5));
+    srv.signal(libc::SIGTERM);
+    // §6: a SECOND signal during recovery is logged and forces, but recovery
+    // still finishes and the joins still run.
+    thread::sleep(Duration::from_millis(200));
+    srv.signal(libc::SIGTERM);
+    let status = srv
+        .wait_for_exit(Duration::from_secs(2 + 10 + 6))
+        .unwrap_or_else(|| panic!("a pre-serving shutdown must exit\nlog:\n{}", read_log(&srv)));
+    assert!(status.success(), "{status}");
+    assert!(
+        !srv.socket_path.exists(),
+        "the producer socket was never served, so no socket file may remain"
+    );
+    let log = read_log(&srv);
+    assert!(!log.contains("weir serving"), "{log}");
+    assert!(log.contains("shutdown requested during startup"), "{log}");
+    assert!(
+        log.contains("forced shutdown"),
+        "the second signal must force\n{log}"
+    );
+    assert!(
+        log.contains("WAB recovery complete"),
+        "a forced shutdown must not interrupt recovery\n{log}"
+    );
 }
 
 // ── File descriptor limit exhaustion ─────────────────────────────────────────
