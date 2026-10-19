@@ -11,6 +11,7 @@ pub mod codes;
 pub mod condition;
 pub mod config;
 pub mod evidence;
+mod probe;
 mod rules;
 pub mod segment;
 mod summary;
@@ -23,5 +24,6 @@ pub use codes::{
 pub use condition::*;
 pub use config::{ConfigValue, PublicConfig};
 pub use evidence::*;
+pub use probe::*;
 pub use rules::evaluate;
 pub use segment::SegmentId;
