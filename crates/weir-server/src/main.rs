@@ -22,6 +22,10 @@ mod test_hooks;
 // is exactly why the mistake was invisible.
 #[cfg(unix)]
 mod socket;
+// The admin socket (Foundations spec §5.9, §11) is Unix-only, like the listener
+// layer it builds on.
+#[cfg(unix)]
+mod admin;
 // Also under `dst`: the simulation harness is compiled into a non-test build
 // by that feature, and it needs the same umask-immune scratch directories.
 #[cfg(any(test, feature = "dst"))]
