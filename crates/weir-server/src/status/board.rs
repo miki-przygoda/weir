@@ -58,12 +58,22 @@ impl LifecycleCell {
     pub(crate) fn enter(&self, phase: Phase, now_ms: u64) -> bool {
         let target = phase.as_u8();
         let shutting = Phase::ShuttingDown.as_u8();
-        let moved = self
-            .phase
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
-                (cur != shutting || target == shutting).then_some(target)
-            })
-            .is_ok();
+        // A compare-exchange loop rather than `fetch_update`: newer stable
+        // toolchains deprecate that name in favour of `try_update`, which
+        // the 1.88 MSRV does not have, and CI's clippy denies warnings.
+        let mut cur = self.phase.load(Ordering::Acquire);
+        let moved = loop {
+            if cur == shutting && target != shutting {
+                break false;
+            }
+            match self
+                .phase
+                .compare_exchange_weak(cur, target, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => break true,
+                Err(actual) => cur = actual,
+            }
+        };
         if moved {
             self.phase_since_ms.store(now_ms, Ordering::Relaxed);
             if phase == Phase::Serving {
