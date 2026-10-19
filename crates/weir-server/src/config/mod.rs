@@ -216,6 +216,35 @@ fn parse_wab_dir_lock(s: &str) -> Result<crate::wab::lock::LockPolicy, ConfigErr
     }
 }
 
+/// Parses `livez_checks`: a comma-separated subset of the five liveness
+/// checks a restart can fix (spec §12). Empty, the default, means `/livez`
+/// answers 200 whenever the runtime answers. Duplicates fold, and the result
+/// is in catalogue order so the rendered list is stable.
+fn parse_livez_checks(s: &str) -> Result<Vec<weir_status::LivezCheck>, ConfigError> {
+    use weir_status::LivezCheck;
+    let mut out: Vec<LivezCheck> = Vec::new();
+    for raw in s.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        let Some(check) = LivezCheck::parse(raw) else {
+            return Err(ConfigError::InvalidValue {
+                field: "livez_checks",
+                reason: format!(
+                    "{raw:?} is not a liveness check; expected a subset of {}",
+                    LivezCheck::ALL
+                        .iter()
+                        .map(|c| c.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            });
+        };
+        if !out.contains(&check) {
+            out.push(check);
+        }
+    }
+    out.sort_by_key(|c| LivezCheck::ALL.iter().position(|a| a == c));
+    Ok(out)
+}
+
 // ── Partial config (one layer) ────────────────────────────────────────────────
 
 #[derive(Default)]
@@ -239,6 +268,7 @@ pub(crate) struct PartialConfig {
     pub metrics_port: Option<u16>,
     pub metrics_bind: Option<String>,
     pub metrics_max_connections: Option<usize>,
+    pub livez_checks: Option<String>,
     pub peer_uid_check: Option<bool>,
     pub shutdown_timeout_secs: Option<u64>,
     pub drain_shutdown_budget_secs: Option<u64>,
@@ -444,6 +474,10 @@ pub struct Config {
     /// fork-bomb surface so a misconfigured (or hostile) client can't spawn
     /// unbounded tokio tasks against the endpoint.
     pub metrics_max_connections: usize,
+    /// Liveness checks `/livez` fails on (spec §12). Empty (default): `/livez`
+    /// is 200 whenever the runtime answers. Only states a restart fixes are
+    /// selectable; every check is evaluated only while the phase is `serving`.
+    pub livez_checks: Vec<weir_status::LivezCheck>,
     /// When true (default), the accept loop reads the peer's effective uid
     /// via SO_PEERCRED (Linux) / getpeereid (macOS) and refuses connections
     /// whose uid does not match the daemon's effective uid. Defense-in-depth
@@ -912,6 +946,7 @@ impl Config {
 
         let metrics_max_connections = merge!(metrics_max_connections).unwrap_or(8);
         check_range("metrics_max_connections", metrics_max_connections, 1, 1024)?;
+        let livez_checks = parse_livez_checks(&merge!(livez_checks).unwrap_or_default())?;
 
         let peer_uid_check = merge!(peer_uid_check).unwrap_or(true);
 
@@ -1255,6 +1290,7 @@ impl Config {
             metrics_port,
             metrics_bind,
             metrics_max_connections,
+            livez_checks,
             peer_uid_check,
             shutdown_timeout_secs,
             drain_shutdown_budget_secs,
@@ -2728,6 +2764,62 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("wab_compression"), "{msg}");
         assert!(msg.contains("zstd"), "{msg}");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn livez_checks_defaults_to_empty() {
+        let dir = tmp_dir("livez_default");
+        let c = layers_with_wab(dir.clone()).unwrap();
+        assert!(c.livez_checks.is_empty(), "liveness is opt-in (spec §12)");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn livez_checks_parse_dedup_and_catalogue_order() {
+        use weir_status::LivezCheck;
+        let dir = tmp_dir("livez_parse");
+        let c = Config::from_layers(
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                livez_checks: Some(" worker_exited,no_live_shard , worker_exited,".into()),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+        )
+        .unwrap();
+        assert_eq!(
+            c.livez_checks,
+            vec![LivezCheck::NoLiveShard, LivezCheck::WorkerExited]
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn livez_checks_rejects_an_unselectable_code() {
+        let dir = tmp_dir("livez_bad");
+        // `sink_down` is a real condition but never a liveness check: a restart
+        // does not fix a down sink (spec §12).
+        for bad in ["sink_down", "No_Live_Shard", "starting"] {
+            let err = Config::from_layers(
+                PartialConfig {
+                    wab_dir: Some(dir.clone()),
+                    livez_checks: Some(bad.into()),
+                    ..PartialConfig::empty()
+                },
+                PartialConfig::empty(),
+                PartialConfig::empty(),
+            )
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("livez_checks"), "{err}");
+            assert!(
+                err.contains("no_live_shard"),
+                "the error lists the valid checks: {err}"
+            );
+        }
         fs::remove_dir_all(dir).ok();
     }
 
