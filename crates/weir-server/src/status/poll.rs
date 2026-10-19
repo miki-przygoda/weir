@@ -3,13 +3,16 @@
 //! and the drain-heartbeat stall check with its busy gauge. Later sections
 //! of this file add the cap refresh, the lag scan, the counter windows, the
 //! evaluation and the 500 ms queue-depth task.
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tracing::{info, warn};
 
 use crate::drain::{self, DrainHeartbeat, drain_appears_stalled};
+use crate::metrics::Metrics;
+use crate::status::{StatusBoard, unix_ms_now};
 
 /// Total live shard-segment bytes, or `None` if the WAB could not be scanned.
 ///
@@ -481,6 +484,9 @@ pub(crate) struct WabPoll {
     samples: Vec<u64>,
     /// The last time the growth warning fired (rate-limited).
     last_growth_warned: Option<std::time::Instant>,
+    /// The status half of the task (spec §5.11). `None` in the unit tests
+    /// that exercise the warning logic alone.
+    status: Option<PollStatus>,
 }
 
 impl WabPoll {
@@ -499,7 +505,16 @@ impl WabPoll {
             liveness,
             samples: Vec::with_capacity(WAB_GROWTH_WINDOW + 1),
             last_growth_warned: None,
+            status: None,
         }
+    }
+
+    /// Attaches the status half: the board the scan stamps, the cap flag and
+    /// the growth verdict are published on.
+    #[cfg_attr(not(test), allow(dead_code))] // Task 1.23 wires the 5 s task
+    pub(crate) fn with_status(mut self, status: PollStatus) -> Self {
+        self.status = Some(status);
+        self
     }
 
     /// One tick. Returns the stall verdict logged on it, if any.
@@ -520,29 +535,43 @@ impl WabPoll {
     {
         let logged = self.check_drain_liveness(now);
 
-        // On a join failure the last known size stands and this tick
-        // contributes no sample — see `apply_wab_scan` for why neither 0 nor a
-        // repeated value is safe here.
-        let Some(bytes) = apply_wab_scan(
+        // On a failed scan the last known size stands, the cap flag is left
+        // as it is (fail-closed) and this tick contributes no growth sample;
+        // see `apply_wab_scan` for why neither 0 nor a repeated value is safe
+        // here. The status steps below still run.
+        if let Some(bytes) = apply_wab_scan(
             scan().await,
             &mut self.samples,
             &self.metrics,
             &self.wab_bytes_now,
-        ) else {
-            return logged;
-        };
-        let drain_healthy = drain_is_healthy(&self.metrics);
-        let due = growth_warning_is_due(self.last_growth_warned, std::time::Instant::now());
-        if due && should_warn_wab_growth(&self.samples, self.wab_max_bytes, drain_healthy) {
-            warn!(
-                wab_bytes = bytes,
-                growth_bytes = bytes.saturating_sub(self.samples[0]),
-                window_secs = WAB_GROWTH_WINDOW * 5,
-                "WAB is growing while the sink is not healthy and no wab_max_bytes \
-                 is set — producers are still being acked into an unbounded buffer. \
-                 Set wab_max_bytes to bound it."
-            );
-            self.last_growth_warned = Some(std::time::Instant::now());
+        ) {
+            if let Some(st) = &self.status {
+                st.board.wab.note_scan_ok(unix_ms_now());
+                // Spec §5.5: the refresh that clears the flag without traffic.
+                let rejecting = crate::wab::cap::evaluate(
+                    self.wab_max_bytes,
+                    bytes,
+                    &st.board.wab_cap_rejecting,
+                );
+                self.metrics.wab_cap_rejecting.set(flag(rejecting));
+            }
+            let drain_healthy = drain_is_healthy(&self.metrics);
+            let growing = should_warn_wab_growth(&self.samples, self.wab_max_bytes, drain_healthy);
+            if let Some(st) = &self.status {
+                st.board.wab.set_growth(growing);
+            }
+            if growing && growth_warning_is_due(self.last_growth_warned, std::time::Instant::now())
+            {
+                warn!(
+                    wab_bytes = bytes,
+                    growth_bytes = bytes.saturating_sub(self.samples[0]),
+                    window_secs = WAB_GROWTH_WINDOW * 5,
+                    "WAB is growing while the sink is not healthy and no wab_max_bytes \
+                     is set — producers are still being acked into an unbounded buffer. \
+                     Set wab_max_bytes to bound it."
+                );
+                self.last_growth_warned = Some(std::time::Instant::now());
+            }
         }
         logged
     }
@@ -689,6 +718,89 @@ fn drain_is_healthy(metrics: &crate::metrics::Metrics) -> bool {
         .get()
         > 0.0;
     sink_healthy && draining
+}
+
+/// The status half of the 5 s task (spec §5.11). `None` in the moved unit
+/// tests, which exercise the warning logic alone.
+pub(crate) struct PollStatus {
+    board: Arc<StatusBoard>,
+    // Read by the lag scan (Task 1.21).
+    #[allow(dead_code)]
+    wab_dir: PathBuf,
+    // Read by the evaluation step (Task 1.22).
+    #[allow(dead_code)]
+    thresholds: weir_status::Thresholds,
+    // Read by the evaluation step (Task 1.22).
+    #[allow(dead_code)]
+    coalesce_hint: Arc<AtomicU64>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // Task 1.23 wires the 5 s task
+impl PollStatus {
+    pub(crate) fn new(
+        board: Arc<StatusBoard>,
+        wab_dir: PathBuf,
+        coalesce_hint: Arc<AtomicU64>,
+    ) -> Self {
+        PollStatus {
+            board,
+            wab_dir,
+            thresholds: weir_status::Thresholds::DEFAULT,
+            coalesce_hint,
+        }
+    }
+}
+
+fn flag(v: bool) -> f64 {
+    if v { 1.0 } else { 0.0 }
+}
+
+/// Spec §6 step 9: the first size scan and cap evaluation run synchronously,
+/// after recovery and before any producer listener exists. Without it a
+/// daemon restarted over its cap reads `wab_bytes_now = 0`, reports ready
+/// and admits pushes until the first asynchronous scan. Fail-closed: if the
+/// scan fails and a cap is set, start rejecting until a poll scan succeeds.
+///
+/// Returns the scanned size, or `None` when the scan failed.
+#[cfg_attr(not(test), allow(dead_code))] // Task 1.23 calls it from main
+pub(crate) fn startup_cap_gate(
+    wab_dir: &Path,
+    wab_max_bytes: u64,
+    board: &StatusBoard,
+    metrics: &Metrics,
+) -> Option<u64> {
+    match compute_wab_bytes_on_disk(wab_dir) {
+        Some(bytes) => {
+            metrics.wab_bytes_on_disk.set(bytes as f64);
+            board.wab_bytes_now.store(bytes, Ordering::Relaxed);
+            board.wab.note_scan_ok(unix_ms_now());
+            let rejecting =
+                crate::wab::cap::evaluate(wab_max_bytes, bytes, &board.wab_cap_rejecting);
+            metrics.wab_cap_rejecting.set(flag(rejecting));
+            if rejecting {
+                warn!(
+                    wab_bytes = bytes,
+                    wab_max_bytes,
+                    "the WAB is over wab_max_bytes at startup; pushes nack until delivery \
+                     brings it below {}",
+                    crate::wab::cap::low_water(wab_max_bytes)
+                );
+            }
+            Some(bytes)
+        }
+        None => {
+            if wab_max_bytes > 0 {
+                board.wab_cap_rejecting.store(true, Ordering::Relaxed);
+                metrics.wab_cap_rejecting.set(1.0);
+                warn!(
+                    wab_dir = %wab_dir.display(),
+                    "the startup WAB size scan failed; with wab_max_bytes set, pushes nack \
+                     (fail-closed) until a scan succeeds (every 5 s)"
+                );
+            }
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1703,5 +1815,120 @@ mod drain_stall_log_tests {
             })
             .get();
         assert!(gauge > 0.0, "the busy gauge was published: {gauge}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metrics::Metrics;
+    use crate::status::StatusBoard;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    fn wab_with_bytes(label: &str, bytes: usize) -> std::path::PathBuf {
+        let root = crate::testutil::scratch_dir(&format!("poll_{label}"));
+        let shard = root.join("shard_00");
+        crate::testutil::mkdir_p(&shard);
+        std::fs::write(shard.join("seg_00000001.wab.sealed"), vec![0u8; bytes]).unwrap();
+        root
+    }
+
+    fn poll_for(
+        board: &Arc<StatusBoard>,
+        metrics: &Arc<Metrics>,
+        cap: u64,
+        dir: std::path::PathBuf,
+    ) -> WabPoll {
+        WabPoll::new(
+            Arc::clone(metrics),
+            Arc::clone(&board.wab_bytes_now),
+            cap,
+            DrainHeartbeat::new(),
+            DrainLiveness::new(Instant::now(), secs(30), secs(60)),
+        )
+        .with_status(PollStatus::new(
+            Arc::clone(board),
+            dir,
+            Arc::new(AtomicU64::new(200)),
+        ))
+    }
+
+    #[test]
+    fn startup_gate_rejects_a_restart_over_the_cap_before_any_listener_exists() {
+        let dir = wab_with_bytes("gate_over", 2_000);
+        let board = StatusBoard::for_test();
+        let m = Metrics::new().0;
+        assert_eq!(startup_cap_gate(&dir, 1_000, &board, &m), Some(2_000));
+        assert!(board.wab_cap_rejecting.load(Ordering::Relaxed));
+        assert_eq!(board.wab_bytes_now.load(Ordering::Relaxed), 2_000);
+        assert!(board.wab.first_scan_ok_ms().is_some());
+        assert_eq!(m.wab_cap_rejecting.get(), 1.0);
+        let under = StatusBoard::for_test();
+        assert_eq!(startup_cap_gate(&dir, 10_000, &under, &m), Some(2_000));
+        assert!(!under.wab_cap_rejecting.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_failed_startup_scan_fails_closed_only_when_a_cap_is_set() {
+        let missing = crate::testutil::scratch_dir("poll_gate_missing").join("no_such_wab_dir");
+        let m = Metrics::new().0;
+        let capped = StatusBoard::for_test();
+        assert_eq!(startup_cap_gate(&missing, 1_000, &capped, &m), None);
+        assert!(
+            capped.wab_cap_rejecting.load(Ordering::Relaxed),
+            "fail-closed: nack until a scan succeeds"
+        );
+        assert!(capped.wab.first_scan_ok_ms().is_none());
+        let uncapped = StatusBoard::for_test();
+        startup_cap_gate(&missing, 0, &uncapped, &m);
+        assert!(!uncapped.wab_cap_rejecting.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn the_poll_clears_the_cap_with_zero_pushes() {
+        let board = StatusBoard::for_test();
+        let m = Arc::new(Metrics::new().0);
+        board.wab_cap_rejecting.store(true, Ordering::Relaxed);
+        let mut poll = poll_for(&board, &m, 1_000, std::path::PathBuf::from("/nonexistent"));
+        poll.tick(Instant::now(), || async { Ok(Some(100)) }).await;
+        assert!(
+            !board.wab_cap_rejecting.load(Ordering::Relaxed),
+            "drained below low water: released without a push"
+        );
+        assert!(board.wab.last_scan_ok_ms().is_some());
+        assert_eq!(m.wab_cap_rejecting.get(), 0.0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_poll_scan_leaves_the_cap_and_the_scan_stamp_alone() {
+        let board = StatusBoard::for_test();
+        let m = Arc::new(Metrics::new().0);
+        board.wab_cap_rejecting.store(true, Ordering::Relaxed);
+        let mut poll = poll_for(&board, &m, 1_000, std::path::PathBuf::from("/nonexistent"));
+        poll.tick(Instant::now(), || async { Ok(None) }).await;
+        assert!(
+            board.wab_cap_rejecting.load(Ordering::Relaxed),
+            "fail-closed"
+        );
+        assert!(board.wab.last_scan_ok_ms().is_none());
+    }
+
+    #[tokio::test]
+    async fn the_growth_verdict_is_published_on_every_successful_scan() {
+        let board = StatusBoard::for_test();
+        let m = Arc::new(Metrics::new().0);
+        let mut poll = poll_for(&board, &m, 0, std::path::PathBuf::from("/nonexistent"));
+        assert_eq!(board.wab.growth(), None);
+        poll.tick(Instant::now(), || async { Ok(Some(10)) }).await;
+        assert_eq!(
+            board.wab.growth(),
+            Some(false),
+            "a one-sample window is not growth"
+        );
     }
 }
