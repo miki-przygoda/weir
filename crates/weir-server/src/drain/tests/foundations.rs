@@ -6,6 +6,7 @@ use crate::drain::control::SLICE;
 use crate::drain::control::{DrainControl, DrainRuntime};
 use crate::drain::publish::Publisher;
 use crate::drain::{DrainCtx, DrainExit, Wait, spawn_with, wait_slice};
+use crate::metrics::{DrainQueue, DrainQueueLabel};
 use crate::status::{DrainExitReason, StatusBoard};
 use crate::wab::segment::segment_identity;
 use crate::wab::{
@@ -1588,5 +1589,172 @@ fn a_sinks_leftover_blocking_task_cannot_hold_a_panicking_drain() {
     );
     assert!(s.exists(), "a panicked commit is never confirmed");
     drop(tx);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn the_drain_publishes_its_progress_to_the_board() {
+    let dir = tmp_dir("fnd_publication");
+    let backlog: Vec<PathBuf> = (1..=3).map(|n| seg(&dir, n, &[b"r"])).collect();
+    let sink = Arc::new(MockSink::with_yielding_commit(
+        Duration::from_millis(200),
+        1000,
+    ));
+    let board = StatusBoard::for_test();
+    let control = DrainControl::attached();
+    let metrics = noop_metrics();
+    let (tx, rx) = crossbeam_channel::bounded::<PathBuf>(256);
+    let h = start(
+        rx,
+        &sink,
+        quiet(dir.clone()),
+        &metrics,
+        rt_with(control.clone(), Some(Arc::clone(&board)), backlog.clone()),
+    );
+    wait_for(5, "the first replay segment is in flight", || {
+        sink.call_count() == 1
+    });
+
+    assert_eq!(board.drain.generation.load(Relaxed), 1);
+    assert_eq!(metrics.drain_generation.get(), 1.0);
+    assert_eq!(board.drain.replay_total.load(Relaxed), 3);
+    assert_eq!(board.drain.replay_remaining.load(Relaxed), 2);
+    assert_eq!(metrics.drain_replay_remaining_segments.get(), 2.0);
+    assert_eq!(board.drain.backlog_len.load(Relaxed), 2);
+    assert_eq!(
+        metrics
+            .drain_pending_segments
+            .get_or_create(&DrainQueueLabel {
+                queue: DrainQueue::backlog
+            })
+            .get(),
+        2.0
+    );
+    let f = board
+        .drain
+        .in_flight
+        .load_full()
+        .expect("a segment in flight");
+    assert_eq!(f.segment, segment_identity(&backlog[0]));
+    assert_eq!((f.attempt, f.processed, f.next_retry_at_ms), (1, 0, None));
+    assert_eq!(board.drain.state(), Some(DrainStateValue::draining));
+
+    control.request_stop(Duration::from_secs(30));
+    wait_for(2, "stopping is published", || {
+        board.drain.stopping.load(Relaxed)
+    });
+    assert_eq!(
+        Some(board.drain.deadline_ms.load(Relaxed)),
+        control.deadline_unix_ms()
+    );
+
+    let exit = join_within(h, Duration::from_secs(5));
+    assert_eq!(exit.reason, DrainExitReason::Stopped);
+    assert_eq!(board.drain.replay_remaining.load(Relaxed), 0);
+    assert_eq!(board.drain.state(), Some(DrainStateValue::stopped));
+    assert!(board.drain.in_flight.load_full().is_none());
+    assert_eq!(
+        board.drain.exit.load_full().unwrap().reason,
+        DrainExitReason::Stopped
+    );
+    drop(tx);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn a_retry_publishes_its_attempt_and_when_it_fires() {
+    let dir = tmp_dir("fnd_publication_retry");
+    let s = seg(&dir, 1, &[b"x"]);
+    let sink = Arc::new(MockSink::with_responses([Err(
+        MockError::TransientWithRetryAfter(Duration::from_secs(2)),
+    )]));
+    let board = StatusBoard::for_test();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let h = start(
+        rx,
+        &sink,
+        quiet(dir.clone()),
+        &noop_metrics(),
+        rt_with(
+            DrainControl::detached(),
+            Some(Arc::clone(&board)),
+            Vec::new(),
+        ),
+    );
+    tx.send(s.clone()).unwrap();
+    // The arm state is published a moment before the retry's in-flight record,
+    // so wait on the record itself.
+    wait_for(5, "the retry is published", || {
+        board
+            .drain
+            .in_flight
+            .load_full()
+            .is_some_and(|f| f.attempt == 2)
+    });
+    assert_eq!(
+        board.drain.state(),
+        Some(DrainStateValue::retrying_transient)
+    );
+    let f = board.drain.in_flight.load_full().unwrap();
+    assert_eq!(f.retries_left, MAX_RETRIES);
+    assert!(
+        f.next_retry_at_ms
+            .is_some_and(|t| t > crate::status::unix_ms_now())
+    );
+    drop(tx);
+    join_within(h, Duration::from_secs(5));
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// A retry-stranded backoff cut (Task 2.7) moves the retry earlier; the board's
+/// `next_retry_at_ms` must move with it. A 10 s hint cut to the 1 s
+/// base_retry_delay floor leaves the test ~900 ms to see the new value before
+/// the retry fires.
+#[test]
+fn a_backoff_cut_republishes_when_the_retry_fires() {
+    let dir = tmp_dir("fnd_publication_cut");
+    let s = seg(&dir, 1, &[b"x"]);
+    let sink = Arc::new(MockSink::with_responses([Err(
+        MockError::TransientWithRetryAfter(Duration::from_secs(10)),
+    )]));
+    let cfg = DrainConfig {
+        base_retry_delay: Duration::from_secs(1),
+        ..quiet(dir.clone())
+    };
+    let control = DrainControl::detached();
+    let board = StatusBoard::for_test();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let h = start(
+        rx,
+        &sink,
+        cfg,
+        &noop_metrics(),
+        rt_with(control.clone(), Some(Arc::clone(&board)), Vec::new()),
+    );
+    tx.send(s.clone()).unwrap();
+    let retry_at = || {
+        board
+            .drain
+            .in_flight
+            .load_full()
+            .and_then(|f| f.next_retry_at_ms)
+    };
+    wait_for(5, "the 10 s retry is published", || {
+        retry_at().is_some_and(|t| t > crate::status::unix_ms_now() + 5_000)
+    });
+    control.request_requeue();
+    wait_for(5, "the cut retry time is published", || {
+        retry_at().is_some_and(|t| t <= crate::status::unix_ms_now() + 1_000)
+    });
+    assert!(
+        board
+            .drain
+            .last_requeue
+            .load_full()
+            .is_some_and(|r| r.backoff_cut)
+    );
+    wait_for(5, "delivered on the cut retry", || !s.exists());
+    drop(tx);
+    join_within(h, Duration::from_secs(5));
     std::fs::remove_dir_all(dir).ok();
 }

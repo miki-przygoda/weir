@@ -63,9 +63,9 @@ use weir_sink_sdk::RecordId;
 
 use crate::{
     metrics::{
-        DispositionKind, DispositionLabel, DrainStateLabel, DrainStateValue, LocalIoStrandCause,
-        LocalIoStrandLabel, Metrics, Outcome, OutcomeLabel, ParkedLabel, ParkedReason,
-        SinkHealthLabel, SinkHealthState,
+        DispositionKind, DispositionLabel, DrainQueue, DrainQueueLabel, DrainStateLabel,
+        DrainStateValue, LocalIoStrandCause, LocalIoStrandLabel, Metrics, Outcome, OutcomeLabel,
+        ParkedLabel, ParkedReason, SinkHealthLabel, SinkHealthState,
     },
     sink::{Sink, SinkError, SinkHealth},
     wab::{SegmentReader, read_segment_record_count, segment::segment_identity},
@@ -74,7 +74,9 @@ use crate::{
 pub(crate) use control::{DrainControl, DrainExit, DrainRuntime, Lifetime};
 use publish::{CommitGuard, Publisher};
 
-use crate::status::{DrainExitInfo, DrainExitReason, RequeueResult, SinkFailureKind, unix_ms_now};
+use crate::status::{
+    DrainExitInfo, DrainExitReason, InFlight, RequeueResult, SinkFailureKind, unix_ms_now,
+};
 use confirmed::confirm_and_delete;
 use dead_letter::DeadLetterWriter;
 use ledger::{Admit, DeadLetterCarry, SegmentLedger, TransientCause};
@@ -668,6 +670,50 @@ fn set_drain_state(metrics: &Metrics, active: DrainStateValue) {
             .drain_state
             .get_or_create(&DrainStateLabel { state: s })
             .set(v);
+    }
+}
+
+/// Publishes the arm the drain is in: the one-hot gauge, the board state, and
+/// the blocked-since stamp (0 outside BlockedDeadLetterFull). Called wherever
+/// `set_drain_state` was called at an arm head (spec §5.4 "Publication").
+fn enter_arm(
+    publish: &Publisher,
+    metrics: &Metrics,
+    state: DrainStateValue,
+    blocked_since_ms: u64,
+) {
+    publish.state(&state);
+    publish.blocked_since(blocked_since_ms);
+    set_drain_state(metrics, state);
+}
+
+/// Queue lengths to the board and to `weir_drain_pending_segments{queue}`.
+fn publish_queues(publish: &Publisher, metrics: &Metrics, pending: usize, backlog: usize) {
+    publish.queue_lens(pending, backlog);
+    for (queue, n) in [(DrainQueue::live, pending), (DrainQueue::backlog, backlog)] {
+        metrics
+            .drain_pending_segments
+            .get_or_create(&DrainQueueLabel { queue })
+            .set(n as f64);
+    }
+}
+
+/// Startup-replay progress. The replay list sits at the FRONT of the FIFO
+/// backlog and rescans append behind it, so the first `total` backlog pops are
+/// exactly the replay list.
+struct ReplayProgress {
+    total: u64,
+    taken: u64,
+}
+
+impl ReplayProgress {
+    fn took_one(&mut self) {
+        if self.taken < self.total {
+            self.taken += 1;
+        }
+    }
+    fn remaining(&self) -> u64 {
+        self.total - self.taken
     }
 }
 
@@ -1384,6 +1430,9 @@ fn wait_slice(
     channel_gone: &mut bool,
 ) -> Wait {
     ctx.hb.bump();
+    if ctx.control.stop_requested() {
+        ctx.publish.stopping(ctx.control.deadline_unix_ms());
+    }
     if ctx.control.absorbing() {
         while let Ok(p) = rx.try_recv() {
             pending.push_back(p);
@@ -1578,6 +1627,17 @@ fn drain_thread_with<S: Sink>(
     // `pending` and the channel; see `next_queued`.
     let mut backlog: VecDeque<PathBuf> = initial_backlog.into();
     let mut backlog_turn = false;
+    // Startup-replay progress, published as the replay list is taken.
+    let mut replay = ReplayProgress {
+        total: backlog.len() as u64,
+        taken: 0,
+    };
+    if replay.total > 0 {
+        publish.replay(replay.total, replay.total);
+        metrics
+            .drain_replay_remaining_segments
+            .set(replay.total as f64);
+    }
     // Resolves operator retry-stranded tickets (spec §5.4).
     let mut requeue = RequeueService::new(control);
     // When the current pause took effect (unix ms), shared by every hold: the
@@ -1631,10 +1691,14 @@ fn drain_thread_with<S: Sink>(
         // another pass through here, so publishing at the loop head keeps the
         // gauges current without threading `metrics` into the ledger.
         publish_ledger_counts(ledger.counts(), &metrics);
+        publish_queues(publish, &metrics, pending.len(), backlog.len());
         state = match state {
             // ── Draining ─────────────────────────────────────────────────────
             DrainState::Draining => {
-                set_drain_state(&metrics, DrainStateValue::draining);
+                enter_arm(publish, &metrics, DrainStateValue::draining, 0);
+                if control.stop_requested() {
+                    publish.stopping(control.deadline_unix_ms());
+                }
                 if let Some(reason) =
                     stop_exit(control, pending.is_empty() && backlog.is_empty(), &drain_rx)
                 {
@@ -1774,9 +1838,17 @@ fn drain_thread_with<S: Sink>(
                     // finds), so a long replay never holds the flushers' hand-off
                     // up for more than one backlog segment (spec §5.4).
                     let next_segment = loop {
-                        if let Some(p) =
-                            next_queued(&mut pending, &mut backlog, &drain_rx, &mut backlog_turn)
-                        {
+                        let backlog_before = backlog.len();
+                        let picked =
+                            next_queued(&mut pending, &mut backlog, &drain_rx, &mut backlog_turn);
+                        if backlog.len() < backlog_before {
+                            replay.took_one();
+                            publish.replay(replay.total, replay.remaining());
+                            metrics
+                                .drain_replay_remaining_segments
+                                .set(replay.remaining() as f64);
+                        }
+                        if let Some(p) = picked {
                             match ledger.admit(&p, Instant::now()) {
                                 Admit::Process { skip } => break Some((p, skip)),
                                 Admit::Drop(owner) => {
@@ -1791,6 +1863,7 @@ fn drain_thread_with<S: Sink>(
                         // then re-enter Draining so the wall-clock poll above runs.
                         // A Detached drain's channel closure (all WAB flushers
                         // exited) still ends the loop; an Attached drain's does not.
+                        publish.in_flight(None);
                         let until_next_poll = config
                             .health_poll_interval
                             .saturating_sub(last_health_poll.elapsed())
@@ -1829,6 +1902,14 @@ fn drain_thread_with<S: Sink>(
                             // refreshed by the wall-clock poll above, so we no longer
                             // probe the sink after every segment (which, under
                             // sustained load, meant a HEAD request per segment).
+                            publish_queues(publish, &metrics, pending.len(), backlog.len());
+                            publish.in_flight(Some(InFlight {
+                                segment: segment_identity(&segment),
+                                attempt: 1,
+                                retries_left: config.max_retries,
+                                processed: skip,
+                                next_retry_at_ms: None,
+                            }));
                             let result = attempt_segment(
                                 &rt,
                                 &segment,
@@ -1965,7 +2046,20 @@ fn drain_thread_with<S: Sink>(
                 backoff_cut,
                 waited,
             } => {
-                set_drain_state(&metrics, DrainStateValue::retrying_transient);
+                enter_arm(publish, &metrics, DrainStateValue::retrying_transient, 0);
+                // What the board shows for this retry: the attempt about to
+                // fire and, while it waits, when.
+                let attempt = config
+                    .max_retries
+                    .saturating_sub(retries_left)
+                    .saturating_add(2);
+                let retry_record = |next_retry_at_ms: Option<u64>| InFlight {
+                    segment: segment_identity(&segment),
+                    attempt,
+                    retries_left,
+                    processed,
+                    next_retry_at_ms,
+                };
                 // The episode's cut flag outlives the wait: it is passed on to
                 // the next retry, and to a hold if this attempt pauses.
                 let mut backoff_cut = backoff_cut;
@@ -2012,6 +2106,9 @@ fn drain_thread_with<S: Sink>(
                     // wait's start (W2): see `RequeueService`.
                     let wait_start = Instant::now();
                     let mut wait_end = wait_start + next_delay;
+                    publish.in_flight(Some(retry_record(Some(unix_ms_now().saturating_add(
+                        u64::try_from(next_delay.as_millis()).unwrap_or(u64::MAX),
+                    )))));
                     loop {
                         // Spec §5.4: a backoff that would end after the
                         // deadline is abandoned now, not served. A pause
@@ -2031,6 +2128,7 @@ fn drain_thread_with<S: Sink>(
                             abandoned = Some((segment.clone(), processed));
                             break 'outer DrainExitReason::DeadlineAbandoned;
                         }
+                        let cut_before = backoff_cut;
                         {
                             let now = Instant::now();
                             let base = config.base_retry_delay;
@@ -2064,6 +2162,19 @@ fn drain_thread_with<S: Sink>(
                                     }
                                 },
                             );
+                        }
+                        // A cut moved the retry earlier: the board follows.
+                        if backoff_cut && !cut_before {
+                            publish.in_flight(Some(retry_record(Some(
+                                unix_ms_now().saturating_add(
+                                    u64::try_from(
+                                        wait_end
+                                            .saturating_duration_since(Instant::now())
+                                            .as_millis(),
+                                    )
+                                    .unwrap_or(u64::MAX),
+                                ),
+                            ))));
                         }
                         // WAITING IS NOT WEDGED. `heartbeat.bump()` at the top of
                         // `'outer` is never reached while this arm holds the thread,
@@ -2191,6 +2302,7 @@ fn drain_thread_with<S: Sink>(
                 }
 
                 // Resume past the sub-batches already durably processed (F05).
+                publish.in_flight(Some(retry_record(None)));
                 let result = attempt_segment(
                     &rt,
                     &segment,
@@ -2241,7 +2353,15 @@ fn drain_thread_with<S: Sink>(
                 processed,
                 needed,
             } => {
-                set_drain_state(&metrics, DrainStateValue::blocked_dead_letter_full);
+                let blocked_ms = unix_ms_now().saturating_sub(
+                    u64::try_from(blocked_since.elapsed().as_millis()).unwrap_or(u64::MAX),
+                );
+                enter_arm(
+                    publish,
+                    &metrics,
+                    DrainStateValue::blocked_dead_letter_full,
+                    blocked_ms,
+                );
                 metrics
                     .dead_letter_blocked_duration
                     .set(blocked_since.elapsed().as_secs_f64());
@@ -2442,7 +2562,7 @@ fn drain_thread_with<S: Sink>(
                 processed,
                 resume,
             } => {
-                set_drain_state(&metrics, resume.gauge_state());
+                enter_arm(publish, &metrics, resume.gauge_state(), 0);
                 let since = *paused_since.get_or_insert_with(unix_ms_now);
                 publish.paused(since, true);
                 metrics.drain_paused.set(1.0);
