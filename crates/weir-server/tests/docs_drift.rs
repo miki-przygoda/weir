@@ -823,3 +823,24 @@ fn the_wab_dir_lock_key_is_in_the_configuration_reference() {
         );
     }
 }
+
+/// `test-hooks` system tests compile only under that feature. The CI line that
+/// runs the system tests with `--all-features` is what keeps them from being
+/// silently skipped forever (spec §16 "a drift guard asserts the
+/// --all-features line runs them").
+#[test]
+fn the_test_hooks_system_tests_run_in_ci() {
+    let cargo = include_str!("../Cargo.toml");
+    assert!(
+        cargo.contains("\ntest-hooks = []"),
+        "the test-hooks feature is gone from Cargo.toml"
+    );
+    let ci = include_str!("../../../.github/workflows/ci.yml");
+    assert!(
+        ci.lines().any(|l| l.contains("cargo test -p weir-server")
+            && l.contains("--test system")
+            && l.contains("--all-features")),
+        "no CI line runs tests/system.rs with --all-features, so every \
+         #[cfg(feature = \"test-hooks\")] system test is skipped"
+    );
+}

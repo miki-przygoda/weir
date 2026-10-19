@@ -5480,3 +5480,59 @@ fn startup_log_names_version_and_config_and_carries_no_ansi() {
     );
     assert!(!log.contains('\u{1b}'), "no ANSI escapes in a file:\n{log}");
 }
+
+/// Spec §16 system test 8: a shard whose counter scan fails goes
+/// Offline(CounterScanFailed), and new connections are routed around it.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn routing_avoids_a_shard_whose_counter_scan_failed() {
+    let srv = weir_server!("route_offline")
+        .shard_count(2)
+        .env("WEIR_TEST_HOOKS", "1")
+        .env("WEIR_TEST_FAIL_SHARD_COUNTER_SCAN", "1")
+        .start();
+    // One push per fresh connection: round-robin would put half on shard 1.
+    for i in 0..20 {
+        let mut c = srv.client();
+        c.push(format!("r{i}").as_bytes(), Durability::Durable)
+            .unwrap_or_else(|e| panic!("connection {i} was routed to the offline shard: {e}"));
+    }
+    assert!(wab_dir_bytes(&srv.wab_dir.join("shard_00")) > 0);
+    assert_eq!(
+        wab_dir_bytes(&srv.wab_dir.join("shard_01")),
+        0,
+        "nothing may be routed to the offline shard"
+    );
+    // Spec §16: a test-hooks build says so at startup.
+    let log = fs::read_to_string(srv.tmp_dir.join("weir.log")).unwrap();
+    assert!(
+        log.contains("built with the test-hooks feature") && log.contains("active=true"),
+        "no test-hooks startup WARN:\n{log}"
+    );
+}
+
+/// With every shard offline, a connection is closed at accept and counted.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn no_live_shard_refuses_connections_and_counts_them() {
+    let srv = weir_server!("route_none_live")
+        .shard_count(1)
+        .env("WEIR_TEST_HOOKS", "1")
+        .env("WEIR_TEST_FAIL_SHARD_COUNTER_SCAN", "0")
+        .start();
+    let mut c = srv.client();
+    assert!(
+        c.push(b"x", Durability::Durable).is_err(),
+        "no shard can take the record"
+    );
+    let metrics = srv.scrape_metrics();
+    let refused: f64 = metrics
+        .lines()
+        .find_map(|l| l.strip_prefix("weir_connections_refused_no_live_shard_total "))
+        .expect("the refusal counter is exported")
+        .trim()
+        .parse()
+        .unwrap();
+    // wait_ready's own probe connection is refused too.
+    assert!(refused >= 2.0, "refused = {refused}");
+}

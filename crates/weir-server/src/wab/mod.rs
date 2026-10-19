@@ -973,7 +973,19 @@ fn flusher_thread<C: BlockingClock>(
     {
         let mut attempt = 0u32;
         loop {
-            match writer.scan_and_advance_counter() {
+            let scan = writer.scan_and_advance_counter();
+            // System-test hook (spec §16 system test 8): force this shard's
+            // scan to fail so it ends Offline(CounterScanFailed). Compiled
+            // out without `test-hooks`, and inert unless WEIR_TEST_HOOKS=1.
+            #[cfg(feature = "test-hooks")]
+            let scan = if crate::test_hooks::fail_counter_scan(shard_id) {
+                Err(io::Error::other(
+                    "test hook: WEIR_TEST_FAIL_SHARD_COUNTER_SCAN",
+                ))
+            } else {
+                scan
+            };
+            match scan {
                 Ok(()) => {
                     // The counter is established: this shard can seal safely.
                     slot.mark_up();

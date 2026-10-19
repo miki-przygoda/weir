@@ -8,6 +8,10 @@ mod queue;
 mod reload;
 mod sink;
 mod status;
+// Test-only fault hooks for the system tests (spec §16); inert unless
+// WEIR_TEST_HOOKS=1 is also set.
+#[cfg(feature = "test-hooks")]
+mod test_hooks;
 // The whole listener layer is Unix-only, and `tcp`/`tls` live inside it. So every
 // `feature = "tls"` site below is gated `all(unix, feature = "tls")`, not on the
 // feature alone: `--features tls` on Windows would otherwise name `crate::socket`,
@@ -286,6 +290,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for w in &config_warnings {
         warn!("config: {w}");
     }
+    // A test-hooks build says so loudly, active or not: it must never be the
+    // binary a production host runs.
+    #[cfg(feature = "test-hooks")]
+    test_hooks::warn_if_compiled_in();
 
     // Name the config source, so "which file did it read?" is answerable from
     // the log alone. A missing file has its own WARN above (spec §3.4).
