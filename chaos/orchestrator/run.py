@@ -496,6 +496,38 @@ def exit_code_for(violations, anomalies, verdict):
     return 0
 
 
+#: Off the device under test for the admin trigger, so its control-plane
+#: socket is not on the filesystem being cut. Other schedules pass no path,
+#: and weir binds its default `<parent(wab_dir)>/wab.admin.sock` on the
+#: device. That is harmless: every cut SIGKILLs first, and `bind_hardened`
+#: removes the stale file on restart. /run/weir-chaos is 0700 (main), which
+#: the admin bind requires (spec §11).
+ADMIN_SOCKET_PATH = "/run/weir-chaos/weir.admin.sock"
+
+
+def trigger_record_fields(kind, cut, trigger_result):
+    """Record fields a lifecycle trigger adds. {} for the legacy kinds, so every
+    Phase 1/2 record stays byte-identical."""
+    if trigger_result is None:
+        return {}
+    return {
+        "trigger": kind,
+        "cut": cut,
+        "trigger_result": {k: v for k, v in trigger_result.items()
+                           if k not in ("canary", "anomaly_reasons")},
+        "anomaly_reasons": list(trigger_result.get("anomaly_reasons", [])),
+    }
+
+
+def episode_counts(result_ok, advisory, quiesced, no_progress, trigger_anomaly_reasons):
+    """(violations, anomalies) one episode adds. Same split as I5: a trigger
+    that did not land, or a shutdown that broke its bound, is an anomaly, never
+    a durability violation."""
+    violation = 1 if (not result_ok and not advisory) else 0
+    anomaly = 1 if (not quiesced or no_progress or advisory or trigger_anomaly_reasons) else 0
+    return violation, anomaly
+
+
 def cumulative_deltas(result, prev):
     """Per-episode deltas from the accumulator's CUMULATIVE totals.
 
@@ -1267,12 +1299,24 @@ def main():
             # instance on this host would collide with the harness.
             19185, sched["weir"], daemon_log,
             log_path=os.path.join(run_dir, "weir-server.log"),
+            # Only the admin trigger drives the control plane; see
+            # ADMIN_SOCKET_PATH for why the others keep weir's default.
+            admin_socket_path=ADMIN_SOCKET_PATH if kind == "admin_pause_resume" else None,
         )
         daemon.start(SINK_URL)
 
         delays = kill_delays(
             seed, sched["episodes"], sched["steady_lo_secs"], sched["steady_hi_secs"]
         )
+        # How each episode ends, and the fault the ORACLE judges it under. For
+        # the legacy kinds `oracle == kind`, so their records are unchanged. A
+        # lifecycle trigger is judged as the cut it ends in; the trigger itself
+        # is recorded separately under `trigger`. The plan draws from its own
+        # salted stream, so `delays` above is the same sequence as before.
+        cut = faults.cut_mode(sched)
+        oracle = faults.oracle_fault(kind, cut)
+        plan = (faults.fault_plan(seed, sched["episodes"], kind, sched.get("faults") or {})
+                if kind in faults.TRIGGER_KINDS else None)
         run_started = time.monotonic()
         deadline = run_started + max_duration_secs if max_duration_secs else None
         # The load must outlast the episodes. Steady-state sleeps are only part
@@ -1390,17 +1434,29 @@ def main():
                     # `abort_reason` is what makes this count as an anomaly.
                     anomalies += 1
                     ep_log.write(json.dumps({
-                        "episode": i, "fault": kind, "ok": True,
+                        "episode": i, "fault": oracle,
+                        **({"trigger": kind} if plan else {}), "ok": True,
                         "quiesced": False, "abort_reason": reason,
                         "exit_code": code, "seed": seed,
                     }) + "\n")
                     ep_log.flush()
                     break
 
+                trigger_result = None
                 if kind == "power_loss":
                     # The Phase 2 kill-first protocol and the I6 canary: see
                     # faults.power_cut, which the lifecycle triggers share.
                     canary_result = faults.power_cut(stack, daemon, i)
+                elif kind in faults.TRIGGER_KINDS:
+                    # Provoke the lifecycle path, then end in the schedule's
+                    # cut (faults.cut). The trigger owns the canary when it
+                    # ends in a power cut, and reports what it saw as
+                    # anomaly_reasons (never violations: see episode_counts).
+                    ops = faults.LiveOps(daemon, recorder, stack, cut, i, SINK_URL,
+                                         admin_path=daemon.admin_socket_path,
+                                         delivered_path=delivered_path)
+                    trigger_result = faults.run_trigger(kind, plan[i], ops)
+                    canary_result = trigger_result.get("canary")
                 else:
                     daemon.kill9()
                     canary_result = None
@@ -1435,7 +1491,7 @@ def main():
                     acc.ingest(ledger_tail.read_new(), delivered_tail.read_new())
                     result = acc.check(
                         frontier_slack=frontier_slack,
-                        tier=sched["load"]["tier"], fault=kind,
+                        tier=sched["load"]["tier"], fault=oracle,
                     )
                 finally:
                     # Always resume, even if the wait or the check raised —
@@ -1470,14 +1526,17 @@ def main():
                 # A quiescence timeout or a no-progress episode is not
                 # evidence weir lost or leaked anything; it means this
                 # episode proved nothing, which is a different kind of bad.
-                if not result.ok and not advisory:
-                    violations += 1
-                if not ok or no_progress or advisory:
-                    anomalies += 1
+                # A trigger's own findings (it did not land, a shutdown broke
+                # its bound) are anomalies on the same footing.
+                tf = trigger_record_fields(kind, cut, trigger_result)
+                v, a = episode_counts(result.ok, advisory, ok, no_progress,
+                                      tf.get("anomaly_reasons", []))
+                violations += v
+                anomalies += a
 
                 record = {
                     "episode": i,
-                    "fault": kind,
+                    "fault": oracle,
                     "tier": sched["load"]["tier"],
                     "steady_secs": round(delay, 2),
                     "quiesced": ok,
@@ -1540,6 +1599,9 @@ def main():
                     "canary": canary_result,
                     "seed": seed,
                 }
+                # {} for the legacy kinds. The trigger's `anomaly_reasons` stay
+                # separate from the recorder's `advisory_reasons` below.
+                record.update(tf)
                 if advisory:
                     record["advisory_reasons"] = ["recorder_exited"]
                 ep_log.write(json.dumps(record) + "\n")
@@ -1573,7 +1635,7 @@ def main():
             final_record, v, a = final_pass(
                 loadgen, daemon, recorder, acc, ledger_tail, delivered_tail,
                 daemon.wab_dir, frontier_slack, seed, prev_totals=prev_totals,
-                tier=sched["load"]["tier"], fault=kind,
+                tier=sched["load"]["tier"], fault=oracle,
             )
             final_pass_ran = True
             violations += v

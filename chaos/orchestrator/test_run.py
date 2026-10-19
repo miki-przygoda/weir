@@ -1637,5 +1637,71 @@ class TestDaemonLifecycle(unittest.TestCase):
         self.d.wait_serving(timeout_secs=1)
 
 
+class TestTriggerRecordFields(unittest.TestCase):
+    def test_legacy_kinds_add_nothing_so_records_stay_byte_identical(self):
+        self.assertEqual(run.trigger_record_fields("power_loss", "power_loss", None), {})
+        self.assertEqual(run.trigger_record_fields("kill_random", "kill", None), {})
+
+    def test_a_trigger_records_its_kind_its_cut_and_its_findings_separately(self):
+        tr = {"trigger": "sigterm_at", "cut_phase": "during_shutdown",
+              "canary": "bit", "anomaly_reasons": ["daemon_exit_code=3"]}
+        f = run.trigger_record_fields("sigterm_at", "power_loss", tr)
+        self.assertEqual(f["trigger"], "sigterm_at")
+        self.assertEqual(f["cut"], "power_loss")
+        self.assertEqual(f["anomaly_reasons"], ["daemon_exit_code=3"])
+        self.assertEqual(f["trigger_result"], {"trigger": "sigterm_at",
+                                               "cut_phase": "during_shutdown"})
+        json.dumps(f)
+
+    def test_the_record_renders(self):
+        tr = {"trigger": "sigterm_at", "canary": "bit", "anomaly_reasons": ["x_y"]}
+        rec = {"episode": 0, "fault": "power_loss", "ok": True, "quiesced": True,
+               "canary": "bit", "seed": 1,
+               **run.trigger_record_fields("sigterm_at", "power_loss", tr)}
+        out = report.render([rec], {})
+        self.assertIn("x_y", out)
+
+
+class TestEpisodeCounts(unittest.TestCase):
+    def test_a_clean_episode_counts_nothing(self):
+        self.assertEqual(run.episode_counts(True, False, True, False, []), (0, 0))
+
+    def test_a_trigger_anomaly_is_an_anomaly_not_a_violation(self):
+        self.assertEqual(run.episode_counts(True, False, True, False, ["x"]), (0, 1))
+
+    def test_the_pre_existing_rules_are_unchanged(self):
+        self.assertEqual(run.episode_counts(False, False, True, False, []), (1, 0))
+        self.assertEqual(run.episode_counts(False, True, True, False, []), (0, 1))
+        self.assertEqual(run.episode_counts(True, False, False, False, []), (0, 1))
+        self.assertEqual(run.episode_counts(True, False, True, True, []), (0, 1))
+
+
+class TestTriggerWiring(unittest.TestCase):
+    def _main(self):
+        with open(os.path.join(os.path.dirname(os.path.abspath(run.__file__)), "run.py")) as f:
+            src = f.read()
+        return src[src.index("def main("):]
+
+    def test_the_loop_dispatches_triggers_and_judges_by_the_oracle_fault(self):
+        body = self._main()
+        for needle in ("faults.run_trigger(kind, plan[i], ops)",
+                       "fault=oracle",
+                       "episode_counts(",
+                       "trigger_record_fields(kind, cut, trigger_result)",
+                       '"fault": oracle'):
+            self.assertIn(needle, body)
+        self.assertNotIn('"fault": kind', body,
+                         "a trigger record must carry the ORACLE fault")
+
+    def test_only_the_admin_trigger_gets_an_admin_socket_path(self):
+        body = self._main()
+        self.assertIn(
+            'admin_socket_path=ADMIN_SOCKET_PATH if kind == "admin_pause_resume" else None',
+            body)
+
+    def test_the_admin_socket_lives_off_the_device_under_test(self):
+        self.assertTrue(run.ADMIN_SOCKET_PATH.startswith("/run/weir-chaos/"))
+
+
 if __name__ == "__main__":
     unittest.main()
