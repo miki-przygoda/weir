@@ -30,6 +30,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::metrics::{Metrics, SegmentState, SegmentStateLabel};
 use crate::models::{AckOutcome, Batch, RecordSlot};
+use crate::status::{ShardRegistry, ShardSlot, SupervisorExit};
 use clock::{BlockingClock, RealClock};
 use recovery::{check_confirmed, recover_open_segments};
 use segment::{FsSegmentStore, SegmentStore, ShardWriter, WriteFailure};
@@ -107,6 +108,10 @@ impl Default for WabConfig {
 /// Returned by `spawn`. Drop `shard_txs` to initiate shutdown (flusher threads
 /// exit when their receiver disconnects), then join the handles to wait for all
 /// segments to be sealed.
+///
+/// A joined handle carries no verdict: each shard's supervisor records how its
+/// flusher ended (`Stopped`, or `Offline` with a reason) on the
+/// `ShardRegistry` passed to `spawn` before the thread returns (spec §5.3).
 pub(crate) struct WabHandle {
     /// One sender per shard. Drop all of them to signal shutdown.
     pub(crate) shard_txs: Vec<Sender<Batch>>,
@@ -121,6 +126,16 @@ fn shard_dir_path(wab_dir: &Path, shard_id: usize) -> PathBuf {
 /// a string literal lands in `&'static str`; `panic!("{}", ...)` lands in
 /// `String`. Anything else gets a placeholder so the log line still says
 /// *something*.
+/// How a flusher body ended (spec §5.3). A panic is not a value: the
+/// supervisor sees it as `Err` from `catch_unwind`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FlusherExit {
+    /// The batch channel disconnected (every worker gone).
+    InputClosed,
+    /// The startup counter scan failed repeatedly; the shard refuses to seal.
+    CounterScanFailed,
+}
+
 fn panic_message_str(payload: &Box<dyn std::any::Any + Send>) -> &str {
     if let Some(s) = payload.downcast_ref::<&'static str>() {
         return s;
@@ -170,14 +185,21 @@ pub(crate) const MAX_FLUSHER_RESPAWNS: u32 = 10;
 /// crossbeam channels (lock-free, panic-safe). We accept the
 /// unwind-safety claim — matching the previous implementation's
 /// rationale.
+///
+/// The supervisor is the single writer of the shard's terminal state on
+/// `slot` (spec §5.3): it marks `Respawning` before each respawn and
+/// records the exit before returning it. The flusher itself writes only
+/// `Up`, once its counter scan has succeeded.
 fn run_with_panic_supervision<F, B, C>(
     shard_id: usize,
     metrics: Arc<Metrics>,
     clock: &C,
+    slot: &ShardSlot,
     mut body_factory: F,
-) where
+) -> SupervisorExit
+where
     F: FnMut() -> B,
-    B: FnOnce(),
+    B: FnOnce() -> FlusherExit,
     C: BlockingClock,
 {
     let mut attempt: u32 = 0;
@@ -185,9 +207,17 @@ fn run_with_panic_supervision<F, B, C>(
         let body = body_factory();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
         match result {
-            // Clean exit (channel disconnected at daemon shutdown) —
-            // the supervisor is done, NOT a panic.
-            Ok(()) => return,
+            // The body returned (a channel close at shutdown, or the counter
+            // scan giving up) — the supervisor is done, NOT a panic. The
+            // supervisor is the single writer of terminal states (spec §5.3).
+            Ok(exit) => {
+                let exit = match exit {
+                    FlusherExit::InputClosed => SupervisorExit::InputClosed,
+                    FlusherExit::CounterScanFailed => SupervisorExit::CounterScanFailed,
+                };
+                slot.mark_exit(exit);
+                return exit;
+            }
             Err(panic_payload) => {
                 let msg = panic_message_str(&panic_payload);
                 metrics.wab_flusher_panics.inc();
@@ -202,8 +232,10 @@ fn run_with_panic_supervision<F, B, C>(
                          this shard will Nack(InternalError) until the \
                          daemon is restarted."
                     );
-                    return;
+                    slot.mark_exit(SupervisorExit::RespawnExhausted);
+                    return SupervisorExit::RespawnExhausted;
                 }
+                slot.mark_respawning();
                 tracing::warn!(
                     shard = shard_id,
                     attempt,
@@ -267,6 +299,7 @@ pub(crate) fn spawn(
     drain_tx: Sender<PathBuf>,
     metrics: Arc<Metrics>,
     coalesce_hint: Arc<AtomicU64>,
+    registry: Arc<ShardRegistry>,
 ) -> io::Result<WabHandle> {
     // Caller (`Config::load`) has already validated and canonicalised `wab_dir`.
 
@@ -305,6 +338,7 @@ pub(crate) fn spawn(
         let compression_level = config.compression_level;
         let core_id = core_ids.get(shard_id % core_ids.len().max(1)).copied();
         let coalesce_hint_for_flusher = Arc::clone(&coalesce_hint);
+        let slot = ShardSlot::new(Arc::clone(&registry), shard_id);
 
         let handle = thread::Builder::new()
             .name(format!("wab-flusher-{shard_id}"))
@@ -316,36 +350,48 @@ pub(crate) fn spawn(
                 // Batches buffered in the bounded queue survive a flusher
                 // panic and are drained by the respawned flusher in the
                 // same order.
-                run_with_panic_supervision(shard_id, metrics_for_panic, &RealClock, || {
-                    let sdir = sdir.clone();
-                    let rx = rx.clone();
-                    let drain_clone = drain_clone.clone();
-                    let metrics_for_flusher = Arc::clone(&metrics_for_flusher);
-                    let coalesce_hint = Arc::clone(&coalesce_hint_for_flusher);
-                    move || {
-                        // Production filesystem backend; the DST harness drives
-                        // `flusher_thread` directly with a fault-injecting store.
-                        let store: Arc<dyn SegmentStore> = Arc::new(FsSegmentStore);
-                        flusher_thread(
-                            shard_id as u16,
-                            sdir,
-                            rx,
-                            drain_clone,
-                            batch_size,
-                            batch_deadline,
-                            segment_max_bytes,
-                            segment_max_age,
-                            segment_max_lifetime,
-                            core_id,
-                            metrics_for_flusher,
-                            coalesce_hint,
-                            &RealClock,
-                            store,
-                            compression,
-                            compression_level,
-                        );
-                    }
-                });
+                //
+                // The supervisor's verdict is recorded on the registry; the
+                // return value is for callers (DST, tests) that have no
+                // registry to read.
+                let _ = run_with_panic_supervision(
+                    shard_id,
+                    metrics_for_panic,
+                    &RealClock,
+                    &slot,
+                    || {
+                        let sdir = sdir.clone();
+                        let rx = rx.clone();
+                        let drain_clone = drain_clone.clone();
+                        let metrics_for_flusher = Arc::clone(&metrics_for_flusher);
+                        let coalesce_hint = Arc::clone(&coalesce_hint_for_flusher);
+                        let slot = slot.clone();
+                        move || {
+                            // Production filesystem backend; the DST harness drives
+                            // `flusher_thread` directly with a fault-injecting store.
+                            let store: Arc<dyn SegmentStore> = Arc::new(FsSegmentStore);
+                            flusher_thread(
+                                shard_id as u16,
+                                sdir,
+                                rx,
+                                drain_clone,
+                                batch_size,
+                                batch_deadline,
+                                segment_max_bytes,
+                                segment_max_age,
+                                segment_max_lifetime,
+                                core_id,
+                                metrics_for_flusher,
+                                coalesce_hint,
+                                &RealClock,
+                                store,
+                                compression,
+                                compression_level,
+                                &slot,
+                            )
+                        }
+                    },
+                );
             })
             .map_err(io::Error::other)?;
 
@@ -806,7 +852,8 @@ fn flusher_thread<C: BlockingClock>(
     store: Arc<dyn SegmentStore>,
     compression: Compression,
     compression_level: i32,
-) {
+    slot: &ShardSlot,
+) -> FlusherExit {
     // Core affinity (fail-open: log and continue if denied)
     if let Some(id) = core_id
         && !core_affinity::set_for_current(id)
@@ -853,7 +900,11 @@ fn flusher_thread<C: BlockingClock>(
         let mut attempt = 0u32;
         loop {
             match writer.scan_and_advance_counter() {
-                Ok(()) => break,
+                Ok(()) => {
+                    // The counter is established: this shard can seal safely.
+                    slot.mark_up();
+                    break;
+                }
                 Err(e) if attempt < 3 => {
                     attempt += 1;
                     warn!(shard = shard_id, error = %e, attempt, "segment-counter scan failed; retrying before giving up");
@@ -865,9 +916,10 @@ fn flusher_thread<C: BlockingClock>(
                         error = %e,
                         "segment-counter scan failed repeatedly; refusing to seal at an \
                          unestablished counter (would risk overwriting a recovered sealed \
-                         segment) — taking shard offline; records will Nack until restart"
+                         segment) — taking shard offline; records will Nack until restart \
+                         (weir_wab_shard_up=0, condition shard_offline/no_live_shard)"
                     );
-                    return;
+                    return FlusherExit::CounterScanFailed;
                 }
             }
         }
@@ -1026,6 +1078,7 @@ fn flusher_thread<C: BlockingClock>(
             tracing::error!(shard = shard_id, error = %e, "WAB flusher failed to seal segment on shutdown");
         }
     }
+    FlusherExit::InputClosed
 }
 
 fn flush_batch(
@@ -1996,7 +2049,7 @@ mod tests {
     fn panic_then_recover_factory(
         n_panics: u32,
         panic_payload: &'static str,
-    ) -> impl FnMut() -> Box<dyn FnOnce() + Send> {
+    ) -> impl FnMut() -> Box<dyn FnOnce() -> FlusherExit + Send> {
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         move || {
             let counter = std::sync::Arc::clone(&counter);
@@ -2007,6 +2060,7 @@ mod tests {
                     panic!("{payload}");
                 }
                 // clean return on the (n_panics + 1)th attempt
+                FlusherExit::InputClosed
             })
         }
     }
@@ -2021,6 +2075,7 @@ mod tests {
             0,
             Arc::clone(&m),
             &RealClock,
+            &ShardSlot::detached(),
             panic_then_recover_factory(1, "boom"),
         );
         assert_eq!(m.wab_flusher_panics.get(), 1);
@@ -2037,14 +2092,21 @@ mod tests {
         let m = Arc::new(m);
         let shard = 7;
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-        run_with_panic_supervision(shard, Arc::clone(&m), &RealClock, move || {
-            let counter = std::sync::Arc::clone(&counter);
+        run_with_panic_supervision(
+            shard,
+            Arc::clone(&m),
+            &RealClock,
+            &ShardSlot::detached(),
             move || {
-                if counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
-                    panic!("panic from shard {shard}");
+                let counter = std::sync::Arc::clone(&counter);
+                move || {
+                    if counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                        panic!("panic from shard {shard}");
+                    }
+                    FlusherExit::InputClosed
                 }
-            }
-        });
+            },
+        );
         assert_eq!(m.wab_flusher_panics.get(), 1);
     }
 
@@ -2052,9 +2114,15 @@ mod tests {
     fn supervisor_lets_clean_exit_pass_through() {
         let (m, _reg) = crate::metrics::Metrics::new();
         let m = Arc::new(m);
-        run_with_panic_supervision(0, Arc::clone(&m), &RealClock, || {
-            || { /* normal return on first attempt */ }
-        });
+        run_with_panic_supervision(
+            0,
+            Arc::clone(&m),
+            &RealClock,
+            &ShardSlot::detached(),
+            || {
+                || FlusherExit::InputClosed // normal return on first attempt
+            },
+        );
         assert_eq!(m.wab_flusher_panics.get(), 0);
     }
 
@@ -2071,6 +2139,7 @@ mod tests {
             0,
             Arc::clone(&m),
             &RealClock,
+            &ShardSlot::detached(),
             panic_then_recover_factory(3, "transient boom"),
         );
         assert_eq!(
@@ -2091,10 +2160,16 @@ mod tests {
         let (m, _reg) = crate::metrics::Metrics::new();
         let m = Arc::new(m);
         let start = std::time::Instant::now();
-        run_with_panic_supervision(0, Arc::clone(&m), &RealClock, || {
-            // Every attempt panics — never recovers.
-            || panic!("persistent panic")
-        });
+        run_with_panic_supervision(
+            0,
+            Arc::clone(&m),
+            &RealClock,
+            &ShardSlot::detached(),
+            || {
+                // Every attempt panics — never recovers.
+                || -> FlusherExit { panic!("persistent panic") }
+            },
+        );
         let elapsed = start.elapsed();
         assert_eq!(
             m.wab_flusher_panics.get(),
@@ -2107,6 +2182,145 @@ mod tests {
             elapsed < Duration::from_secs(5),
             "respawn loop should terminate within ~1 s, took {elapsed:?}"
         );
+    }
+
+    // ── Shard registry: the supervisor records terminal states ─────────────────
+
+    use crate::status::{ShardRegistry, ShardSlot, SupervisorExit};
+    use weir_status::{OfflineReason, ShardState};
+
+    fn slot_with_flag(shutting_down: bool) -> ShardSlot {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(shutting_down));
+        ShardSlot::new(Arc::new(ShardRegistry::new(1, 1, flag)), 0)
+    }
+
+    #[test]
+    fn the_supervisor_maps_every_exit_to_a_terminal_registry_state() {
+        let m = Arc::new(crate::metrics::Metrics::new().0);
+        let clock = crate::wab::dst::SimClock::new();
+        let cases: Vec<(
+            bool,
+            FlusherExit,
+            SupervisorExit,
+            ShardState,
+            Option<OfflineReason>,
+        )> = vec![
+            (
+                false,
+                FlusherExit::InputClosed,
+                SupervisorExit::InputClosed,
+                ShardState::Offline,
+                Some(OfflineReason::FlusherExited),
+            ),
+            (
+                true,
+                FlusherExit::InputClosed,
+                SupervisorExit::InputClosed,
+                ShardState::Stopped,
+                None,
+            ),
+            (
+                false,
+                FlusherExit::CounterScanFailed,
+                SupervisorExit::CounterScanFailed,
+                ShardState::Offline,
+                Some(OfflineReason::CounterScanFailed),
+            ),
+        ];
+        for (sd, body_exit, want_exit, want_state, want_reason) in cases {
+            let slot = slot_with_flag(sd);
+            let got =
+                run_with_panic_supervision(0, Arc::clone(&m), &clock, &slot, || move || body_exit);
+            assert_eq!(got, want_exit);
+            assert_eq!(
+                slot.registry().state(0),
+                want_state,
+                "{body_exit:?} shutting_down={sd}"
+            );
+            assert_eq!(slot.registry().reason(0), want_reason);
+        }
+    }
+
+    #[test]
+    fn panic_exhaustion_ends_respawn_exhausted_after_marking_each_respawn() {
+        let m = Arc::new(crate::metrics::Metrics::new().0);
+        let clock = crate::wab::dst::SimClock::new();
+        let slot = slot_with_flag(false);
+        let got = run_with_panic_supervision(0, Arc::clone(&m), &clock, &slot, || {
+            || -> FlusherExit { panic!("persistent panic") }
+        });
+        assert_eq!(got, SupervisorExit::RespawnExhausted);
+        assert_eq!(slot.registry().state(0), ShardState::Offline);
+        assert_eq!(
+            slot.registry().reason(0),
+            Some(OfflineReason::RespawnExhausted)
+        );
+        assert_eq!(slot.registry().respawns(0), MAX_FLUSHER_RESPAWNS);
+    }
+
+    /// The counter-scan give-up used to be a bare `return`, indistinguishable
+    /// from a clean channel close (spec §5.3). A missing shard dir makes every
+    /// `segment_counters` read_dir fail.
+    #[test]
+    fn a_counter_scan_give_up_returns_counter_scan_failed_and_never_marks_up() {
+        let slot = ShardSlot::detached();
+        let (_work_tx, work_rx) = crossbeam_channel::bounded::<Batch>(1);
+        let (drain_tx, _drain_rx) = crossbeam_channel::bounded::<PathBuf>(1);
+        let missing = tmp_dir("counter_scan_missing").join("no_such_shard");
+        let exit = flusher_thread(
+            0,
+            missing,
+            work_rx,
+            drain_tx,
+            1,
+            Duration::from_millis(5),
+            64 * 1024 * 1024,
+            None,
+            None,
+            None,
+            Arc::new(crate::metrics::Metrics::new().0),
+            Arc::new(AtomicU64::new(200)),
+            &crate::wab::dst::SimClock::new(),
+            Arc::new(FsSegmentStore),
+            Compression::None,
+            1,
+            &slot,
+        );
+        assert_eq!(exit, FlusherExit::CounterScanFailed);
+        assert_eq!(
+            slot.registry().state(0),
+            ShardState::Starting,
+            "only the supervisor writes terminal states"
+        );
+    }
+
+    #[test]
+    fn a_flusher_marks_its_shard_up_after_the_counter_scan_and_returns_input_closed() {
+        let slot = ShardSlot::detached();
+        let (work_tx, work_rx) = crossbeam_channel::bounded::<Batch>(1);
+        drop(work_tx); // Disconnected on the first recv
+        let (drain_tx, _drain_rx) = crossbeam_channel::bounded::<PathBuf>(1);
+        let exit = flusher_thread(
+            0,
+            tmp_dir("flusher_marks_up"),
+            work_rx,
+            drain_tx,
+            1,
+            Duration::from_millis(5),
+            64 * 1024 * 1024,
+            None,
+            None,
+            None,
+            Arc::new(crate::metrics::Metrics::new().0),
+            Arc::new(AtomicU64::new(200)),
+            &crate::wab::dst::SimClock::new(),
+            Arc::new(FsSegmentStore),
+            Compression::None,
+            1,
+            &slot,
+        );
+        assert_eq!(exit, FlusherExit::InputClosed);
+        assert_eq!(slot.registry().state(0), ShardState::Up);
     }
 
     #[test]

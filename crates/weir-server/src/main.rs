@@ -1091,6 +1091,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         drain_tx,
         Arc::clone(&metrics),
         Arc::clone(&coalesce_hint),
+        Arc::new(status::ShardRegistry::new(
+            config.shard_count,
+            config.worker_count,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        )), // Task 1.23 replaces this with the board's registry
     )?;
 
     // ── Workers (queue → per-shard Batch channels → flusher directly) ────────
