@@ -37,7 +37,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crossbeam_channel::{Receiver, RecvTimeoutError, TryRecvError};
+use crossbeam_channel::{
+    Receiver, RecvTimeoutError, SendTimeoutError, Sender, TryRecvError, TrySendError,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
@@ -163,8 +165,31 @@ impl BlockingClock for SimClock {
         rx.recv_timeout(timeout)
     }
 
+    /// Never blocks: a full channel charges `timeout` of virtual time and hands
+    /// the value back, exactly as a real `send_timeout` that waited it out.
+    fn send_timeout<T>(
+        &self,
+        tx: &Sender<T>,
+        value: T,
+        timeout: Duration,
+    ) -> Result<(), SendTimeoutError<T>> {
+        match tx.try_send(value) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Disconnected(v)) => Err(SendTimeoutError::Disconnected(v)),
+            Err(TrySendError::Full(v)) => {
+                self.virtual_nanos
+                    .fetch_add(timeout.as_nanos() as u64, SeqCst);
+                Err(SendTimeoutError::Timeout(v))
+            }
+        }
+    }
+
     fn sleep(&self, dur: Duration) {
         self.virtual_nanos.fetch_add(dur.as_nanos() as u64, SeqCst);
+    }
+
+    fn now(&self) -> Duration {
+        self.virtual_elapsed()
     }
 }
 
@@ -335,8 +360,35 @@ impl BlockingClock for SchedClock {
         }
     }
 
+    /// A cooperative point. A full channel yields the turn (NOT blocked: a
+    /// blocked thread is only rescheduled after progress, and nothing in the
+    /// sim drains the drain channel) and reports a timeout.
+    fn send_timeout<T>(
+        &self,
+        tx: &Sender<T>,
+        value: T,
+        timeout: Duration,
+    ) -> Result<(), SendTimeoutError<T>> {
+        match tx.try_send(value) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Disconnected(v)) => Err(SendTimeoutError::Disconnected(v)),
+            Err(TrySendError::Full(v)) => {
+                self.virtual_nanos
+                    .fetch_add(timeout.as_nanos() as u64, SeqCst);
+                self.sched.step(self.id);
+                Err(SendTimeoutError::Timeout(v))
+            }
+        }
+    }
+
     fn sleep(&self, dur: Duration) {
         self.virtual_nanos.fetch_add(dur.as_nanos() as u64, SeqCst);
+    }
+
+    /// Shared virtual time: other sim threads advance it too, which can only
+    /// shorten a budget measured with it, never lengthen it.
+    fn now(&self) -> Duration {
+        Duration::from_nanos(self.virtual_nanos.load(SeqCst))
     }
 }
 
@@ -1535,6 +1587,43 @@ fn run_interleaved_flush(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sim_send_timeout_on_a_full_channel_advances_virtual_time_without_blocking() {
+        use crossbeam_channel::SendTimeoutError;
+        let clock = SimClock::new();
+        let (tx, rx) = crossbeam_channel::bounded::<u32>(1);
+        tx.send(1).unwrap();
+        let t0 = Instant::now();
+        assert!(matches!(
+            clock.send_timeout(&tx, 2, Duration::from_millis(100)),
+            Err(SendTimeoutError::Timeout(2))
+        ));
+        assert!(
+            t0.elapsed() < Duration::from_millis(50),
+            "SimClock must never block the real thread"
+        );
+        assert_eq!(clock.virtual_elapsed(), Duration::from_millis(100));
+        assert_eq!(
+            clock.now(),
+            clock.virtual_elapsed(),
+            "SimClock's now() is its virtual time"
+        );
+
+        // Room again: delivered, and no virtual time is charged for a send that
+        // did not wait.
+        assert_eq!(rx.try_recv().unwrap(), 1);
+        clock
+            .send_timeout(&tx, 3, Duration::from_millis(100))
+            .unwrap();
+        assert_eq!(clock.virtual_elapsed(), Duration::from_millis(100));
+
+        drop(rx);
+        assert!(matches!(
+            clock.send_timeout(&tx, 4, Duration::from_millis(100)),
+            Err(SendTimeoutError::Disconnected(4))
+        ));
+    }
 
     /// Scenario 1: an `EIO` on the group fdatasync must Nack every Durable record
     /// in the batch — no producer is told its record is durable when it isn't.
