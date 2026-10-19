@@ -86,6 +86,13 @@ consecutive polls:
      actually draining, no matter what `drain_state` reads.
    - the immediate `BLOCKED` return (`drain_state{state="blocked_dead_letter_full"}`)
      — reported instantly, not folded into the stability window.
+   - Foundations (4.1) gauges, each a condition only when PRESENT, because a
+     pre-Foundations daemon does not export them and every historical
+     schedule runs against such binaries:
+     `weir_wab_undelivered_segments == 0` (the spec's own drain-out
+     condition, §16; weir's 5 s scan, so it lags the filesystem walk in
+     condition 1, never leads it), and `weir_drain_paused != 1` (a paused
+     drain delivers nothing, so its WAB can look settled while it is not).
 
 Someone will be tempted to go back to metrics because they are one HTTP call
 instead of a directory walk. Don't. Every one of the four bugs above came
@@ -108,6 +115,11 @@ SINK_DOWN = 'weir_sink_health{state="down"}'
 #: Counters, so both carry the `_total` suffix.
 STRANDED = "weir_drain_segments_stranded_total"
 RESUMED = "weir_drain_segments_resumed_total"
+#: Foundations gauges (spec §13). ABSENT on a pre-4.1 daemon, and absence is
+#: not a condition: every historical schedule runs against binaries that do
+#: not export them. Present and non-zero blocks quiescence.
+UNDELIVERED = "weir_wab_undelivered_segments"
+PAUSED = "weir_drain_paused"
 
 #: On-disk extensions, mirroring `crates/weir-wab/src/format.rs`
 #: (`EXT_ACTIVE`/`EXT_SEALED`/`EXT_CONFIRMED`). Duplicated here as string
@@ -418,6 +430,10 @@ def wait_for_quiescence(
         # stranded on a fully-down sink still reads "draining".
         draining = m.get(DRAINING, 0.0) == 1.0
         sink_down = m.get(SINK_DOWN, 1.0)
+        # Unlike the gauges above, absent does NOT block: see UNDELIVERED.
+        undelivered = m.get(UNDELIVERED)
+        nothing_undelivered = undelivered is None or undelivered == 0.0
+        not_paused = m.get(PAUSED, 0.0) != 1.0
 
         no_unconfirmed_sealed = residue.unconfirmed_sealed == 0
         no_buffered_active = residue.nonempty_active == 0
@@ -442,6 +458,10 @@ def wait_for_quiescence(
             unmet.append("drain_state is not 'draining'")
         if sink_down == 1.0:
             unmet.append("sink_health is 'down'")
+        if not nothing_undelivered:
+            unmet.append(f"undelivered_segments={undelivered:.0f}")
+        if not not_paused:
+            unmet.append("drain is paused")
         last_unmet = unmet
 
         if (
@@ -451,6 +471,8 @@ def wait_for_quiescence(
             and depth == 0.0
             and draining
             and sink_down != 1.0
+            and nothing_undelivered
+            and not_paused
         ):
             stable += 1
             if stable >= stable_polls:
