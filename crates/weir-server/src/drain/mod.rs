@@ -715,7 +715,7 @@ fn probe_and_resume_stranded<S: Sink>(
 /// 1.214 s and still confirmed the batch; a 50 ms health-probe timeout
 /// against a 1.5 s blocking health elapsed 1.504 s and returned healthy.
 /// Liveness therefore cannot be observed from inside the drain — this counter
-/// lets a task on another runtime (see `main.rs`'s WAB-growth poll) see it.
+/// lets a task on another runtime (see the WAB-growth poll in `status::poll`) see it.
 ///
 /// Deliberately NOT a fix: the drain still wedges forever against a sink that
 /// never yields. This only makes that state visible in the logs instead of
@@ -906,7 +906,7 @@ impl Drop for BusyGuard<'_> {
 /// an idle-but-healthy drain only bumps the heartbeat that often) before it
 /// warns. Nor is a long freeze on its own proof of a WEDGE specifically: a
 /// drain that has exited leaves the heartbeat frozen forever too, which is why
-/// the poll task also reads `drain_state` (`main.rs`'s `drain_stall_verdict`).
+/// the poll task also reads `drain_state` (`status::poll::drain_stall_verdict`).
 pub(crate) fn drain_appears_stalled(previous: u64, current: u64) -> bool {
     previous == current
 }
@@ -6555,7 +6555,7 @@ mod tests {
     /// closed, delivery is finished," and neither respawned nor counted a
     /// panic; before an earlier, separate fix, `drain_state` also stayed
     /// pre-initialised at `draining = 1` forever, which kept `drain_is_healthy`
-    /// (main.rs) true and the WAB growth warning permanently silent.)
+    /// (`status::poll`) true and the WAB growth warning permanently silent.)
     #[test]
     fn drain_supervisor_publishes_stopped_when_the_dead_letter_writer_cannot_open() {
         let dir = tmp_dir("drain_dl_open_fails");
@@ -9258,12 +9258,18 @@ mod tests {
             longest_freeze = longest_freeze.max(frozen_for);
             let busy = heartbeat.busy();
             assert_ne!(
-                crate::drain_stall_verdict(frozen_for, interval, false, busy, commit_timeout),
-                Some(crate::DrainStallVerdict::Wedged),
+                crate::status::poll::drain_stall_verdict(
+                    frozen_for,
+                    interval,
+                    false,
+                    busy,
+                    commit_timeout
+                ),
+                Some(crate::status::poll::DrainStallVerdict::Wedged),
                 "a slow, yielding sink read as a wedged drain (frozen {frozen_for:?}, busy \
                  {busy:?})"
             );
-            let scaled = crate::classify_drain_stall(
+            let scaled = crate::status::poll::classify_drain_stall(
                 frozen_for >= Duration::from_millis(500),
                 false,
                 busy,
@@ -9271,10 +9277,13 @@ mod tests {
             );
             assert_ne!(
                 scaled,
-                Some(crate::DrainStallVerdict::Wedged),
+                Some(crate::status::poll::DrainStallVerdict::Wedged),
                 "frozen {frozen_for:?}, busy {busy:?}"
             );
-            if matches!(scaled, Some(crate::DrainStallVerdict::SlowSinkCall { .. })) {
+            if matches!(
+                scaled,
+                Some(crate::status::poll::DrainStallVerdict::SlowSinkCall { .. })
+            ) {
                 slow_sink_calls += 1;
             }
         }
@@ -9327,13 +9336,16 @@ mod tests {
         while heartbeat.get() == frozen_at && since.elapsed() < Duration::from_millis(1400) {
             std::thread::sleep(Duration::from_millis(20));
             let busy = heartbeat.busy();
-            if let Some(v) =
-                crate::classify_drain_stall(since.elapsed() >= STALL_AFTER, false, busy, limit)
-            {
+            if let Some(v) = crate::status::poll::classify_drain_stall(
+                since.elapsed() >= STALL_AFTER,
+                false,
+                busy,
+                limit,
+            ) {
                 if verdicts.last() != Some(&std::mem::discriminant(&v)) {
                     verdicts.push(std::mem::discriminant(&v));
                 }
-                if v == crate::DrainStallVerdict::Wedged {
+                if v == crate::status::poll::DrainStallVerdict::Wedged {
                     let (kind, busy_for) = busy.expect("the blocked commit is still busy");
                     assert_eq!(kind, BusyKind::SinkCommit);
                     assert!(busy_for > limit, "{busy_for:?}");
@@ -9341,11 +9353,11 @@ mod tests {
                 }
             }
         }
-        let slow = std::mem::discriminant(&crate::DrainStallVerdict::SlowSinkCall {
+        let slow = std::mem::discriminant(&crate::status::poll::DrainStallVerdict::SlowSinkCall {
             kind: BusyKind::SinkCommit,
             busy_for: Duration::ZERO,
         });
-        let wedged = std::mem::discriminant(&crate::DrainStallVerdict::Wedged);
+        let wedged = std::mem::discriminant(&crate::status::poll::DrainStallVerdict::Wedged);
         assert_eq!(
             verdicts,
             vec![slow, wedged],
