@@ -155,7 +155,6 @@ impl<T> QueueReceiver<T> {
     /// in `recv` and the join never returns (the deadlock main.rs documents
     /// above its pipeline joins). Reads the `Arc` strong count, so nothing is
     /// added to the push path.
-    #[cfg_attr(not(test), allow(dead_code))] // read from PR 4 Task 4.11 (T1); remove there
     pub fn live_senders(&self) -> usize {
         self.alive.strong_count()
     }

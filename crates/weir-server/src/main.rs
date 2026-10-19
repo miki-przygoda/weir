@@ -1,10 +1,7 @@
 mod config;
 mod drain;
 // The shutdown level, the signal task and the bounded drain wait (Foundations
-// §5.6, §7). The bounded-shutdown items (`wait_for_drain`, `ShutdownFacts`,
-// `shutdown_summary`, ...) have no caller until Task 4.11, which removes this
-// allowance.
-#[allow(dead_code)]
+// §5.6, §7).
 mod lifecycle;
 mod logging;
 mod metrics;
@@ -176,6 +173,25 @@ fn spawn_lock_integrity_thread(
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
+/// The daemon. Startup is spec §6 (lock, preflight, runtime and signals,
+/// metrics, recovery, the replay handed to the drain, producer listeners);
+/// shutdown is the bounded §7 sequence:
+///
+/// - **T0** (the signal task, `Lifecycle::request_shutdown`): readiness off,
+///   phase `shutting_down`, drain absorb, the flushers' shutdown flag, and the
+///   lame duck (the producer socket unlinked, the TCP listener closed).
+/// - **T1** (here): await both listeners' bounded connection drains, abort the
+///   queue-depth task, wait up to `QUEUE_SENDERS_GRACE` for every work-queue
+///   sender to go, then join the workers and the flushers (each seals, fsyncs
+///   and hands off within its 1 s budget).
+/// - **T2**: `request_stop(drain_shutdown_budget_secs)`, publish the deadline,
+///   and wait for the drain at most `DRAIN_EXIT_GRACE` past it.
+/// - **T3**: one no-I/O summary line, `shutdown_timeout(1 s)`, exit 0. A drain
+///   that never returned takes the orphan exit, `process::exit(0)`.
+///
+/// A second SIGTERM/SIGINT forces: connection drains abort and the drain
+/// deadline becomes now, but the worker and flusher joins still run. Exit
+/// status is 0 for clean, forced and orphaned exits alike.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Tighten process umask to 0o077 immediately. Defense-in-depth: every
     // file-creation path in weir specifies its mode bits explicitly today, so
@@ -395,10 +411,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .drain_channel_capacity
         .set(wab::DRAIN_CHANNEL_CAPACITY as f64);
 
-    // Foundations PR 2: the drain's control. It stays Detached ("channel
-    // closed = deliver what is queued, then exit") until Task 4.11 flips it to
-    // Attached together with the bounded shutdown that calls request_stop.
-    let drain_ctl = drain::control::DrainControl::detached();
+    // ATTACHED (Foundations §5.4): the drain's lifetime is this control, not the
+    // channel. A closed channel (every flusher gone, e.g. shard_count=1 and the
+    // only flusher offline) no longer ends delivery; only request_stop /
+    // force_stop do. Every path past the drain spawn therefore reaches
+    // request_stop below, or exits the process.
+    let drain_ctl = drain::control::DrainControl::attached();
     // The flushers' shutdown flag (spec §5.5); the Lifecycle sets it at T0.
     let flushers_shutting_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let lifecycle = Arc::new(lifecycle::Lifecycle::new(
@@ -853,12 +871,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         lifecycle.publish_phase(weir_status::Phase::Serving);
     }
 
-    // ── Shutdown (interim; Task 4.11 replaces this with §7 T0-T3) ─────────────
+    // ── T0 ran in the signal task (Lifecycle::request_shutdown): readiness off,
+    //    phase shutting_down, drain absorb, flushers' flag, the lame duck. ──
     let level = rt.block_on(lifecycle.wait_shutdown());
-    info!(?level, "shutdown requested; draining producer connections");
-    // Both accept loops follow the level into lame duck and their bounded
-    // connection drain; wait for both before the pipeline drain below, or
-    // dropping the runtime would cut a TCP drain short (S09).
+    info!(?level, "shutdown: lame duck; draining producer connections");
+
+    // ── T1: ingest closed. The runtime stays up: /metrics, the poll tasks and
+    //    (PR 6) admin `status` keep answering through the joins. Both accept
+    //    loops follow the level into lame duck and their bounded connection
+    //    drain; wait for both before the joins. ──
     rt.block_on(async {
         #[cfg(unix)]
         if let Some(h) = unix_join {
@@ -871,30 +892,105 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     // Off Unix main still holds its sender here; every path ends with none.
     drop(queue_tx.take());
-
-    // ── Graceful pipeline drain ───────────────────────────────────────────────
-    //
-    // Main's queue sender is gone (moved into `serve`, which dropped it, or
-    // dropped above). The queue-depth task holds the last clone: abort it, so
-    // workers observe Disconnected → flush remaining Batches → drop shard_txs
-    // → flusher Disconnected → seal segments → exit → drop drain_tx → drain
-    // delivers what is queued → exits.
+    // The queue-depth task holds the last queue_tx clone: it must go before
+    // the worker join (abort + await, which replaces the old `drop(rt)`).
     queue_depth_task.abort();
     let _ = rt.block_on(queue_depth_task);
-    info!("socket layer shut down; waiting for pipeline to drain");
-
+    // An aborted connection task can still own a sender inside its
+    // spawn_blocking push for up to QUEUE_PUSH_TIMEOUT (§5.7).
+    if !lifecycle::wait_until(
+        lifecycle::QUEUE_SENDERS_GRACE,
+        Duration::from_millis(10),
+        || queue_rx.live_senders() == 0,
+    ) {
+        tracing::error!(
+            live = queue_rx.live_senders(),
+            "a work-queue sender outlived ingest; the worker join waits for it"
+        );
+    }
+    debug_assert_eq!(queue_rx.live_senders(), 0, "a QueueSender outlived ingest");
+    info!(
+        "shutdown: ingest closed; joining workers and flushers (each flusher seals, \
+         fsyncs and hands off)"
+    );
     for h in worker_handles {
         h.join().ok();
     }
+    // Bounded in every drain state: PR 3's hand_off gives up after the
+    // per-flusher 1 s budget once `flushers_shutting_down` is set.
     for h in wab_handle.join_handles {
         h.join().ok();
     }
-    drain_handle.join().ok();
 
-    drop(rt_guard);
-    rt.shutdown_timeout(Duration::from_secs(1));
-    info!("weir shut down cleanly");
-    Ok(())
+    // ── T2: the drain's budget starts now that everything ingested is sealed. ──
+    let budget = Duration::from_secs(config.drain_shutdown_budget_secs);
+    drain_ctl.request_stop(budget); // fetch_min: a forced deadline stays forced
+    // The deadline actually in force (a forced one stays earlier), for
+    // /status, lifecycle.drain_deadline_ms and the gauge.
+    if let Some(deadline_ms) = drain_ctl.deadline_unix_ms() {
+        board
+            .life
+            .set_drain_deadline(deadline_ms, config.drain_shutdown_budget_secs);
+        metrics
+            .drain_shutdown_deadline_seconds
+            .set(deadline_ms as f64 / 1000.0);
+    }
+    info!(
+        budget_secs = config.drain_shutdown_budget_secs,
+        "shutdown: everything ingested is sealed; delivering until the budget ends"
+    );
+    let waited = lifecycle::wait_for_drain(
+        drain_handle,
+        &drain_ctl,
+        lifecycle::DRAIN_EXIT_GRACE,
+        lifecycle::DRAIN_JOIN_POLL,
+    );
+
+    // ── T3: exit. The summary does no I/O (no scan_unconfirmed_sealed). ──
+    // Both `reason` series (budget, disconnected; README Q7).
+    let not_handed_off = metrics.wab_segments_not_handed_off_total();
+    // The last successful size scan (PR 1's poll task writes both).
+    let on_disk = board.wab.last_scan_ok_ms().map(|as_of| lifecycle::OnDisk {
+        bytes: board
+            .wab_bytes_now
+            .load(std::sync::atomic::Ordering::Relaxed),
+        as_of_unix_ms: as_of,
+    });
+    match waited {
+        lifecycle::DrainWait::Joined(exit) => {
+            let facts = lifecycle::ShutdownFacts::from_exit(exit.as_ref(), not_handed_off, on_disk);
+            if facts.left_for_replay() == 0 {
+                info!("{}", lifecycle::shutdown_summary(&facts));
+            } else {
+                warn!("{}", lifecycle::shutdown_summary(&facts));
+            }
+            drop(rt_guard);
+            rt.shutdown_timeout(Duration::from_secs(1));
+            // [PR 6 slot] unlink the admin socket here (remove_own_socket on its
+            // BoundSocket: inode-checked).
+            // The wab_dir lock (wab::lock's process-lifetime static) is released
+            // by the kernel at exit, after everything above.
+            info!("weir shut down cleanly");
+            Ok(())
+        }
+        lifecycle::DrainWait::Orphaned => {
+            let in_flight = board
+                .drain
+                .in_flight
+                .load_full()
+                .map(|f| (f.segment.clone(), f.processed));
+            let facts = lifecycle::ShutdownFacts::orphaned(in_flight, not_handed_off, on_disk);
+            tracing::error!(
+                "drain did not stop within budget; exiting with its in-flight segment \
+                 unconfirmed. {}",
+                lifecycle::shutdown_summary(&facts)
+            );
+            // Without dropping the runtime or the lock: the kernel releases the
+            // flock only once the whole process, orphaned drain thread included,
+            // is gone. Exit status 0 (owner decision).
+            std::process::exit(0);
+        }
+    }
 }
 
 /// The pre-serving shutdown path (spec §6 "A signal before serving"): unlink

@@ -5625,3 +5625,270 @@ fn a_binary_with_test_hooks_announces_them() {
     );
     srv.shutdown();
 }
+
+// ── Bounded shutdown (Foundations §7, PR 4 Task 4.11) ─────────────────────────
+
+/// Every tag in `wanted` (a fixed-length prefix of each payload) shows up in
+/// `sink`'s POST bodies within `within`. At-least-once: duplicates allowed.
+fn assert_all_delivered(sink: &RecordingSink, wanted: &[String], within: Duration) {
+    let len = wanted.first().map_or(0, String::len);
+    let deadline = Instant::now() + within;
+    loop {
+        let got: std::collections::HashSet<String> = sink
+            .bodies()
+            .iter()
+            .filter_map(|b| std::str::from_utf8(b.get(..len)?).ok().map(str::to_owned))
+            .collect();
+        let missing: Vec<&String> = wanted.iter().filter(|w| !got.contains(*w)).collect();
+        if missing.is_empty() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{} of {} acked records were never delivered, e.g. {:?}",
+            missing.len(),
+            wanted.len(),
+            &missing[..missing.len().min(5)]
+        );
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Spec §16 system test 3: SIGTERM with an idle open connection. Within 200 ms
+/// the socket is gone and new connects fail; the idle connection is closed
+/// cleanly (EOF); /metrics keeps answering, reporting `shutting_down`, until
+/// the process exits. (PR 5 adds the `/readyz` 503 assertion here.)
+#[test]
+fn sigterm_unlinks_the_socket_at_once_and_metrics_stay_up_until_exit() {
+    use std::io::Read;
+    let hole = RecordingSink::start_hanging();
+    let mut srv = weir_server!("lame_duck")
+        .extra_config(
+            "sink_type = \"http\"\nsink_timeout_secs = 300\nwab_segment_max_bytes = 4096\n\
+             drain_shutdown_budget_secs = 4",
+        )
+        .env("WEIR_SINK_URL", hole.url())
+        .log_level("info")
+        .start();
+    let mut c = srv.client();
+    for i in 0..8 {
+        let mut p = format!("ld-{i}-").into_bytes();
+        p.resize(2048, b'l');
+        c.push(p, Durability::Durable).unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while hole.connections() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the drain never reached the sink"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let idle = std::os::unix::net::UnixStream::connect(&srv.socket_path).unwrap();
+    idle.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+
+    let t0 = Instant::now();
+    srv.signal(libc::SIGTERM);
+    while srv.socket_path.exists() {
+        assert!(
+            t0.elapsed() < Duration::from_millis(200),
+            "lame duck: the socket must be unlinked within 200 ms of SIGTERM"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        std::os::unix::net::UnixStream::connect(&srv.socket_path).is_err(),
+        "new connects must fail fast"
+    );
+    let mut buf = [0u8; 1];
+    assert_eq!(
+        (&idle)
+            .read(&mut buf)
+            .expect("a clean close, not a reset or a hang"),
+        0,
+        "the idle connection must see EOF"
+    );
+    let body = srv
+        .try_scrape_metrics()
+        .expect("/metrics must answer during shutdown");
+    assert_eq!(
+        parse_metric_f64(&body, "weir_startup_phase{phase=\"shutting_down\"} "),
+        1.0,
+        "{body}"
+    );
+    thread::sleep(Duration::from_secs(1));
+    let body = srv
+        .try_scrape_metrics()
+        .expect("/metrics must stay up while the drain spends its budget");
+    // T2 publishes the deadline in force (spec §13), once the joins are done:
+    // the connection drain here is clean (both connections are idle).
+    assert!(
+        parse_metric_f64(&body, "weir_drain_shutdown_deadline_seconds ") > 0.0,
+        "T2 must publish the drain deadline\n{body}"
+    );
+    let status = srv
+        .wait_for_exit(Duration::from_secs(3 + 4 + 6))
+        .unwrap_or_else(|| panic!("shutdown not bounded\nlog:\n{}", read_log(&srv)));
+    assert!(status.success(), "{status}");
+    drop(c);
+}
+
+/// Spec §16 system test 4: bounded shutdown under a black-holed sink WITH THE
+/// DRAIN CHANNEL FULL at SIGTERM (a flusher is blocked in its hand-off). Exit
+/// within shutdown_timeout + budget + 6 s; nothing is confirmed; a restart
+/// against a working sink delivers every acked record.
+#[test]
+fn bounded_shutdown_with_a_full_drain_channel_loses_no_acked_record() {
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+    let wab = fresh_wab_dir("bounded_full");
+    let hole = RecordingSink::start_hanging();
+    let mut srv = weir_server!("bounded_full")
+        .wab_dir(&wab)
+        .extra_config(
+            "sink_type = \"http\"\nsink_timeout_secs = 300\nwab_segment_max_bytes = 4096\n\
+             drain_shutdown_budget_secs = 2",
+        )
+        .env("WEIR_SINK_URL", hole.url())
+        .log_level("info")
+        .start();
+    let acked = Arc::new(Mutex::new(Vec::<String>::new()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let pusher = {
+        let (path, acked, stop) = (
+            srv.socket_path.clone(),
+            Arc::clone(&acked),
+            Arc::clone(&stop),
+        );
+        thread::spawn(move || {
+            let Ok(mut c) = WeirClient::connect(&path) else {
+                return;
+            };
+            let mut i = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                let tag = format!("full-{i:06}");
+                let mut p = tag.clone().into_bytes();
+                p.resize(1024, b'f');
+                match c.push(p, Durability::Durable) {
+                    Ok(()) => acked.lock().unwrap().push(tag),
+                    Err(_) => break,
+                }
+                i += 1;
+            }
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let depth = parse_metric_f64(&srv.scrape_metrics(), "weir_drain_channel_depth ");
+        if depth >= 256.0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the drain channel never filled (depth {depth})"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    srv.signal(libc::SIGTERM);
+    let status = srv
+        .wait_for_exit(Duration::from_secs(3 + 2 + 6))
+        .unwrap_or_else(|| panic!("shutdown not bounded\nlog:\n{}", read_log(&srv)));
+    stop.store(true, Ordering::Relaxed);
+    pusher.join().unwrap();
+    assert!(status.success(), "{status}");
+    let log = read_log(&srv);
+    assert!(log.contains("left sealed+unconfirmed for replay"), "{log}");
+    assert_eq!(
+        count_wab_files(&wab, ".confirmed"),
+        0,
+        "nothing reached the sink, so nothing may be confirmed"
+    );
+    drop(srv);
+    drop(hole);
+
+    let acked = acked.lock().unwrap().clone();
+    assert!(
+        acked.len() > 256,
+        "the channel cannot fill with {} records",
+        acked.len()
+    );
+    let sink = RecordingSink::start();
+    let srv2 = weir_server!("bounded_full_2")
+        .wab_dir(&wab)
+        .extra_config("sink_type = \"http\"")
+        .env("WEIR_SINK_URL", sink.url())
+        .start();
+    assert_all_delivered(&sink, &acked, Duration::from_secs(120));
+    drop(srv2);
+    let _ = fs::remove_dir_all(&wab);
+}
+
+/// Spec §16 system test 5: with a 120 s budget one SIGTERM keeps waiting on a
+/// black-holed sink; a second forces the exit within the drain-exit grace, exit
+/// status 0, and a restart still delivers every acked record.
+#[test]
+fn a_second_sigterm_forces_a_prompt_exit_and_loses_nothing() {
+    let wab = fresh_wab_dir("second_sigterm");
+    let hole = RecordingSink::start_hanging();
+    let mut srv = weir_server!("second_sigterm")
+        .wab_dir(&wab)
+        .extra_config(
+            "sink_type = \"http\"\nsink_timeout_secs = 300\nwab_segment_max_bytes = 4096\n\
+             drain_shutdown_budget_secs = 120",
+        )
+        .env("WEIR_SINK_URL", hole.url())
+        .log_level("info")
+        .start();
+    let mut c = srv.client();
+    let mut acked = Vec::new();
+    for i in 0..20 {
+        let tag = format!("force-{i:04}");
+        let mut p = tag.clone().into_bytes();
+        p.resize(1024, b'q');
+        c.push(p, Durability::Durable).unwrap();
+        acked.push(tag);
+    }
+    drop(c);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while hole.connections() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the drain never reached the sink"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    srv.signal(libc::SIGTERM);
+    assert!(
+        srv.wait_for_exit(Duration::from_secs(5)).is_none(),
+        "with a 120 s budget one SIGTERM must not exit within 5 s"
+    );
+    srv.signal(libc::SIGTERM);
+    let status = srv
+        .wait_for_exit(Duration::from_secs(2 + 1 + 3))
+        .unwrap_or_else(|| {
+            panic!(
+                "the second SIGTERM did not force an exit\nlog:\n{}",
+                read_log(&srv)
+            )
+        });
+    assert!(
+        status.success(),
+        "a forced exit is still exit 0 (owner decision): {status}"
+    );
+    assert!(read_log(&srv).contains("forced shutdown"));
+    assert_eq!(count_wab_files(&wab, ".confirmed"), 0);
+    drop(srv);
+    drop(hole);
+
+    let sink = RecordingSink::start();
+    let srv2 = weir_server!("second_sigterm_2")
+        .wab_dir(&wab)
+        .extra_config("sink_type = \"http\"")
+        .env("WEIR_SINK_URL", sink.url())
+        .start();
+    assert_all_delivered(&sink, &acked, Duration::from_secs(60));
+    drop(srv2);
+    let _ = fs::remove_dir_all(&wab);
+}

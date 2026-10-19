@@ -758,7 +758,6 @@ pub(crate) struct Metrics {
     pub config_drain_shutdown_budget_seconds: Gauge<f64, AtomicU64>,
     /// Unix time (seconds) at which a bounded shutdown abandons the drain's
     /// in-flight work. 0 until T2 (`request_stop`) sets it.
-    #[cfg_attr(not(test), allow(dead_code))] // read from PR 4 Task 4.11 (T2); remove there
     pub drain_shutdown_deadline_seconds: Gauge<f64, AtomicU64>,
     pub records_nack_internal: Family<NackInternalLabel, Counter<u64, AtomicU64>>,
     #[allow(dead_code)] // written from PR 3 (the accept loop)

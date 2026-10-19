@@ -32,20 +32,18 @@ pub(crate) const SLICE: Duration = Duration::from_millis(50);
 const NO_DEADLINE: u64 = u64::MAX;
 
 /// How the drain treats its channel disconnecting.
-#[cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "called by PR 4 (lifecycle) / PR 6 (admin); tests exercise it now"
-    )
-)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Lifetime {
-    /// Production from PR 4: `Disconnected` is a non-event; the drain exits only
-    /// on `request_stop` / `force_stop` (or when its panic budget is spent).
+    /// Production (main, since PR 4): `Disconnected` is a non-event; the drain
+    /// exits only on `request_stop` / `force_stop` (or when its panic budget is
+    /// spent).
     Attached,
-    /// Today's semantics, kept for the existing tests and for production until
-    /// PR 4: `Disconnected` means "deliver what is queued, then exit".
+    /// The pre-Foundations semantics, kept for the drain's own tests:
+    /// `Disconnected` means "deliver what is queued, then exit".
+    #[cfg_attr(
+        not(test),
+        allow(dead_code, reason = "production is Attached; the drain's tests use it")
+    )]
     Detached,
 }
 
@@ -93,17 +91,12 @@ impl DrainControl {
         }))
     }
 
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "called by PR 4 (lifecycle) / PR 6 (admin); tests exercise it now"
-        )
-    )]
     pub(crate) fn attached() -> Self {
         Self::new(Lifetime::Attached)
     }
 
+    /// The pre-Foundations lifetime, for tests (production is `attached`).
+    #[cfg(test)]
     pub(crate) fn detached() -> Self {
         Self::new(Lifetime::Detached)
     }
@@ -128,13 +121,6 @@ impl DrainControl {
 
     /// T0 (first SIGTERM): absorb mode — move channel arrivals into `pending`
     /// on every wait slice; skip probes, rescans and gauge walks.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "called by PR 4 (lifecycle) / PR 6 (admin); tests exercise it now"
-        )
-    )]
     pub(crate) fn begin_shutdown(&self) {
         self.0.absorb.store(true, Release);
     }
@@ -142,13 +128,6 @@ impl DrainControl {
     /// T2 (after the flusher joins): input is closed, deliver until `budget`
     /// from now, then abandon. The deadline only ever moves earlier, and is
     /// stored before `stop` so a drain that sees `stop` sees the deadline.
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "called by PR 4 (lifecycle) / PR 6 (admin); tests exercise it now"
-        )
-    )]
     pub(crate) fn request_stop(&self, budget: Duration) {
         self.0.input_closed.store(true, Release);
         let budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
@@ -159,13 +138,6 @@ impl DrainControl {
 
     /// Second signal: absorb, and a deadline of now. A later `request_stop`
     /// cannot raise it (both use `fetch_min`).
-    #[cfg_attr(
-        not(test),
-        allow(
-            dead_code,
-            reason = "called by PR 4 (lifecycle) / PR 6 (admin); tests exercise it now"
-        )
-    )]
     pub(crate) fn force_stop(&self) {
         self.0.absorb.store(true, Release);
         self.0.deadline_ms.fetch_min(self.now_ms(), AcqRel);

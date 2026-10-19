@@ -48,8 +48,8 @@ pub(crate) struct DrainSpawnArgs {
     pub(crate) config: DrainConfig,
     pub(crate) metrics: Arc<Metrics>,
     pub(crate) heartbeat: DrainHeartbeat,
-    /// PR 2's control, board and startup backlog. Detached until PR 4 flips
-    /// production to `DrainControl::attached()`.
+    /// PR 2's control, board and startup backlog. Production passes
+    /// `DrainControl::attached()` (PR 4).
     pub(crate) runtime: drain::DrainRuntime,
 }
 
