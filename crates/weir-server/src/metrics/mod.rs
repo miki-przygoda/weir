@@ -295,6 +295,200 @@ pub enum ConfigReloadOutcome {
     dropped,
 }
 
+// ── Foundations: status, lifecycle and conditions (spec §13) ────────────────
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct BuildInfoLabel {
+    pub version: String,
+    pub wire_version: String,
+}
+
+/// `weir_startup_phase{phase}`: the lifecycle phase, one-hot.
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+pub enum StartupPhaseValue {
+    initializing,
+    recovering,
+    handoff,
+    binding,
+    serving,
+    shutting_down,
+}
+
+impl StartupPhaseValue {
+    pub const ALL: [StartupPhaseValue; 6] = [
+        Self::initializing,
+        Self::recovering,
+        Self::handoff,
+        Self::binding,
+        Self::serving,
+        Self::shutting_down,
+    ];
+
+    pub fn of(p: weir_status::Phase) -> Self {
+        use weir_status::Phase;
+        match p {
+            Phase::Initializing => Self::initializing,
+            Phase::Recovering => Self::recovering,
+            Phase::Handoff => Self::handoff,
+            Phase::Binding => Self::binding,
+            Phase::Serving => Self::serving,
+            Phase::ShuttingDown => Self::shutting_down,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct StartupPhaseLabel {
+    pub phase: StartupPhaseValue,
+}
+
+/// `weir_condition_active{code,severity}`: one pre-created series per
+/// catalogue code. Strings because the code set lives in weir-status.
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ConditionLabel {
+    pub code: String,
+    pub severity: String,
+}
+
+impl ConditionLabel {
+    pub fn of(e: &weir_status::CatalogueEntry) -> Self {
+        let severity = match e.severity {
+            weir_status::Severity::Info => "info",
+            weir_status::Severity::Warning => "warning",
+            weir_status::Severity::Critical => "critical",
+        };
+        ConditionLabel {
+            code: e.code.as_str().to_string(),
+            severity: severity.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct ShardLabel {
+    pub shard: String,
+}
+
+impl ShardLabel {
+    pub fn of(id: usize) -> Self {
+        ShardLabel {
+            shard: id.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct WorkerLabel {
+    pub worker: String,
+}
+
+impl WorkerLabel {
+    pub fn of(id: usize) -> Self {
+        WorkerLabel {
+            worker: id.to_string(),
+        }
+    }
+}
+
+/// `weir_drain_pending_segments{queue}`: the live channel, or the backlog
+/// (startup replay and rescans).
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+pub enum DrainQueue {
+    live,
+    backlog,
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct DrainQueueLabel {
+    pub queue: DrainQueue,
+}
+
+/// `weir_sink_last_failure_timestamp_seconds{kind}`: how a sink commit failed.
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+pub enum SinkFailureValue {
+    transient,
+    permanent,
+    timeout,
+    contract_violation,
+}
+
+impl SinkFailureValue {
+    pub const ALL: [SinkFailureValue; 4] = [
+        Self::transient,
+        Self::permanent,
+        Self::timeout,
+        Self::contract_violation,
+    ];
+
+    #[cfg_attr(not(test), allow(dead_code))] // PR 2 (the drain) writes the family
+    pub fn of(k: weir_status::SinkFailureKind) -> Self {
+        use weir_status::SinkFailureKind as K;
+        match k {
+            K::Transient => Self::transient,
+            K::Permanent => Self::permanent,
+            K::Timeout => Self::timeout,
+            K::ContractViolation => Self::contract_violation,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct SinkFailureLabel {
+    pub kind: SinkFailureValue,
+}
+
+/// Why a transient `InternalError` nack went out (spec §5.13). The wire
+/// reason is the same for all of them; only this label tells them apart.
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+pub enum NackInternalCause {
+    queue_full,
+    write_failed,
+    sender_dropped,
+    ack_timeout,
+    wab_cap,
+    coordinate,
+    ownership_lost,
+}
+
+impl NackInternalCause {
+    pub const ALL: [NackInternalCause; 7] = [
+        Self::queue_full,
+        Self::write_failed,
+        Self::sender_dropped,
+        Self::ack_timeout,
+        Self::wab_cap,
+        Self::coordinate,
+        Self::ownership_lost,
+    ];
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct NackInternalLabel {
+    pub cause: NackInternalCause,
+}
+
+/// Why a flusher could not hand a sealed segment to the drain (binding
+/// decision Q7): the shutdown hand-off budget ran out, or the drain was gone.
+#[allow(non_camel_case_types)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, EncodeLabelValue)]
+pub enum NotHandedOffReason {
+    budget,
+    disconnected,
+}
+
+impl NotHandedOffReason {
+    pub const ALL: [NotHandedOffReason; 2] = [Self::budget, Self::disconnected];
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+pub struct NotHandedOffLabel {
+    pub reason: NotHandedOffReason,
+}
+
 // ── Metrics struct ────────────────────────────────────────────────────────────
 
 /// All Prometheus metrics for the weir daemon.
@@ -516,6 +710,61 @@ pub(crate) struct Metrics {
     /// zero while the drain is between operations. Set by the 5 s poll task
     /// from the drain heartbeat's busy atomics.
     pub drain_busy_seconds: Family<DrainBusyLabel, Gauge<f64, AtomicU64>>,
+
+    // ── Foundations: status, lifecycle and conditions (spec §13) ────────────
+    // A field whose writer lands in a later task or PR carries a dead-code
+    // allowance naming it; every family is registered and pre-created from
+    // boot regardless.
+    pub build_info: Family<BuildInfoLabel, Gauge<f64, AtomicU64>>,
+    pub start_time_seconds: Gauge<f64, AtomicU64>,
+    pub startup_phase: Family<StartupPhaseLabel, Gauge<f64, AtomicU64>>,
+    #[allow(dead_code)] // written from the 5 s poll task (Task 1.22)
+    pub ready: Gauge<f64, AtomicU64>,
+    #[allow(dead_code)] // written from the 5 s poll task (Task 1.22)
+    pub live: Gauge<f64, AtomicU64>,
+    pub condition_active: Family<ConditionLabel, Gauge<f64, AtomicU64>>,
+    pub wab_shard_up: Family<ShardLabel, Gauge<f64, AtomicU64>>,
+    pub wab_handoff_blocked_seconds: Family<ShardLabel, Gauge<f64, AtomicU64>>,
+    pub worker_up: Family<WorkerLabel, Gauge<f64, AtomicU64>>,
+    #[allow(dead_code)] // written from the 5 s poll task (Task 1.22)
+    pub wab_cap_rejecting: Gauge<f64, AtomicU64>,
+    #[allow(dead_code)] // written from the lag scan (Task 1.21)
+    pub wab_undelivered_segments: Gauge<f64, AtomicU64>,
+    #[allow(dead_code)] // written from the lag scan (Task 1.21)
+    pub wab_undelivered_records: Gauge<f64, AtomicU64>,
+    #[allow(dead_code)] // written from the lag scan (Task 1.21)
+    pub wab_oldest_undelivered_age_seconds: Gauge<f64, AtomicU64>,
+    pub wab_active_segment_age_seconds: Family<ShardLabel, Gauge<f64, AtomicU64>>,
+    pub drain_pending_segments: Family<DrainQueueLabel, Gauge<f64, AtomicU64>>,
+    #[allow(dead_code)] // written from PR 2 (the drain)
+    pub drain_replay_remaining_segments: Gauge<f64, AtomicU64>,
+    #[allow(dead_code)] // written from the 5 s poll task (Task 1.22)
+    pub drain_heartbeat_age_seconds: Gauge<f64, AtomicU64>,
+    #[allow(dead_code)] // written from PR 2 (the drain)
+    pub drain_commit_in_flight_seconds: Gauge<f64, AtomicU64>,
+    #[allow(dead_code)] // written from PR 2 (the drain)
+    pub drain_paused: Gauge<f64, AtomicU64>,
+    #[allow(dead_code)] // written from PR 2 (the drain)
+    pub drain_generation: Gauge<f64, AtomicU64>,
+    #[allow(dead_code)] // written from PR 2 (the drain)
+    pub sink_last_success_timestamp_seconds: Gauge<f64, AtomicU64>,
+    #[allow(dead_code)] // written from PR 2 (the drain)
+    pub sink_last_failure_timestamp_seconds: Family<SinkFailureLabel, Gauge<f64, AtomicU64>>,
+    #[allow(dead_code)] // written from PR 2 (the drain)
+    pub sink_consecutive_failures: Gauge<f64, AtomicU64>,
+    pub config_wab_max_bytes: Gauge<f64, AtomicU64>,
+    pub config_dead_letter_max_bytes: Gauge<f64, AtomicU64>,
+    pub config_wab_segment_max_bytes: Gauge<f64, AtomicU64>,
+    pub config_segment_max_age_seconds: Gauge<f64, AtomicU64>,
+    pub config_segment_max_lifetime_seconds: Gauge<f64, AtomicU64>,
+    pub config_sink_max_retries: Gauge<f64, AtomicU64>,
+    pub config_shutdown_timeout_seconds: Gauge<f64, AtomicU64>,
+    pub records_nack_internal: Family<NackInternalLabel, Counter<u64, AtomicU64>>,
+    #[allow(dead_code)] // written from PR 3 (the accept loop)
+    pub connections_refused_no_live_shard: Counter<u64, AtomicU64>,
+    #[allow(dead_code)] // written from PR 2 (the drain)
+    pub drain_segments_abandoned: Counter<u64, AtomicU64>,
+    pub wab_segments_not_handed_off: Family<NotHandedOffLabel, Counter<u64, AtomicU64>>,
 }
 
 /// Latency histogram buckets covering 1 ms–10 s; suitable for fsync and network
@@ -933,6 +1182,186 @@ impl Metrics {
              value past commit_timeout means a sink blocking the drain thread"
         );
 
+        // ── Foundations: status, lifecycle and conditions (spec §13) ─────────
+        let build_info = reg!(
+            Family::<BuildInfoLabel, Gauge<f64, AtomicU64>>::default(),
+            "weir_build_info",
+            "Always 1; the labels carry the daemon version and the wire protocol version"
+        );
+        let start_time_seconds = reg!(
+            Gauge::<f64, AtomicU64>::default(),
+            "weir_start_time_seconds",
+            "Unix time the daemon process started"
+        );
+        let startup_phase = reg!(
+            Family::<StartupPhaseLabel, Gauge<f64, AtomicU64>>::default(),
+            "weir_startup_phase",
+            "Lifecycle phase, one-hot: initializing, recovering, handoff, binding, serving, \
+             shutting_down"
+        );
+        let ready = reg!(
+            Gauge::<f64, AtomicU64>::default(),
+            "weir_ready",
+            "1 when the daemon can accept ingest (the /readyz verdict), refreshed every 5 s"
+        );
+        let live = reg!(
+            Gauge::<f64, AtomicU64>::default(),
+            "weir_live",
+            "1 unless a selected liveness check fails (the /livez verdict), refreshed every 5 s"
+        );
+        let condition_active = reg!(
+            Family::<ConditionLabel, Gauge<f64, AtomicU64>>::default(),
+            "weir_condition_active",
+            "1 while the condition is active, 0 otherwise (also 0 while unevaluated); one \
+             series per catalogue code"
+        );
+        let wab_shard_up = reg!(
+            Family::<ShardLabel, Gauge<f64, AtomicU64>>::default(),
+            "weir_wab_shard_up",
+            "1 while the shard's flusher is up or respawning, 0 while starting, offline or stopped"
+        );
+        let wab_handoff_blocked_seconds = reg!(
+            Family::<ShardLabel, Gauge<f64, AtomicU64>>::default(),
+            "weir_wab_handoff_blocked_seconds",
+            "Seconds the shard's flusher has been blocked handing a sealed segment to a full \
+             drain channel; 0 when not blocked"
+        );
+        let worker_up = reg!(
+            Family::<WorkerLabel, Gauge<f64, AtomicU64>>::default(),
+            "weir_worker_up",
+            "1 while the worker thread is running"
+        );
+        let wab_cap_rejecting = reg!(
+            Gauge::<f64, AtomicU64>::default(),
+            "weir_wab_cap_rejecting",
+            "1 while the wab_max_bytes cap is rejecting pushes"
+        );
+        let wab_undelivered_segments = reg!(
+            Gauge::<f64, AtomicU64>::default(),
+            "weir_wab_undelivered_segments",
+            "Sealed segments not yet confirmed delivered (5 s scan)"
+        );
+        let wab_undelivered_records = reg!(
+            Gauge::<f64, AtomicU64>::default(),
+            "weir_wab_undelivered_records",
+            "Records in sealed, undelivered segments, from segment footers (5 s scan)"
+        );
+        let wab_oldest_undelivered_age_seconds = reg!(
+            Gauge::<f64, AtomicU64>::default(),
+            "weir_wab_oldest_undelivered_age_seconds",
+            "Upper bound on the age of the oldest undelivered record, from its segment header; \
+             0 when none"
+        );
+        let wab_active_segment_age_seconds = reg!(
+            Family::<ShardLabel, Gauge<f64, AtomicU64>>::default(),
+            "weir_wab_active_segment_age_seconds",
+            "Age of the shard's active (open) segment; 0 when none"
+        );
+        let drain_pending_segments = reg!(
+            Family::<DrainQueueLabel, Gauge<f64, AtomicU64>>::default(),
+            "weir_drain_pending_segments",
+            "Segments queued in the drain, by queue (live channel items, backlog)"
+        );
+        let drain_replay_remaining_segments = reg!(
+            Gauge::<f64, AtomicU64>::default(),
+            "weir_drain_replay_remaining_segments",
+            "Startup replay segments not yet delivered"
+        );
+        let drain_heartbeat_age_seconds = reg!(
+            Gauge::<f64, AtomicU64>::default(),
+            "weir_drain_heartbeat_age_seconds",
+            "Seconds since the drain heartbeat last moved (5 s poll)"
+        );
+        let drain_commit_in_flight_seconds = reg!(
+            Gauge::<f64, AtomicU64>::default(),
+            "weir_drain_commit_in_flight_seconds",
+            "Seconds the current sink commit has been in flight; 0 when none"
+        );
+        let drain_paused = reg!(
+            Gauge::<f64, AtomicU64>::default(),
+            "weir_drain_paused",
+            "1 while delivery is paused by an operator"
+        );
+        let drain_generation = reg!(
+            Gauge::<f64, AtomicU64>::default(),
+            "weir_drain_generation",
+            "Drain thread starts in this process (1 + respawns)"
+        );
+        let sink_last_success_timestamp_seconds = reg!(
+            Gauge::<f64, AtomicU64>::default(),
+            "weir_sink_last_success_timestamp_seconds",
+            "Unix time of the last successful sink commit; 0 before the first"
+        );
+        let sink_last_failure_timestamp_seconds = reg!(
+            Family::<SinkFailureLabel, Gauge<f64, AtomicU64>>::default(),
+            "weir_sink_last_failure_timestamp_seconds",
+            "Unix time of the last failed sink commit, by failure kind"
+        );
+        let sink_consecutive_failures = reg!(
+            Gauge::<f64, AtomicU64>::default(),
+            "weir_sink_consecutive_failures",
+            "Sink commits failed in a row since the last success"
+        );
+        let config_wab_max_bytes = reg!(
+            Gauge::<f64, AtomicU64>::default(),
+            "weir_config_wab_max_bytes",
+            "Effective wab_max_bytes (0 = no cap)"
+        );
+        let config_dead_letter_max_bytes = reg!(
+            Gauge::<f64, AtomicU64>::default(),
+            "weir_config_dead_letter_max_bytes",
+            "Effective dead_letter_max_bytes"
+        );
+        let config_wab_segment_max_bytes = reg!(
+            Gauge::<f64, AtomicU64>::default(),
+            "weir_config_wab_segment_max_bytes",
+            "Effective wab_segment_max_bytes"
+        );
+        let config_segment_max_age_seconds = reg!(
+            Gauge::<f64, AtomicU64>::default(),
+            "weir_config_segment_max_age_seconds",
+            "Effective wab_segment_max_age_secs (0 = idle seal off)"
+        );
+        let config_segment_max_lifetime_seconds = reg!(
+            Gauge::<f64, AtomicU64>::default(),
+            "weir_config_segment_max_lifetime_seconds",
+            "Effective wab_segment_max_lifetime_secs (0 = lifetime seal off)"
+        );
+        let config_sink_max_retries = reg!(
+            Gauge::<f64, AtomicU64>::default(),
+            "weir_config_sink_max_retries",
+            "Effective sink_max_retries"
+        );
+        let config_shutdown_timeout_seconds = reg!(
+            Gauge::<f64, AtomicU64>::default(),
+            "weir_config_shutdown_timeout_seconds",
+            "Effective shutdown_timeout_secs"
+        );
+        let records_nack_internal = reg!(
+            Family::<NackInternalLabel, Counter<u64, AtomicU64>>::default(),
+            "weir_records_nack_internal",
+            "Transient InternalError nacks, by cause"
+        );
+        let connections_refused_no_live_shard = reg!(
+            Counter::<u64, AtomicU64>::default(),
+            "weir_connections_refused_no_live_shard",
+            "New connections refused because no shard could accept records"
+        );
+        let drain_segments_abandoned = reg!(
+            Counter::<u64, AtomicU64>::default(),
+            "weir_drain_segments_abandoned",
+            "Segments the drain thread left partly delivered when it exited on a stop (the \
+             shutdown deadline, or a stop while the segment was paused or blocked); they stay \
+             sealed and unconfirmed and are re-delivered from record 0 on the next start"
+        );
+        let wab_segments_not_handed_off = reg!(
+            Family::<NotHandedOffLabel, Counter<u64, AtomicU64>>::default(),
+            "weir_wab_segments_not_handed_off",
+            "Sealed segments a flusher could not hand to the drain, by reason: budget (the 1 s \
+             shutdown hand-off budget ran out) or disconnected (the drain was gone); durable, \
+             delivered on restart"
+        );
+
         #[cfg(feature = "bench-trace")]
         let stage_queue = reg!(
             Histogram::new(STAGE_BUCKETS.iter().copied()),
@@ -1009,6 +1438,40 @@ impl Metrics {
             drain_quarantine_failures,
             drain_dead_letter_write_failures,
             drain_busy_seconds,
+            build_info,
+            start_time_seconds,
+            startup_phase,
+            ready,
+            live,
+            condition_active,
+            wab_shard_up,
+            wab_handoff_blocked_seconds,
+            worker_up,
+            wab_cap_rejecting,
+            wab_undelivered_segments,
+            wab_undelivered_records,
+            wab_oldest_undelivered_age_seconds,
+            wab_active_segment_age_seconds,
+            drain_pending_segments,
+            drain_replay_remaining_segments,
+            drain_heartbeat_age_seconds,
+            drain_commit_in_flight_seconds,
+            drain_paused,
+            drain_generation,
+            sink_last_success_timestamp_seconds,
+            sink_last_failure_timestamp_seconds,
+            sink_consecutive_failures,
+            config_wab_max_bytes,
+            config_dead_letter_max_bytes,
+            config_wab_segment_max_bytes,
+            config_segment_max_age_seconds,
+            config_segment_max_lifetime_seconds,
+            config_sink_max_retries,
+            config_shutdown_timeout_seconds,
+            records_nack_internal,
+            connections_refused_no_live_shard,
+            drain_segments_abandoned,
+            wab_segments_not_handed_off,
             #[cfg(feature = "bench-trace")]
             stage_queue,
             #[cfg(feature = "bench-trace")]
@@ -1129,7 +1592,122 @@ impl Metrics {
             });
         }
 
+        // Foundations (spec §9.2 rule 6): every fixed label set exists at 0
+        // from boot. The per-shard and per-worker series are created by
+        // `init_topology` once the topology is known.
+        for phase in StartupPhaseValue::ALL {
+            metrics
+                .startup_phase
+                .get_or_create(&StartupPhaseLabel { phase })
+                .set(0.0);
+        }
+        for e in weir_status::CATALOGUE {
+            metrics
+                .condition_active
+                .get_or_create(&ConditionLabel::of(e))
+                .set(0.0);
+        }
+        for queue in [DrainQueue::live, DrainQueue::backlog] {
+            metrics
+                .drain_pending_segments
+                .get_or_create(&DrainQueueLabel { queue })
+                .set(0.0);
+        }
+        for kind in SinkFailureValue::ALL {
+            metrics
+                .sink_last_failure_timestamp_seconds
+                .get_or_create(&SinkFailureLabel { kind })
+                .set(0.0);
+        }
+        for cause in NackInternalCause::ALL {
+            let _ = metrics
+                .records_nack_internal
+                .get_or_create(&NackInternalLabel { cause });
+        }
+        for reason in NotHandedOffReason::ALL {
+            let _ = metrics
+                .wab_segments_not_handed_off
+                .get_or_create(&NotHandedOffLabel { reason });
+        }
+
         (metrics, reg)
+    }
+}
+
+impl Metrics {
+    /// Pre-creates the per-shard and per-worker series (spec §9.2 rule 6:
+    /// after startup, `get_or_create` only ever takes the read lock).
+    #[cfg_attr(not(test), allow(dead_code))] // Task 1.23 calls this from main
+    pub(crate) fn init_topology(&self, shard_count: usize, worker_count: usize) {
+        for s in 0..shard_count {
+            let l = ShardLabel::of(s);
+            self.wab_shard_up.get_or_create(&l).set(0.0);
+            self.wab_handoff_blocked_seconds.get_or_create(&l).set(0.0);
+            self.wab_active_segment_age_seconds
+                .get_or_create(&l)
+                .set(0.0);
+        }
+        for w in 0..worker_count {
+            self.worker_up.get_or_create(&WorkerLabel::of(w)).set(0.0);
+        }
+    }
+
+    /// Both causes of `weir_wab_segments_not_handed_off_total` summed: what
+    /// PR 3's DST invariant and PR 4's T3 summary read.
+    #[cfg_attr(not(test), allow(dead_code))] // PR 3 / PR 4 call this
+    pub(crate) fn wab_segments_not_handed_off_total(&self) -> u64 {
+        NotHandedOffReason::ALL
+            .into_iter()
+            .map(|reason| {
+                self.wab_segments_not_handed_off
+                    .get_or_create(&NotHandedOffLabel { reason })
+                    .get()
+            })
+            .sum()
+    }
+
+    /// `weir_build_info` and `weir_start_time_seconds`, once at startup.
+    #[cfg_attr(not(test), allow(dead_code))] // Task 1.23 calls this from main
+    pub(crate) fn publish_build_info(&self, version: &str, wire_version: u8) {
+        self.build_info
+            .get_or_create(&BuildInfoLabel {
+                version: version.to_string(),
+                wire_version: wire_version.to_string(),
+            })
+            .set(1.0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0.0, |d| d.as_secs_f64());
+        self.start_time_seconds.set(now);
+    }
+
+    /// The `weir_config_*` gauges: the effective values of the keys an
+    /// operator most often needs next to a dashboard panel.
+    #[cfg_attr(not(test), allow(dead_code))] // Task 1.23 calls this from main
+    pub(crate) fn publish_config(&self, c: &crate::config::Config) {
+        self.config_wab_max_bytes.set(c.wab_max_bytes as f64);
+        self.config_dead_letter_max_bytes
+            .set(c.dead_letter_max_bytes as f64);
+        self.config_wab_segment_max_bytes
+            .set(c.wab_segment_max_bytes as f64);
+        self.config_segment_max_age_seconds
+            .set(c.wab_segment_max_age_secs as f64);
+        self.config_segment_max_lifetime_seconds
+            .set(c.wab_segment_max_lifetime_secs as f64);
+        self.config_sink_max_retries
+            .set(f64::from(c.sink_max_retries));
+        self.config_shutdown_timeout_seconds
+            .set(c.shutdown_timeout_secs as f64);
+    }
+
+    /// Sets `weir_startup_phase` one-hot on `phase`.
+    pub(crate) fn publish_phase(&self, phase: weir_status::Phase) {
+        let current = StartupPhaseValue::of(phase);
+        for p in StartupPhaseValue::ALL {
+            self.startup_phase
+                .get_or_create(&StartupPhaseLabel { phase: p })
+                .set(if p == current { 1.0 } else { 0.0 });
+        }
     }
 }
 
@@ -1227,6 +1805,41 @@ mod tests {
             "weir_drain_quarantine_failures",
             "weir_drain_dead_letter_write_failures",
             "weir_drain_busy_seconds",
+            // Foundations PR 1 (status, lifecycle and conditions)
+            "weir_build_info",
+            "weir_start_time_seconds",
+            "weir_startup_phase",
+            "weir_ready",
+            "weir_live",
+            "weir_condition_active",
+            "weir_wab_shard_up",
+            "weir_wab_handoff_blocked_seconds",
+            "weir_worker_up",
+            "weir_wab_cap_rejecting",
+            "weir_wab_undelivered_segments",
+            "weir_wab_undelivered_records",
+            "weir_wab_oldest_undelivered_age_seconds",
+            "weir_wab_active_segment_age_seconds",
+            "weir_drain_pending_segments",
+            "weir_drain_replay_remaining_segments",
+            "weir_drain_heartbeat_age_seconds",
+            "weir_drain_commit_in_flight_seconds",
+            "weir_drain_paused",
+            "weir_drain_generation",
+            "weir_sink_last_success_timestamp_seconds",
+            "weir_sink_last_failure_timestamp_seconds",
+            "weir_sink_consecutive_failures",
+            "weir_config_wab_max_bytes",
+            "weir_config_dead_letter_max_bytes",
+            "weir_config_wab_segment_max_bytes",
+            "weir_config_segment_max_age_seconds",
+            "weir_config_segment_max_lifetime_seconds",
+            "weir_config_sink_max_retries",
+            "weir_config_shutdown_timeout_seconds",
+            "weir_records_nack_internal",
+            "weir_connections_refused_no_live_shard",
+            "weir_drain_segments_abandoned",
+            "weir_wab_segments_not_handed_off",
         ];
         if cfg!(feature = "bench-trace") {
             expected.extend([
@@ -1329,6 +1942,129 @@ mod tests {
                 out.contains(series),
                 "{series:?} missing or not pre-initialised to 0:\n{out}"
             );
+        }
+    }
+
+    #[test]
+    fn foundations_families_exist_from_boot_with_their_label_sets() {
+        let (m, reg) = Metrics::new();
+        m.init_topology(2, 1);
+        let out = encode_to_string(&reg);
+        for series in [
+            "weir_startup_phase{phase=\"initializing\"} 0",
+            "weir_startup_phase{phase=\"shutting_down\"} 0",
+            "weir_ready 0",
+            "weir_live 0",
+            "weir_condition_active{code=\"starting\",severity=\"info\"} 0",
+            "weir_condition_active{code=\"admin_unavailable\",severity=\"warning\"} 0",
+            "weir_wab_shard_up{shard=\"1\"} 0",
+            "weir_wab_handoff_blocked_seconds{shard=\"0\"} 0",
+            "weir_wab_active_segment_age_seconds{shard=\"1\"} 0",
+            "weir_worker_up{worker=\"0\"} 0",
+            "weir_wab_cap_rejecting 0",
+            "weir_drain_pending_segments{queue=\"live\"} 0",
+            "weir_drain_pending_segments{queue=\"backlog\"} 0",
+            "weir_sink_last_failure_timestamp_seconds{kind=\"contract_violation\"} 0",
+            "weir_records_nack_internal_total{cause=\"queue_full\"} 0",
+            "weir_records_nack_internal_total{cause=\"ownership_lost\"} 0",
+            "weir_connections_refused_no_live_shard_total 0",
+            "weir_drain_segments_abandoned_total 0",
+            "weir_wab_segments_not_handed_off_total{reason=\"budget\"} 0",
+            "weir_wab_segments_not_handed_off_total{reason=\"disconnected\"} 0",
+        ] {
+            assert!(out.contains(series), "{series:?} missing:\n{out}");
+        }
+        assert_eq!(
+            out.matches("weir_condition_active{").count(),
+            30,
+            "one series per daemon code"
+        );
+        assert_eq!(m.wab_segments_not_handed_off_total(), 0);
+    }
+
+    #[test]
+    fn build_info_config_and_phase_publish_once_and_one_hot() {
+        let (m, reg) = Metrics::new();
+        m.publish_build_info("4.1.0", 1);
+        m.publish_phase(weir_status::Phase::Recovering);
+        m.publish_phase(weir_status::Phase::Serving);
+        let out = encode_to_string(&reg);
+        assert!(
+            out.contains("weir_build_info{version=\"4.1.0\",wire_version=\"1\"} 1"),
+            "{out}"
+        );
+        assert!(out.contains("weir_startup_phase{phase=\"serving\"} 1"));
+        assert!(out.contains("weir_startup_phase{phase=\"recovering\"} 0"));
+        let start: f64 = out
+            .lines()
+            .find_map(|l| l.strip_prefix("weir_start_time_seconds "))
+            .expect("start time series")
+            .parse()
+            .unwrap();
+        assert!(start > 1_700_000_000.0, "start time is stamped: {start}");
+    }
+
+    /// The `weir_config_*` gauges carry the effective values, so a dashboard
+    /// can draw the cap next to the usage it bounds.
+    #[test]
+    fn publish_config_sets_the_effective_values() {
+        use crate::config::{Config, PartialConfig};
+        let dir = crate::testutil::scratch_dir("metrics_publish_config");
+        crate::testutil::mkdir_p(&dir);
+        let c = Config::from_layers(
+            PartialConfig {
+                wab_dir: Some(dir),
+                wab_max_bytes: Some(1 << 30),
+                sink_max_retries: Some(7),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+        )
+        .expect("valid config");
+        let (m, _reg) = Metrics::new();
+        m.publish_config(&c);
+        assert_eq!(m.config_wab_max_bytes.get(), (1u64 << 30) as f64);
+        assert_eq!(m.config_sink_max_retries.get(), 7.0);
+        assert_eq!(
+            m.config_dead_letter_max_bytes.get(),
+            c.dead_letter_max_bytes as f64
+        );
+        assert_eq!(
+            m.config_wab_segment_max_bytes.get(),
+            c.wab_segment_max_bytes as f64
+        );
+        assert_eq!(
+            m.config_segment_max_age_seconds.get(),
+            c.wab_segment_max_age_secs as f64
+        );
+        assert_eq!(
+            m.config_segment_max_lifetime_seconds.get(),
+            c.wab_segment_max_lifetime_secs as f64
+        );
+        assert_eq!(
+            m.config_shutdown_timeout_seconds.get(),
+            c.shutdown_timeout_secs as f64
+        );
+    }
+
+    /// The `kind` label value is the wire name weir-status gives the same
+    /// failure kind, so `evidence_from_metrics` reads back what PR 2 writes.
+    #[test]
+    fn sink_failure_label_values_match_the_weir_status_wire_names() {
+        for &k in weir_status::SinkFailureKind::ALL {
+            let (m, reg) = Metrics::new();
+            m.sink_last_failure_timestamp_seconds
+                .get_or_create(&SinkFailureLabel {
+                    kind: SinkFailureValue::of(k),
+                })
+                .set(42.0);
+            let out = encode_to_string(&reg);
+            let series = format!(
+                "weir_sink_last_failure_timestamp_seconds{{kind=\"{}\"}} 42",
+                k.as_str()
+            );
+            assert!(out.contains(&series), "{series:?} missing:\n{out}");
         }
     }
 }

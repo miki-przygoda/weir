@@ -883,6 +883,29 @@ impl StatusBoard {
         })
     }
 
+    /// Moves the lifecycle phase and publishes `weir_startup_phase`.
+    /// Refused (false) once shutting down, exactly as `LifecycleCell::enter`.
+    #[cfg_attr(not(test), allow(dead_code))] // Task 1.23 / PR 3 / PR 4 call this
+    pub(crate) fn enter_phase(&self, phase: Phase, metrics: &crate::metrics::Metrics) -> bool {
+        let moved = self.life.enter(phase, unix_ms_now());
+        if moved {
+            metrics.publish_phase(phase);
+        }
+        moved
+    }
+
+    /// T0 (spec §7 a-b): the shared flag, the phase, and its gauge. True for
+    /// the first caller only. PR 4's Lifecycle calls this; PR 1's signal task
+    /// does.
+    #[cfg_attr(not(test), allow(dead_code))] // Task 1.23 / PR 4 call this
+    pub(crate) fn begin_shutdown(&self, metrics: &crate::metrics::Metrics) -> bool {
+        let first = self.life.begin_shutdown(unix_ms_now());
+        if first {
+            metrics.publish_phase(Phase::ShuttingDown);
+        }
+        first
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test() -> Arc<Self> {
         Self::for_test_with(1, 1)
@@ -1346,5 +1369,22 @@ mod tests {
         l.tcp.set(ListenerState::Bound);
         assert_eq!(l.evidence().len(), 2);
         assert_eq!(l.unix.get(), ListenerState::Bound);
+    }
+
+    #[test]
+    fn entering_a_phase_publishes_the_one_hot_gauge_and_shutdown_marks_shutting_down() {
+        let (m, reg) = crate::metrics::Metrics::new();
+        let b = StatusBoard::for_test();
+        assert!(b.enter_phase(Phase::Binding, &m));
+        assert!(b.begin_shutdown(&m));
+        assert!(!b.begin_shutdown(&m));
+        let mut out = String::new();
+        prometheus_client::encoding::text::encode(&mut out, &reg).unwrap();
+        assert!(
+            out.contains("weir_startup_phase{phase=\"shutting_down\"} 1"),
+            "{out}"
+        );
+        assert!(out.contains("weir_startup_phase{phase=\"binding\"} 0"));
+        assert!(!b.enter_phase(Phase::Serving, &m));
     }
 }
