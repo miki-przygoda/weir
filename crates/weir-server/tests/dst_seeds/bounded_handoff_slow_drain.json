@@ -1,0 +1,6 @@
+{
+  "seed": 11534339,
+  "scenario": { "BoundedHandoff": { "records": 8, "capacity": 1, "flip_after": null, "consume_every": 3 } },
+  "faults": [],
+  "compressed": true
+}

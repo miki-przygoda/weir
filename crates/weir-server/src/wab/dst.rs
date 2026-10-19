@@ -144,11 +144,22 @@ impl Ledger {
 #[derive(Clone, Default)]
 pub struct SimClock {
     virtual_nanos: Arc<AtomicU64>,
+    /// `BoundedHandoff` only: driven by every full-channel `send_timeout`.
+    handoff: Option<Arc<SimHandoffHook>>,
 }
 
 impl SimClock {
     pub fn new() -> Self {
         SimClock::default()
+    }
+
+    /// A SimClock whose full-channel sends drive `hook`: a deterministic
+    /// shutdown flip and a deterministic slow drain, both counted in slices.
+    pub fn with_handoff_hook(hook: Arc<SimHandoffHook>) -> Self {
+        SimClock {
+            virtual_nanos: Arc::default(),
+            handoff: Some(hook),
+        }
     }
 
     /// Total virtual time the clock has advanced (sum of every `sleep` +
@@ -179,6 +190,9 @@ impl BlockingClock for SimClock {
             Err(TrySendError::Full(v)) => {
                 self.virtual_nanos
                     .fetch_add(timeout.as_nanos() as u64, SeqCst);
+                if let Some(hook) = &self.handoff {
+                    hook.on_timeout();
+                }
                 Err(SendTimeoutError::Timeout(v))
             }
         }
@@ -190,6 +204,69 @@ impl BlockingClock for SimClock {
 
     fn now(&self) -> Duration {
         self.virtual_elapsed()
+    }
+}
+
+/// Drives a bounded-channel hand-off deterministically, in units of timed-out
+/// slices: after `flip_after` slices it raises the flusher's `shutting_down`
+/// flag (SIGTERM arriving while the flusher is blocked); every `consume_every`
+/// slices it takes one item off the drain channel (a slow drain). Both happen
+/// inside the flusher's own `send_timeout`, so the run has no second thread
+/// and no wall-clock race: a seed reproduces it exactly.
+pub struct SimHandoffHook {
+    timeouts: AtomicU64,
+    flip_after: Option<u64>,
+    /// Timeouts counted when the flag went up; `u64::MAX` = never.
+    flipped_at: AtomicU64,
+    shutting_down: Arc<AtomicBool>,
+    consume_every: Option<u64>,
+    drain_rx: Receiver<PathBuf>,
+    consumed: Mutex<Vec<PathBuf>>,
+}
+
+impl SimHandoffHook {
+    pub fn new(
+        flip_after: Option<u64>,
+        shutting_down: Arc<AtomicBool>,
+        consume_every: Option<u64>,
+        drain_rx: Receiver<PathBuf>,
+    ) -> Arc<Self> {
+        if flip_after == Some(0) {
+            shutting_down.store(true, SeqCst);
+        }
+        Arc::new(SimHandoffHook {
+            timeouts: AtomicU64::new(0),
+            flip_after,
+            flipped_at: AtomicU64::new(if flip_after == Some(0) { 0 } else { u64::MAX }),
+            shutting_down,
+            consume_every,
+            drain_rx,
+            consumed: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn on_timeout(&self) {
+        let n = self.timeouts.fetch_add(1, SeqCst) + 1;
+        if let Some(k) = self.flip_after
+            && n >= k
+            && !self.shutting_down.swap(true, SeqCst)
+        {
+            self.flipped_at.store(n, SeqCst);
+        }
+        if let Some(e) = self.consume_every
+            && n.is_multiple_of(e)
+            && let Ok(p) = self.drain_rx.try_recv()
+        {
+            self.consumed.lock().unwrap().push(p);
+        }
+    }
+
+    /// Timed-out slices the flusher spent after the flag went up.
+    fn timeouts_after_flip(&self) -> u64 {
+        match self.flipped_at.load(SeqCst) {
+            u64::MAX => 0,
+            at => self.timeouts.load(SeqCst) - at,
+        }
     }
 }
 
@@ -658,6 +735,21 @@ pub enum Scenario {
     /// symptom was duplicate delivery rather than loss, which is why it survived
     /// a crown-invariant suite that only ever asks whether an ack was false.
     RejectedRecordInBatch { records: usize, reject_index: usize },
+    /// The real flusher hands sealed segments to a BOUNDED drain channel of
+    /// `capacity`, pre-filled to capacity, through `SimClock::send_timeout`
+    /// (spec §15's bounded-channel seed family). 50-byte records over a
+    /// 100-byte segment rotate every record or two. `flip_after`: slices until
+    /// `shutting_down` is raised (`Some(0)` = set before the first send,
+    /// `None` = never). `consume_every`: a slow drain takes one item every
+    /// that many slices (`None` = nobody consumes). At least one of the two
+    /// must be set: with neither, the flusher blocks forever, which is
+    /// backpressure working as designed.
+    BoundedHandoff {
+        records: usize,
+        capacity: usize,
+        flip_after: Option<u64>,
+        consume_every: Option<u64>,
+    },
 }
 
 /// A fully specified, reproducible run. Serialises to a `tests/dst_seeds/*.json`
@@ -727,6 +819,19 @@ impl SimSpec {
                 &self.faults,
                 *records,
                 *reject_index,
+                self.compression(),
+            ),
+            Scenario::BoundedHandoff {
+                records,
+                capacity,
+                flip_after,
+                consume_every,
+            } => run_bounded_handoff(
+                self.seed,
+                *records,
+                *capacity,
+                *flip_after,
+                *consume_every,
                 self.compression(),
             ),
         }
@@ -804,6 +909,13 @@ pub struct SimReport {
     /// `MidFileCorruption`: count of segments quarantined during recovery (the
     /// preserved-corrupt-tail metric).
     pub quarantined: u64,
+    /// `BoundedHandoff`: sealed segments that reached the drain channel.
+    pub handed_off: usize,
+    /// `BoundedHandoff`: sealed segments left for replay
+    /// (`weir_wab_segments_not_handed_off_total`, both reasons).
+    pub not_handed_off: u64,
+    /// `BoundedHandoff`: timed-out slices spent after `shutting_down` went up.
+    pub handoff_timeouts_after_flip: u64,
 }
 
 // ── Invariant oracle ────────────────────────────────────────────────────────
@@ -1459,6 +1571,185 @@ fn run_mid_file_corruption(seed: u64, records: usize, corrupt_index: usize) -> S
     }
 }
 
+/// The 1 s shutdown budget in 100 ms slices: the most timed-out slices one
+/// flusher can spend after the flag before its budget is gone.
+fn budget_slices() -> u64 {
+    (super::handoff::FINAL_HANDOFF_TIMEOUT.as_nanos() / super::handoff::HANDOFF_SLICE.as_nanos())
+        as u64
+}
+
+/// Scenario: the timed hand-off against a bounded drain channel (spec §15).
+///
+/// The budget invariant is expressed in slices; the hand-off itself measures
+/// wall time on `SimClock::now()`, which a full channel's slice charge, a
+/// flusher wait or a sleep advances. Any advance besides the slice charges
+/// only shortens the budget, so the slice bound is an upper bound.
+fn run_bounded_handoff(
+    seed: u64,
+    records: usize,
+    capacity: usize,
+    flip_after: Option<u64>,
+    consume_every: Option<u64>,
+    compression: Compression,
+) -> SimReport {
+    assert!(
+        capacity >= 1,
+        "a bounded channel has room for at least one item"
+    );
+    assert!(
+        flip_after.is_some() || consume_every.is_some(),
+        "with neither a shutdown nor a consumer the flusher blocks forever (backpressure)"
+    );
+    let env = SimEnv::new("bounded_handoff");
+    let ledger = Ledger::default();
+    let store: Arc<dyn SegmentStore> = Arc::new(SimSegmentStore::new(
+        SimFaults::from_faults(&[]),
+        ledger.clone(),
+    ));
+
+    let (drain_tx, drain_rx) = crossbeam_channel::bounded::<PathBuf>(capacity);
+    for i in 0..capacity {
+        drain_tx
+            .send(PathBuf::from(format!("prefill-{i}")))
+            .expect("prefill");
+    }
+    let shutting_down = Arc::new(AtomicBool::new(false));
+    let hook = SimHandoffHook::new(
+        flip_after,
+        Arc::clone(&shutting_down),
+        consume_every,
+        drain_rx.clone(),
+    );
+    let clock = SimClock::with_handoff_hook(Arc::clone(&hook));
+    let handoff = super::handoff::HandoffState::new(
+        0,
+        Arc::clone(&shutting_down),
+        Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        None,
+        Arc::clone(&env.metrics),
+    );
+
+    // Fixed 50-byte payloads (index prefix + seed fill) so rotation is
+    // deterministic.
+    let mut rng = SplitMix64::new(seed);
+    let (work_tx, work_rx) = crossbeam_channel::bounded::<Batch>(records.max(1) * 4);
+    let mut payloads = Vec::with_capacity(records);
+    let mut ack_rxs = Vec::with_capacity(records);
+    let mut units = Vec::with_capacity(records);
+    for i in 0..records {
+        let mut p = (i as u64).to_be_bytes().to_vec();
+        p.extend((0..42).map(|_| (rng.next_u64() & 0xFF) as u8));
+        let (ack_tx, ack_rx) = oneshot::channel();
+        ack_rxs.push(ack_rx);
+        units.push(make_unit(p.clone(), Durability::Durable, ack_tx));
+        payloads.push(p);
+    }
+    work_tx.send(make_batch(units)).expect("send batch");
+    drop(work_tx);
+
+    let shard_dir = env.shard_dir(0);
+    let metrics = Arc::clone(&env.metrics);
+    std::thread::spawn(move || {
+        let _ = super::flusher_thread(
+            0,
+            shard_dir,
+            work_rx,
+            drain_tx,
+            records.max(1),
+            Duration::from_millis(5),
+            100,
+            None,
+            None,
+            None,
+            metrics,
+            Arc::new(AtomicU64::new(200)),
+            &clock,
+            store,
+            compression,
+            1,
+            &crate::status::ShardSlot::detached(),
+            handoff,
+        );
+    })
+    .join()
+    .expect("flusher join");
+
+    let acks: Vec<bool> = ack_rxs
+        .into_iter()
+        .map(|mut rx| rx.try_recv().map(|o| o.durable).unwrap_or(false))
+        .collect();
+    for (p, &acked) in payloads.iter().zip(&acks) {
+        if acked {
+            assert_invariant(
+                seed,
+                "i1_acked_true_is_durable",
+                ledger.is_durable_logical(p, compression),
+            );
+        }
+    }
+    // No faults: every Durable record is fsynced before any hand-off, so the
+    // hand-off outcome can never turn an ack false.
+    assert_invariant(seed, "i_handoff_acks_true", acks.iter().all(|a| *a));
+
+    let mut handed: Vec<PathBuf> = hook.consumed.lock().unwrap().clone();
+    handed.extend(drain_rx.try_iter());
+    handed.retain(|p| !p.to_string_lossy().starts_with("prefill-"));
+    let mut on_disk: Vec<PathBuf> = std::fs::read_dir(env.shard_dir(0))
+        .expect("read shard dir")
+        .map(|e| e.expect("dir entry").path())
+        .filter(|p| p.to_string_lossy().ends_with(".wab.sealed"))
+        .collect();
+    on_disk.sort();
+    // Both reasons: a slot that never frees is `budget`; nothing here closes
+    // the channel, so `disconnected` stays 0, but the invariant is about every
+    // segment left for replay, whatever the reason.
+    let not_handed_off = env.metrics.wab_segments_not_handed_off_total();
+
+    // Every sealed segment is handed off exactly once, or counted as left for
+    // replay: nothing durable is silently dropped, nothing is sent twice.
+    let mut handed_sorted = handed.clone();
+    handed_sorted.sort();
+    handed_sorted.dedup();
+    assert_invariant(
+        seed,
+        "i_handoff_no_sealed_segment_lost",
+        handed_sorted.len() == handed.len()
+            && handed.iter().all(|p| on_disk.contains(p))
+            && handed.len() as u64 + not_handed_off == on_disk.len() as u64,
+    );
+    // Outside shutdown the loop is a blocking send: it never gives up.
+    if flip_after.is_none() {
+        assert_invariant(
+            seed,
+            "i_handoff_backpressure_unchanged",
+            not_handed_off == 0,
+        );
+    }
+    // After the flag: <= the per-flusher budget, plus one slice per later
+    // hand-off (spec §5.5 "<= 1 s + 100 ms per remaining rotation").
+    let after = hook.timeouts_after_flip();
+    if flip_after.is_some() {
+        assert_invariant(
+            seed,
+            "i_handoff_bounded",
+            after <= budget_slices() + on_disk.len() as u64,
+        );
+    }
+
+    let recovered = read_sealed_payloads(&env.shard_dir(0));
+    env.cleanup();
+    SimReport {
+        seed,
+        acks,
+        written: payloads,
+        recovered,
+        handed_off: handed.len(),
+        not_handed_off,
+        handoff_timeouts_after_flip: after,
+        ..Default::default()
+    }
+}
+
 /// Scenario (Phase 3) — a producer and the real flusher run as two cooperatively
 /// scheduled threads ([`SimScheduler`]), so the seed deterministically chooses
 /// how the producer's sends interleave with the flusher's receives (i.e. how
@@ -2084,6 +2375,94 @@ mod tests {
         assert_eq!(a.recovered, a.written);
     }
 
+    /// Spec §15: "a deterministic DST seed family with a bounded channel
+    /// through SimClock::send_timeout". Flag set before the first send: every
+    /// sealed segment is either handed off or counted, the acks are all true,
+    /// and the hand-off gives up within the budget.
+    #[test]
+    fn bounded_handoff_with_shutdown_from_the_start_is_bounded_and_loses_nothing() {
+        let r = Sim::new(0xB0_0001)
+            .scenario(Scenario::BoundedHandoff {
+                records: 6,
+                capacity: 1,
+                flip_after: Some(0),
+                consume_every: None,
+            })
+            .run();
+        assert!(r.acks.iter().all(|a| *a), "{:?}", r.acks);
+        assert_eq!(
+            r.handed_off, 0,
+            "nothing consumes, so nothing is handed off"
+        );
+        assert!(
+            r.not_handed_off >= 3,
+            "6 records rotate into >= 3 sealed segments, got {}",
+            r.not_handed_off
+        );
+        assert!(r.handoff_timeouts_after_flip <= super::budget_slices() + r.not_handed_off);
+    }
+
+    /// The flag flips after the flusher has already been blocked for 7 slices.
+    #[test]
+    fn bounded_handoff_flag_raised_mid_block_is_honoured() {
+        let r = Sim::new(0xB0_0002)
+            .scenario(Scenario::BoundedHandoff {
+                records: 4,
+                capacity: 2,
+                flip_after: Some(7),
+                consume_every: None,
+            })
+            .run();
+        assert!(r.acks.iter().all(|a| *a), "{:?}", r.acks);
+        assert!(r.not_handed_off >= 1);
+    }
+
+    /// No shutdown, a drain that takes one item every third slice: backpressure
+    /// only, every segment delivered, nothing given up.
+    #[test]
+    fn bounded_handoff_without_shutdown_only_applies_backpressure() {
+        let r = Sim::new(0xB0_0003)
+            .scenario(Scenario::BoundedHandoff {
+                records: 8,
+                capacity: 1,
+                flip_after: None,
+                consume_every: Some(3),
+            })
+            .run();
+        assert_eq!(r.not_handed_off, 0);
+        assert!(r.handed_off >= 4, "handed off {}", r.handed_off);
+        assert!(r.acks.iter().all(|a| *a), "{:?}", r.acks);
+    }
+
+    #[test]
+    fn bounded_handoff_is_seed_deterministic() {
+        let spec = |seed| {
+            Sim::new(seed)
+                .scenario(Scenario::BoundedHandoff {
+                    records: 7,
+                    capacity: 2,
+                    flip_after: Some(5),
+                    consume_every: Some(4),
+                })
+                .run()
+        };
+        let (a, b) = (spec(0xB0_0004), spec(0xB0_0004));
+        assert_eq!(
+            (
+                a.handed_off,
+                a.not_handed_off,
+                a.handoff_timeouts_after_flip
+            ),
+            (
+                b.handed_off,
+                b.not_handed_off,
+                b.handoff_timeouts_after_flip
+            )
+        );
+        assert_eq!(a.written, b.written);
+        assert_eq!(a.acks, b.acks);
+    }
+
     /// Replays every pinned regression seed in `tests/dst_seeds/`. A spec whose
     /// invariants once failed lives here forever; `run()` re-checks them and
     /// panics with the seed repro on any regression. New failing seeds are
@@ -2165,6 +2544,28 @@ mod tests {
                 .scenario(Scenario::InterleavedFlush {
                     batches: records,
                     records_per_batch: rpb as usize,
+                })
+                .compressed(compressed)
+                .run();
+            // Bounded drain channel through the timed hand-off: a shutdown that
+            // is set from the start, raised mid-block, or never raised (then a
+            // slow drain must exist, or the flusher correctly blocks forever).
+            let capacity = 1 + ((seed >> 40) % 3) as usize;
+            let flip_after = match (seed >> 44) % 3 {
+                0 => None,
+                1 => Some(0),
+                _ => Some(1 + (seed >> 48) % 40),
+            };
+            let consume_every = match (flip_after, (seed >> 54) & 1) {
+                (None, _) | (_, 1) => Some(1 + (seed >> 56) % 5),
+                _ => None,
+            };
+            Sim::new(seed)
+                .scenario(Scenario::BoundedHandoff {
+                    records: records + 1,
+                    capacity,
+                    flip_after,
+                    consume_every,
                 })
                 .compressed(compressed)
                 .run();
