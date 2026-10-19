@@ -248,6 +248,11 @@ enum DrainState {
         processed: u64,
         resume: HeldResume,
     },
+    /// An attempt was abandoned at the deadline; the loop exits on its next pass.
+    Abandoned {
+        segment: PathBuf,
+        processed: u64,
+    },
     BlockedDeadLetterFull {
         segment: PathBuf,
         blocked_since: Instant,
@@ -330,6 +335,10 @@ enum ProcessResult {
     /// in flight and `processed` is exactly the committed prefix, so resuming
     /// past it re-sends nothing.
     Paused { processed: u64 },
+    /// The stop deadline passed before the next batch, or during a commit
+    /// (spec §5.4). `processed` is the committed prefix. Maps to drain exit;
+    /// never confirmed.
+    Abandoned { processed: u64 },
 }
 
 enum BatchResult {
@@ -347,6 +356,10 @@ enum BatchResult {
         needed: u64,
         owed: DeadLetterOwed,
     },
+    /// The stop deadline passed while the sink commit was in flight; the
+    /// commit future was dropped (the `commit_timeout` drop semantics, with no
+    /// retry bump and no backoff).
+    Abandoned,
 }
 
 /// What a sub-batch still owes the dead-letter directory after its sink call:
@@ -1902,6 +1915,24 @@ fn drain_thread_with<S: Sink>(
                     let wait_start = Instant::now();
                     let mut wait_end = wait_start + next_delay;
                     loop {
+                        // Spec §5.4: a backoff that would end after the
+                        // deadline is abandoned now, not served. A pause
+                        // outranks it: the paused branch below exits at once
+                        // too, as `Stopped` (pause honoured at stop).
+                        if control.stop_requested()
+                            && !control.pause_requested()
+                            && (control.deadline_passed()
+                                || control.deadline().is_some_and(|d| wait_end > d))
+                        {
+                            info!(
+                                path = %segment.display(),
+                                processed,
+                                "drain: stop requested and this retry would fire after the deadline; \
+                                 leaving the segment unconfirmed"
+                            );
+                            abandoned = Some((segment.clone(), processed));
+                            break 'outer DrainExitReason::DeadlineAbandoned;
+                        }
                         {
                             let now = Instant::now();
                             let base = config.base_retry_delay;
@@ -2010,9 +2041,12 @@ fn drain_thread_with<S: Sink>(
                         ) {
                             Wait::Segment(new_seg) => pending.push_back(new_seg),
                             Wait::TimedOut => {}
-                            // Task 2.11 turns this into an exit; until then the
-                            // retry runs at once and the Draining head exits.
-                            Wait::Stop => break,
+                            // The deadline passed inside the backoff: the retry
+                            // never fires (spec §5.4).
+                            Wait::Stop => {
+                                abandoned = Some((segment.clone(), processed));
+                                break 'outer DrainExitReason::DeadlineAbandoned;
+                            }
                             // Detached shutdown: serve the clamped remainder of the
                             // backoff (W2), then finish the retry.
                             Wait::Disconnected => {
@@ -2112,11 +2146,16 @@ fn drain_thread_with<S: Sink>(
                     .set(blocked_since.elapsed().as_secs_f64());
 
                 // Drain new segments into the pending buffer while waiting.
-                // Wait in `wait_slice` slices to notice a shutdown: a Detached
-                // channel disconnecting or a passed stop deadline.
-                let mut channel_closed = false;
+                // Wait in `wait_slice` slices to notice a shutdown: any stop
+                // request (spec §5.4: Blocked exits on any stop, deadline or
+                // not) or a Detached channel disconnecting.
+                let mut stop_seen = false;
                 let check_end = Instant::now() + config.dead_letter_check_interval;
                 loop {
+                    if control.stop_requested() {
+                        stop_seen = true;
+                        break;
+                    }
                     // Same reasoning as the retry-backoff wait above: this arm
                     // parks for `dead_letter_check_interval` (30 s by default)
                     // and can re-park indefinitely while an operator frees
@@ -2159,7 +2198,7 @@ fn drain_thread_with<S: Sink>(
                         Wait::Segment(new_seg) => pending.push_back(new_seg),
                         Wait::TimedOut => {}
                         Wait::Stop | Wait::Disconnected => {
-                            channel_closed = true;
+                            stop_seen = true;
                             break;
                         }
                     }
@@ -2251,14 +2290,16 @@ fn drain_thread_with<S: Sink>(
                         backoff_cut: false,
                         waited: false,
                     }
-                } else if channel_closed {
-                    // No headroom and shutdown requested — leave segment unconfirmed.
-                    // Crash recovery will replay it on next start.
-                    info!(
-                        path = %segment.display(),
-                        "drain: shutdown while blocked; segment not confirmed"
-                    );
-                    break 'outer DrainExitReason::Stopped;
+                } else if stop_seen {
+                    // No headroom and a stop (or a Detached disconnect): leave the
+                    // segment unconfirmed; replay delivers it on the next start.
+                    info!(path = %segment.display(), "drain: stop while blocked; segment not confirmed");
+                    abandoned = Some((segment, processed));
+                    break 'outer if control.deadline_passed() {
+                        DrainExitReason::DeadlineAbandoned
+                    } else {
+                        DrainExitReason::Stopped
+                    };
                 } else {
                     DrainState::BlockedDeadLetterFull {
                         segment,
@@ -2267,6 +2308,18 @@ fn drain_thread_with<S: Sink>(
                         needed,
                     }
                 }
+            }
+
+            // ── Abandoned at the stop deadline (spec §5.4) ────────────────────
+            DrainState::Abandoned { segment, processed } => {
+                warn!(
+                    path = %segment.display(),
+                    processed,
+                    "drain: stop deadline reached; abandoning the segment in flight (left sealed and \
+                     unconfirmed; its first {processed} records re-deliver on replay)"
+                );
+                abandoned = Some((segment, processed));
+                break 'outer DrainExitReason::DeadlineAbandoned;
             }
 
             // ── Held: paused mid-segment (spec §5.4, §8) ──────────────────────
@@ -2550,6 +2603,12 @@ fn next_state_after_process(
                 processed,
                 resume,
             }
+        }
+        // The stop deadline passed before a batch or during a commit: never
+        // confirmed. The cursor is recorded like any other partial result.
+        ProcessResult::Abandoned { processed } => {
+            ledger.record_progress(&segment, processed);
+            DrainState::Abandoned { segment, processed }
         }
     }
 }
@@ -3233,6 +3292,13 @@ async fn process_segment_ctl<S: Sink>(
 /// here and `durable_through` is the committed prefix, so stopping here costs
 /// no duplicate on resume.
 fn batch_gate(ctx: &DrainCtx<'_>, durable_through: u64) -> Option<ProcessResult> {
+    // The deadline outranks a pause: both stop before the batch, but only the
+    // deadline ends the drain.
+    if ctx.control.stop_requested() && ctx.control.deadline_passed() {
+        return Some(ProcessResult::Abandoned {
+            processed: durable_through,
+        });
+    }
     if ctx.control.pause_requested() {
         return Some(ProcessResult::Paused {
             processed: durable_through,
@@ -3306,6 +3372,7 @@ fn apply_batch(
             needed,
             carry: Some(owed.into_carry(processed + n)),
         }),
+        BatchResult::Abandoned => Err(ProcessResult::Abandoned { processed }),
     }
 }
 
@@ -3747,9 +3814,28 @@ async fn commit_batch_ctl<S: Sink>(
     // the thread instead of yielding defeats the timeout, and the guard staying
     // set past `commit_timeout` is how the poll task tells that wedge from a
     // merely slow commit. It is dropped before the dead-letter write below.
+    //
+    // The commit also races the stop deadline (spec §5.4): past it the commit
+    // future is dropped, exactly as `commit_timeout` drops it, but with no
+    // retry bump and no backoff. Without a deadline `deadline_reached()` never
+    // resolves, so `biased` plus its 50 ms poll costs one timer wake per 50 ms
+    // of commit and nothing else.
     let timed = {
         let _busy = BusyGuard::new(hb, BusyKind::SinkCommit);
-        tokio::time::timeout(config.commit_timeout, sink.commit(batch)).await
+        tokio::select! {
+            biased;
+            r = tokio::time::timeout(config.commit_timeout, sink.commit(batch)) => Some(r),
+            () = ctx.control.deadline_reached() => None,
+        }
+    };
+    let Some(timed) = timed else {
+        warn!(
+            records = payloads.len(),
+            "drain: the stop deadline passed during a sink commit; abandoning it (the segment stays \
+             sealed and unconfirmed and replays on the next start; the sink may already have \
+             applied this batch, which its idempotency absorbs)"
+        );
+        return BatchResult::Abandoned;
     };
     let commit = match timed {
         Ok(inner) => inner,

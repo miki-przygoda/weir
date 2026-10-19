@@ -7,6 +7,7 @@ use crate::drain::control::{DrainControl, DrainRuntime};
 use crate::drain::publish::Publisher;
 use crate::drain::{DrainCtx, DrainExit, Wait, spawn_with, wait_slice};
 use crate::status::{DrainExitReason, StatusBoard};
+use crate::wab::segment::segment_identity;
 use crate::wab::{
     format::Compression,
     segment::{WabSegment, segment_path},
@@ -882,4 +883,199 @@ fn a_paused_wait_slice_never_returns_early_on_a_zero_duration() {
         "the pause floor: {:?}",
         t.elapsed()
     );
+}
+
+/// Spec §16 drain test 2: budget 0 against a 2 s (yielding) sink commit. Exit
+/// within 100 ms, nothing confirmed, one segment abandoned.
+#[test]
+fn a_zero_budget_abandons_a_commit_in_flight_within_100ms() {
+    let dir = tmp_dir("fnd_budget_zero");
+    let sealed = seg(&dir, 1, &[b"slow"]);
+    let sink = Arc::new(MockSink::with_yielding_commit(Duration::from_secs(2), 1000));
+    let control = DrainControl::attached();
+    let metrics = noop_metrics();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let h = start(
+        rx,
+        &sink,
+        quiet(dir.clone()),
+        &metrics,
+        rt_with(control.clone(), None, Vec::new()),
+    );
+    tx.send(sealed.clone()).unwrap();
+    wait_for(5, "the commit is in flight", || sink.call_count() == 1);
+    let t = Instant::now();
+    control.request_stop(Duration::ZERO);
+    let exit = join_within(h, Duration::from_secs(1));
+    assert!(
+        t.elapsed() < Duration::from_millis(100),
+        "exit took {:?}",
+        t.elapsed()
+    );
+    assert_eq!(exit.reason, DrainExitReason::DeadlineAbandoned);
+    assert_eq!(exit.abandoned, Some((segment_identity(&sealed), 0)));
+    assert!(
+        sealed.exists() && !get_confirmed_path(&sealed).exists(),
+        "never confirmed"
+    );
+    assert_eq!(metrics.drain_segments_abandoned.get(), 1);
+    drop(tx);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// Spec §16 drain test 4: stop in RetryingTransient with wait_end > deadline.
+#[test]
+fn a_backoff_that_would_outlast_the_deadline_exits_at_once() {
+    let dir = tmp_dir("fnd_backoff_deadline");
+    let sealed = seg(&dir, 1, &[b"x"]);
+    let sink = Arc::new(MockSink::with_responses([Err(
+        MockError::TransientWithRetryAfter(Duration::from_secs(10)),
+    )]));
+    let control = DrainControl::attached();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let h = start(
+        rx,
+        &sink,
+        quiet(dir.clone()),
+        &noop_metrics(),
+        rt_with(control.clone(), None, Vec::new()),
+    );
+    tx.send(sealed.clone()).unwrap();
+    wait_for(5, "the first attempt failed", || sink.call_count() == 1);
+    std::thread::sleep(Duration::from_millis(50)); // inside the 10 s backoff
+    let t = Instant::now();
+    control.request_stop(Duration::from_secs(1));
+    let exit = join_within(h, Duration::from_secs(1));
+    assert!(
+        t.elapsed() < Duration::from_millis(200),
+        "{:?}",
+        t.elapsed()
+    );
+    assert_eq!(exit.reason, DrainExitReason::DeadlineAbandoned);
+    assert_eq!(exit.abandoned, Some((segment_identity(&sealed), 0)));
+    assert_eq!(sink.call_count(), 1, "the retry never fired");
+    assert!(sealed.exists());
+    drop(tx);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// Spec §16 drain test 5: stop while BlockedDeadLetterFull.
+#[test]
+fn a_stop_while_blocked_on_dead_letter_headroom_exits() {
+    let dir = tmp_dir("fnd_blocked_stop");
+    let sealed = seg(&dir, 1, &[b"record"]);
+    let dl_dir = dir.join("dead_letter");
+    crate::testutil::mkdir_p(&dl_dir);
+    std::fs::write(dl_dir.join("dl_00000001.wab.sealed"), vec![0u8; 200]).unwrap();
+    let sink = Arc::new(MockSink::with_responses([Err(MockError::Permanent)]));
+    let cfg = DrainConfig {
+        dead_letter_check_interval: Duration::from_millis(1500),
+        health_poll_interval: Duration::from_secs(60),
+        ..tight_dl_config(dir.clone(), 100)
+    };
+    let control = DrainControl::attached();
+    let metrics = noop_metrics();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let h = start(
+        rx,
+        &sink,
+        cfg,
+        &metrics,
+        rt_with(control.clone(), None, Vec::new()),
+    );
+    tx.send(sealed.clone()).unwrap();
+    wait_for(5, "blocked on dead-letter headroom", || {
+        drain_is_blocked(&metrics)
+    });
+    control.request_stop(Duration::from_secs(10));
+    let exit = join_within(h, Duration::from_millis(500));
+    assert_eq!(exit.reason, DrainExitReason::Stopped);
+    assert_eq!(exit.abandoned, Some((segment_identity(&sealed), 0)));
+    assert!(sealed.exists());
+    drop(tx);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// Spec §16 drain test 6: force_stop during a yielding commit is Abandoned,
+/// with no `retried` bump (it is not a sink failure).
+#[test]
+fn force_stop_abandons_a_yielding_commit_without_counting_a_retry() {
+    let dir = tmp_dir("fnd_force_commit");
+    let sealed = seg(&dir, 1, &[b"x"]);
+    let sink = Arc::new(MockSink::with_yielding_commit(Duration::from_secs(2), 1000));
+    let control = DrainControl::attached();
+    let metrics = noop_metrics();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let h = start(
+        rx,
+        &sink,
+        quiet(dir.clone()),
+        &metrics,
+        rt_with(control.clone(), None, Vec::new()),
+    );
+    tx.send(sealed.clone()).unwrap();
+    wait_for(5, "the commit is in flight", || sink.call_count() == 1);
+    control.force_stop();
+    let exit = join_within(h, Duration::from_millis(200));
+    assert_eq!(exit.reason, DrainExitReason::DeadlineAbandoned);
+    assert_eq!(records_retried(&metrics), 0);
+    assert!(sealed.exists());
+    drop(tx);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+/// Spec §16 drain test 7: force_stop then main's T2 request_stop(10 s): the
+/// forced deadline stands (fetch_min), so the drain exits within the grace.
+#[test]
+fn force_stop_then_request_stop_still_exits_within_the_grace() {
+    let dir = tmp_dir("fnd_force_then_stop");
+    let sealed = seg(&dir, 1, &[b"x"]);
+    let sink = Arc::new(MockSink::with_yielding_commit(Duration::from_secs(5), 1000));
+    let control = DrainControl::attached();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let h = start(
+        rx,
+        &sink,
+        quiet(dir.clone()),
+        &noop_metrics(),
+        rt_with(control.clone(), None, Vec::new()),
+    );
+    tx.send(sealed.clone()).unwrap();
+    wait_for(5, "the commit is in flight", || sink.call_count() == 1);
+    control.force_stop();
+    control.request_stop(Duration::from_secs(10));
+    let exit = join_within(h, Duration::from_secs(2)); // DRAIN_EXIT_GRACE
+    assert_eq!(exit.reason, DrainExitReason::DeadlineAbandoned);
+    drop(tx);
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn process_segment_ctl_abandons_before_a_batch_once_the_deadline_has_passed() {
+    let dir = tmp_dir("fnd_gate_deadline");
+    let (sealed, _) = make_numbered_segment(&dir, 4);
+    let sink = MockSink::with_batch_size(2, []);
+    let control = DrainControl::attached();
+    control.force_stop();
+    control.request_pause(); // the deadline outranks a pause
+    let (publish, hb) = (Publisher::none(), DrainHeartbeat::new());
+    let ctx = DrainCtx {
+        control: &control,
+        publish: &publish,
+        hb: &hb,
+    };
+    let mut dl = DeadLetterWriter::open(&dir).unwrap();
+    let r = block_on(crate::drain::process_segment_ctl(
+        &sealed,
+        &sink,
+        &fast_config(dir.clone()),
+        &noop_metrics(),
+        &mut dl,
+        0,
+        false,
+        &ctx,
+    ));
+    assert!(matches!(r, ProcessResult::Abandoned { processed: 0 }));
+    assert_eq!(sink.call_count(), 0);
+    std::fs::remove_dir_all(dir).ok();
 }
