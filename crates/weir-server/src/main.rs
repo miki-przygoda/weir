@@ -421,7 +421,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Drain channel ─────────────────────────────────────────────────────────
 
-    let (drain_tx, drain_rx) = crossbeam_channel::bounded::<std::path::PathBuf>(256);
+    let (drain_tx, drain_rx) =
+        crossbeam_channel::bounded::<std::path::PathBuf>(wab::DRAIN_CHANNEL_CAPACITY);
+    metrics
+        .drain_channel_capacity
+        .set(wab::DRAIN_CHANNEL_CAPACITY as f64);
     // Startup-only sender for replaying sealed-but-unconfirmed segments from a
     // previous run. Replay runs AFTER the drain consumer is spawned (below) so
     // the blocking bounded-channel sends drain live instead of dead-locking the

@@ -163,6 +163,11 @@ pub(crate) fn panic_message_str(payload: &Box<dyn std::any::Any + Send>) -> &str
 /// after the first panic) is the upper bound of how-bad-can-it-get.
 pub(crate) const MAX_FLUSHER_RESPAWNS: u32 = 10;
 
+/// Capacity of the flusher → drain channel. It is the implicit disk bound
+/// between seal and delivery (spec §18 SP-H invariant): outside shutdown no
+/// flusher sends without blocking, so at most this many sealed segments wait.
+pub(crate) const DRAIN_CHANNEL_CAPACITY: usize = 256;
+
 /// Wraps a flusher body in `catch_unwind` and, on panic, respawns the
 /// flusher up to `MAX_FLUSHER_RESPAWNS` times. Each respawn:
 ///   - bumps `weir_wab_flusher_panics`,

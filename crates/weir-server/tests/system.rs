@@ -842,6 +842,9 @@ fn metrics_all_families_registered() {
         "weir_sink_health",
         "weir_sink_info",
         "weir_queue_depth",
+        // PR 3 (Task 3.6)
+        "weir_drain_channel_depth",
+        "weir_drain_channel_capacity",
         // Recovery
         "weir_recovery_records_replayed",
         "weir_recovery_segments_quarantined",
