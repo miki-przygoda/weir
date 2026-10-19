@@ -126,21 +126,26 @@ guards the systemd the runner ships, not every host's, so the check above is
 still worth running on an unusual distribution. If you tighten the filter, keep
 `flock` in it.
 
-## Graceful shutdown: `TimeoutStopSec` vs `shutdown_timeout_secs`
+## Graceful shutdown: `TimeoutStopSec`, `shutdown_timeout_secs` and `drain_shutdown_budget_secs`
 
-On `systemctl stop` (or a host shutdown), systemd sends `SIGTERM`. weir traps it,
-seals the open WAB segment, drains in-flight connections, then exits. Two
-timeouts bound that:
+On `systemctl stop` (or a host shutdown), systemd sends `SIGTERM`. weir unlinks
+its socket at once (new connects fail fast), lets open connections finish,
+seals every active WAB segment, gives the drain a bounded budget, and exits.
+Three settings bound that:
 
-- **`shutdown_timeout_secs`** (in `weir.toml`, default **30**) — how long *weir*
-  waits for in-flight connections to finish before forcibly closing them.
-- **`TimeoutStopSec`** (in `weir.service`, **35**) — how long *systemd* waits
-  after `SIGTERM` before escalating to `SIGKILL`.
+- **`shutdown_timeout_secs`** (in `weir.toml`, default **30**): how long open
+  connections may take to finish.
+- **`drain_shutdown_budget_secs`** (in `weir.toml`, default **10**): how long the
+  drain keeps delivering once everything is sealed; the rest replays at the
+  next start.
+- **`TimeoutStopSec`** (in `weir.service`, **45**): how long *systemd* waits
+  before `SIGKILL`.
 
-Keep `TimeoutStopSec` a few seconds **above** `shutdown_timeout_secs` so the
-daemon completes its own drain before systemd kills it. If you raise
-`shutdown_timeout_secs` (e.g. for long-running batched producers), raise
-`TimeoutStopSec` to match (`shutdown_timeout_secs + ~5s`).
+Keep `TimeoutStopSec` at least
+`shutdown_timeout_secs + drain_shutdown_budget_secs + 5`: **45 s** at the
+defaults. A second `systemctl kill --signal=SIGTERM weir` forces a prompt exit
+(open connections aborted, the drain stopped); the seal still runs, so no
+acked record is lost.
 
 ## TCP + mutual TLS on this deployment path
 

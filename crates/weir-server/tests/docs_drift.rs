@@ -938,3 +938,54 @@ fn the_startup_order_doc_lists_the_phases_in_order() {
         "the socket layer takes a watch<ShutdownLevel>, not a CancellationToken"
     );
 }
+
+const SYSTEMD_UNIT: &str = include_str!("../../../deploy/systemd/weir.service");
+const SYSTEMD_README: &str = include_str!("../../../deploy/systemd/README.md");
+const COMPOSE: &str = include_str!("../../../deploy/docker/docker-compose.yml");
+
+/// `[default: N]` from the CLI help line naming `flag`.
+fn help_default(flag: &str) -> u64 {
+    let line = CONFIG_CLI_SRC
+        .lines()
+        .skip_while(|l| !l.contains(flag))
+        .take(3)
+        .collect::<String>();
+    line.split("[default: ")
+        .nth(1)
+        .and_then(|s| s.split(']').next())
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no `[default: N]` for {flag} in src/config/cli.rs HELP"))
+}
+
+/// Foundations §7: the orchestrator grace must be at least
+/// shutdown_timeout_secs + drain_shutdown_budget_secs + 5, derived here from
+/// the defaults the binary actually ships, and stated identically in every
+/// deploy file and doc that states it.
+#[test]
+fn the_shutdown_grace_follows_the_shutdown_bound_everywhere() {
+    let grace =
+        help_default("--shutdown-timeout-secs") + help_default("--drain-shutdown-budget-secs") + 5;
+    assert!(
+        SYSTEMD_UNIT
+            .lines()
+            .any(|l| l.trim() == format!("TimeoutStopSec={grace}")),
+        "deploy/systemd/weir.service must set TimeoutStopSec={grace}"
+    );
+    assert!(
+        COMPOSE.contains(&format!("stop_grace_period: {grace}s")),
+        "deploy/docker/docker-compose.yml must set stop_grace_period: {grace}s"
+    );
+    for (name, doc) in [
+        ("configuration.md", CONFIGURATION),
+        ("deploy/systemd/README.md", SYSTEMD_README),
+    ] {
+        assert!(
+            doc.contains("shutdown_timeout_secs + drain_shutdown_budget_secs + 5"),
+            "{name} must state the grace formula"
+        );
+        assert!(
+            doc.contains(&format!("{grace} s")) || doc.contains(&format!("**{grace}**")),
+            "{name} must state the resulting grace ({grace} s)"
+        );
+    }
+}
