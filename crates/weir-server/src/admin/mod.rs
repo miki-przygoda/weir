@@ -14,9 +14,26 @@ pub(crate) mod verbs;
 use std::{
     fmt, io,
     path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
 };
 
-use crate::socket::{self, BoundSocket, ParentPolicy};
+use serde_json::Value;
+use tokio::{
+    io::AsyncWriteExt,
+    net::UnixStream,
+    sync::Semaphore,
+    task::{JoinHandle, JoinSet},
+};
+use tracing::warn;
+use weir_status::admin::{AdminError, ErrorCode, Response};
+
+use crate::{
+    metrics::{AdminOutcomeLabel, AdminRequestLabel, AdminVerbLabel, Metrics},
+    socket::{self, BoundSocket, ParentPolicy},
+};
+use framing::{Dispatch, Limits};
+use verbs::AdminState;
 
 /// Why the admin socket could not be bound. Codes only, from code: they go
 /// into log fields and error messages. The status board carries PR 1's closed
@@ -137,6 +154,158 @@ pub(crate) fn names_same_file(admin: &Path, socket_path: &Path) -> bool {
     }
 }
 
+/// spec §11: at most 4 concurrent admin connections per socket.
+pub(crate) const MAX_CONNECTIONS: usize = 4;
+
+/// A refusal is one short line into a fresh socket; it must never hold the
+/// accept loop for long.
+const REFUSAL_WRITE_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// The serving admin socket. Owns the listener (and, on Linux, its `O_PATH`
+/// pin) until [`AdminHandle::close`], so the inode-checked removal at exit
+/// compares against the inode this daemon bound.
+pub(crate) struct AdminHandle {
+    path: PathBuf,
+    socket: Arc<BoundSocket>,
+    task: JoinHandle<()>,
+    metrics: Arc<Metrics>,
+}
+
+impl AdminHandle {
+    /// T3 (spec §7 "unlink the admin socket (inode-checked)"): stop serving,
+    /// remove the socket file only if it is still the inode this daemon
+    /// bound, and mark the socket down. Synchronous, and safe after the
+    /// runtime has shut down: aborting a task the runtime already cancelled
+    /// is a no-op.
+    pub(crate) fn close(self) {
+        self.task.abort();
+        socket::remove_own_socket(&self.path, &self.socket);
+        self.metrics.admin_socket_up.set(0.0);
+    }
+}
+
+/// Starts serving a bound admin socket. Must run inside a tokio runtime.
+pub(crate) fn spawn(bound: BoundAdmin, state: Arc<AdminState>) -> AdminHandle {
+    let socket = Arc::new(bound.socket);
+    let metrics = Arc::clone(&state.metrics);
+    let euid = state.daemon_euid;
+    metrics.admin_socket_up.set(1.0);
+    let task = tokio::spawn(accept_loop(
+        Arc::clone(&socket),
+        state,
+        euid,
+        Arc::clone(&metrics),
+        Limits::PRODUCTION,
+    ));
+    AdminHandle {
+        path: bound.path,
+        socket,
+        task,
+        metrics,
+    }
+}
+
+fn count(m: &Metrics, verb: AdminVerbLabel, outcome: AdminOutcomeLabel) {
+    m.admin_requests
+        .get_or_create(&AdminRequestLabel { verb, outcome })
+        .inc();
+}
+
+/// Serves until aborted (T3) or the runtime shuts down. The admin socket
+/// stays up through shutdown so `status` and `reload` keep answering.
+///
+/// Every accepted connection is checked against the peer predicate (always
+/// on, independent of `peer_uid_check`), then needs one of
+/// [`MAX_CONNECTIONS`] permits. A refused peer gets one error line and EOF:
+/// `forbidden` without `instance`, `busy` with it. Dropping this future
+/// (abort) drops the `JoinSet`, which aborts every connection it serves.
+async fn accept_loop<D>(
+    socket: Arc<BoundSocket>,
+    d: Arc<D>,
+    daemon_euid: u32,
+    metrics: Arc<Metrics>,
+    limits: Limits,
+) where
+    D: Dispatch + Send + Sync + 'static,
+{
+    let permits = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+    let mut conns: JoinSet<()> = JoinSet::new();
+    loop {
+        let stream = match socket.listener.accept().await {
+            Ok((s, _)) => s,
+            Err(e) => {
+                warn!(error = %e, "admin socket: accept error");
+                if socket::is_accept_resource_exhaustion(&e) {
+                    // The pending connection stays queued: back off rather
+                    // than spin (same rule as the producer accept loop).
+                    tokio::time::sleep(socket::ACCEPT_BACKOFF_ON_EXHAUSTION).await;
+                }
+                continue;
+            }
+        };
+        // Reap finished connections so the set does not grow without bound.
+        while conns.try_join_next().is_some() {}
+        // spec §11: on EVERY accept, independent of peer_uid_check.
+        let peer_uid =
+            match identity::authorize_peer(socket::peer::peer_uid_of(&stream), daemon_euid) {
+                Ok(uid) => uid,
+                Err(why) => {
+                    warn!(
+                        ?why,
+                        daemon_euid,
+                        "admin socket: refusing a peer that is neither the daemon's uid nor root"
+                    );
+                    count(
+                        &metrics,
+                        AdminVerbLabel::Connect,
+                        AdminOutcomeLabel::refused,
+                    );
+                    // No `instance`: an unauthorized peer learns nothing
+                    // (plan reconciliation 4).
+                    refuse(
+                        stream,
+                        Response::failure(
+                            Value::Null,
+                            None,
+                            AdminError::new(ErrorCode::Forbidden, "forbidden"),
+                        ),
+                    )
+                    .await;
+                    continue;
+                }
+            };
+        let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+            count(&metrics, AdminVerbLabel::Connect, AdminOutcomeLabel::busy);
+            refuse(
+                stream,
+                Response::failure(
+                    Value::Null,
+                    d.instance(),
+                    AdminError::new(
+                        ErrorCode::Busy,
+                        format!(
+                            "the admin socket serves at most {MAX_CONNECTIONS} connections at once"
+                        ),
+                    ),
+                ),
+            )
+            .await;
+            continue;
+        };
+        let d = Arc::clone(&d);
+        conns.spawn(async move {
+            let _permit = permit;
+            framing::serve_connection(stream, peer_uid, &*d, &limits).await;
+        });
+    }
+}
+
+/// Writes one refusal line (bounded by [`REFUSAL_WRITE_TIMEOUT`]) and closes.
+async fn refuse(mut stream: UnixStream, r: Response) {
+    let _ = framing::write_response(&mut stream, &r, REFUSAL_WRITE_TIMEOUT).await;
+    let _ = stream.shutdown().await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,6 +396,148 @@ mod tests {
         assert_eq!(e.reason_code, reason::COLLIDES_WITH_SOCKET_PATH);
         assert!(!admin.exists(), "a refused bind creates nothing");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    mod accept {
+        use super::super::*;
+        use crate::admin::test_support::{ReloadMode, harness, requests};
+        use crate::metrics::{AdminOutcomeLabel, AdminVerbLabel};
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixStream as StdStream;
+        use std::time::Duration;
+
+        fn roundtrip(s: &StdStream, line: &str) -> serde_json::Value {
+            let mut w = s.try_clone().unwrap();
+            w.write_all(line.as_bytes()).unwrap();
+            w.write_all(b"\n").unwrap();
+            let mut r = BufReader::new(s.try_clone().unwrap());
+            let mut out = String::new();
+            r.read_line(&mut out).unwrap();
+            serde_json::from_str(&out).unwrap()
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn serves_status_and_sheds_the_fifth_connection() {
+            let h = harness(ReloadMode::Live);
+            let dir = crate::testutil::scratch_dir("admin_accept_busy");
+            let path = dir.join("a.sock");
+            let bound = bind_admin(&path, Path::new("/run/weir/weir.sock")).unwrap();
+            let handle = spawn(bound, Arc::clone(&h.st));
+            assert_eq!(h.st.metrics.admin_socket_up.get(), 1.0);
+
+            let held: Vec<StdStream> = (0..MAX_CONNECTIONS)
+                .map(|_| {
+                    let s = StdStream::connect(&path).unwrap();
+                    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                    // A full round trip proves the server accepted and holds a permit.
+                    let r = roundtrip(&s, r#"{"v":1,"id":1,"verb":"status"}"#);
+                    assert_eq!(r["ok"], true, "{r}");
+                    assert_eq!(r["instance"]["pid"], std::process::id());
+                    s
+                })
+                .collect();
+
+            let fifth = StdStream::connect(&path).unwrap();
+            fifth
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut line = String::new();
+            BufReader::new(fifth.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let r: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(r["error"]["code"], "busy");
+            assert_eq!(r["error"]["retryable"], true);
+            assert_eq!(
+                r["instance"]["pid"],
+                std::process::id(),
+                "an authorized peer: {r}"
+            );
+            assert_eq!(
+                requests(
+                    &h.st.metrics,
+                    AdminVerbLabel::Connect,
+                    AdminOutcomeLabel::busy
+                ),
+                1
+            );
+
+            drop(held);
+            handle.close();
+            assert!(!path.exists(), "close removes our own socket");
+            assert_eq!(h.st.metrics.admin_socket_up.get(), 0.0);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A successor that replaced the file keeps it (own-inode-only removal).
+        #[tokio::test]
+        async fn close_leaves_a_socket_it_did_not_bind() {
+            let h = harness(ReloadMode::Live);
+            let dir = crate::testutil::scratch_dir("admin_accept_successor");
+            let path = dir.join("a.sock");
+            let handle = spawn(
+                bind_admin(&path, Path::new("/run/weir/weir.sock")).unwrap(),
+                Arc::clone(&h.st),
+            );
+            std::fs::remove_file(&path).unwrap();
+            let successor = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            handle.close();
+            assert!(path.exists(), "the successor's socket stays");
+            drop(successor);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// spec §11 + Q8: a peer that is neither the daemon's uid nor root gets
+        /// one `forbidden` line with no `instance`, then EOF, and the refusal is
+        /// counted. Driven in-process by handing `accept_loop` a daemon euid
+        /// that is not the test's own.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_foreign_uid_gets_one_forbidden_line_without_identity_then_eof() {
+            let me = crate::admin::test_support::uid();
+            if me == 0 {
+                return; // root is always admitted: the branch is unreachable as root
+            }
+            let h = harness(ReloadMode::Live);
+            let dir = crate::testutil::scratch_dir("admin_accept_forbidden");
+            let path = dir.join("a.sock");
+            let bound = bind_admin(&path, Path::new("/run/weir/weir.sock")).unwrap();
+            let socket = Arc::new(bound.socket);
+            let task = tokio::spawn(accept_loop(
+                Arc::clone(&socket),
+                Arc::clone(&h.st),
+                me + 1,
+                Arc::clone(&h.st.metrics),
+                framing::Limits::PRODUCTION,
+            ));
+            let s = StdStream::connect(&path).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut r = BufReader::new(s);
+            let mut line = String::new();
+            r.read_line(&mut line).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(v["error"]["code"], "forbidden");
+            assert!(
+                v.get("instance").is_none(),
+                "an unauthorized peer learns nothing: {v}"
+            );
+            line.clear();
+            assert_eq!(
+                r.read_line(&mut line).unwrap(),
+                0,
+                "then the connection closes"
+            );
+            assert_eq!(
+                requests(
+                    &h.st.metrics,
+                    AdminVerbLabel::Connect,
+                    AdminOutcomeLabel::refused
+                ),
+                1
+            );
+            task.abort();
+            socket::remove_own_socket(&path, &socket);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }
 
