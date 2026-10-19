@@ -3835,6 +3835,75 @@ fn public_status_and_verbose_probes_carry_no_secrets() {
     let _ = fs::remove_dir_all(&wab);
 }
 
+/// Spec §16 system test 10: a restart over `wab_max_bytes` is not ready from
+/// the first answer after startup (the synchronous cap gate), and becomes
+/// ready again without a single push once the drain brings the WAB below
+/// the low-water mark (the 5 s poll task's cap refresh).
+#[test]
+fn a_restart_over_the_cap_is_not_ready_at_once_and_recovers_with_zero_pushes() {
+    let wab = fresh_wab_dir("cap_restart");
+    seed_sealed_backlog("cap_restart_seed", &wab);
+    pad_sealed_backlog(&wab, 60);
+    let on_disk = wab_dir_bytes(&wab);
+    // Legal for one shard of 4096-byte segments (minimum 4560), and well
+    // under what is on disk.
+    let cap = (on_disk / 2).max(8192);
+    assert!(
+        on_disk > cap,
+        "the seeded backlog ({on_disk} B) must exceed the cap ({cap} B)"
+    );
+    let sink = RecordingSink::start_slow(Duration::from_millis(200));
+    let srv = weir_server!("cap_restart")
+        .wab_dir(&wab)
+        .shard_count(1)
+        .extra_config(format!(
+            "sink_type = \"http\"\nwab_segment_max_bytes = 4096\nwab_max_bytes = {cap}"
+        ))
+        .env("WEIR_SINK_URL", sink.url())
+        .spawn();
+    let port = srv.metrics_port;
+    let readyz = || -> Option<(u16, String)> {
+        use std::io::{Read, Write};
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+        s.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+        s.write_all(b"GET /readyz HTTP/1.0\r\n\r\n").ok()?;
+        let mut raw = String::new();
+        s.read_to_string(&mut raw).ok()?;
+        let (head, body) = raw.split_once("\r\n\r\n")?;
+        Some((head.split(' ').nth(1)?.parse().ok()?, body.to_string()))
+    };
+
+    // The first answer past startup names the cap; it is never a 200.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let (status, body) = loop {
+        if let Some((s, b)) = readyz() {
+            if !b.contains("starting") {
+                break (s, b);
+            }
+        }
+        assert!(Instant::now() < deadline, "the daemon never left startup");
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        status, 503,
+        "a restart over the cap must not be ready: {body}"
+    );
+    assert!(body.contains("wab_cap_rejecting"), "{body}");
+
+    // No client ever connects: the poll task alone clears the cap.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while readyz().map(|(s, _)| s) != Some(200) {
+        assert!(
+            Instant::now() < deadline,
+            "readiness never recovered without pushes; {} B on disk, cap {cap} B",
+            wab_dir_bytes(&wab)
+        );
+        thread::sleep(Duration::from_millis(250));
+    }
+    drop(srv);
+    let _ = fs::remove_dir_all(&wab);
+}
+
 // ── File descriptor limit exhaustion ─────────────────────────────────────────
 
 /// When the server hits its `RLIMIT_NOFILE` ceiling it must not crash —
