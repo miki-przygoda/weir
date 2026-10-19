@@ -5,11 +5,14 @@
 //! (spec §9.2 rule 5); `no_blocking_locks_under_status` enforces it.
 pub(crate) mod board;
 pub(crate) mod config_view;
+pub(crate) mod render;
 pub(crate) mod shards;
 
 pub(crate) use board::StatusBoard;
 #[cfg_attr(not(test), allow(unused_imports))] // PR 2 imports these from crate::status
 pub(crate) use board::{DrainExitInfo, DrainExitReason, InFlight, RequeueResult};
+#[cfg_attr(not(test), allow(unused_imports))] // PR 5 / PR 6 name it
+pub(crate) use render::StatusSnapshot;
 pub(crate) use shards::{ShardRegistry, ShardSlot, SupervisorExit, WorkerGuard};
 #[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use weir_status::SinkFailureKind;
