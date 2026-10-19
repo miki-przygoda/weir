@@ -5381,3 +5381,26 @@ fn the_client_refuses_a_locally_invalid_batch_without_poisoning() {
         .push(b"still works", Durability::Durable)
         .expect("push after refusals");
 }
+
+/// SP-D (spec §5.13): the startup line names the version, the wire version
+/// and the effective config, and a log redirected to a file carries no
+/// ANSI escape codes.
+#[test]
+fn startup_log_names_version_and_config_and_carries_no_ansi() {
+    let srv = weir_server!("startup_line").log_level("info").start();
+    let log = fs::read_to_string(srv.tmp_dir.join("weir.log")).unwrap();
+    let line = log
+        .lines()
+        .find(|l| l.contains("weir starting"))
+        .unwrap_or_else(|| panic!("no startup line:\n{log}"));
+    assert!(
+        line.contains(&format!("version={}", env!("CARGO_PKG_VERSION"))),
+        "{line}"
+    );
+    assert!(line.contains("wire_version=1"), "{line}");
+    assert!(
+        line.contains("\"wab_dir_lock\": \"required\""),
+        "the ConfigView rides the line: {line}"
+    );
+    assert!(!log.contains('\u{1b}'), "no ANSI escapes in a file:\n{log}");
+}

@@ -1,5 +1,6 @@
 mod config;
 mod drain;
+mod logging;
 mod metrics;
 mod models;
 mod preflight;
@@ -243,12 +244,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (config, config_warnings, config_source) = Config::load()?;
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_new(&config.log_level)
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // Colour only on a terminal, and a bad `log_level` is said out loud rather
+    // than silently falling back to `info` (spec §5.13, SP-D).
+    if let Some(w) = logging::init(&config.log_level) {
+        warn!("{w}");
+    }
 
     // Replay any advisory warnings collected during Config::load — it runs
     // before this subscriber exists, so emitting them there would silently drop
@@ -277,11 +277,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
          data paths on Linux (fdatasync). See the durability section of the README."
     );
 
+    // One line with everything needed to reproduce the run (spec §5.13): the
+    // ConfigView carries no secret (the S3 secret is never entered, the sink URL
+    // is reduced to scheme://host[:port]).
+    let config_view = Arc::new(status::config_view::ConfigView::from(&config));
+    // `%` records the version with Display: a bare `&str` field is formatted
+    // with Debug by tracing-subscriber and would print `version="4.1.0"`.
     info!(
+        version = %env!("CARGO_PKG_VERSION"),
+        wire_version = weir_core::WIRE_VERSION,
         socket = %config.socket_path.display(),
         wab_dir = %config.wab_dir.display(),
         shards = config.shard_count,
         workers = config.worker_count,
+        config = ?config_view,
         "weir starting"
     );
 
@@ -354,7 +363,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // daemon-wide: a per-listener flag would let the Unix and TCP sides
     // disagree about whether ingest has resumed.
     let wab_cap_rejecting = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let config_view = Arc::new(status::config_view::ConfigView::from(&config));
     let board = status::StatusBoard::new(
         status::board::StaticInfo::capture(&config, Arc::clone(&config_view)),
         config.shard_count,
