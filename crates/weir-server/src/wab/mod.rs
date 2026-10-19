@@ -2,6 +2,11 @@ pub(crate) mod cap;
 pub(crate) mod clock;
 #[cfg(any(test, feature = "dst"))]
 pub(crate) mod dst;
+// No production caller until Task 3.4 routes the flusher's three send sites
+// through `hand_off` (and Task 3.5's DST seeds use the detached builders);
+// remove this allowance there.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) mod handoff;
 pub(crate) mod lock;
 pub(crate) mod recovery;
 pub(crate) mod segment;
