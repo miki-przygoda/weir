@@ -13,8 +13,9 @@ use tokio::sync::{Mutex, mpsc, watch};
 use weir_status::{
     LivezCheck, Thresholds,
     admin::{
-        AdminError, DEFAULT_PAUSE_WAIT_MS, ErrorCode, HeldSegment, InstanceId, PAUSE_NOTE,
-        PauseResult, ResumeResult, Verb, WARN_UNBOUNDED_WAB,
+        AdminError, DEFAULT_PAUSE_WAIT_MS, DEFAULT_RETRY_WAIT_MS, ErrorCode, HeldSegment,
+        InstanceId, PAUSE_NOTE, PauseResult, RETRY_NOTE, ResumeResult, RetryStrandedResult, Verb,
+        WARN_UNBOUNDED_WAB,
     },
 };
 
@@ -262,6 +263,42 @@ impl AdminState {
             resumed,
         })
     }
+
+    /// Asks the drain for a stranded-segment rescan and waits up to
+    /// `wait_ms` for its ticket to be observed. A request made while an
+    /// earlier ticket is unobserved folds into it (spec §5.4 "Coalescing"),
+    /// so a client looping on this verb never queues more than one scan.
+    async fn drain_retry_stranded(&self, args: &Map<String, Value>) -> Result<Value, AdminError> {
+        let wait = wait_arg(args, DEFAULT_RETRY_WAIT_MS)?;
+        self.refuse_mutation()?;
+        let ticket = {
+            let _g = self.mutate.lock().await;
+            self.drain_ctl.request_requeue()
+        }; // released BEFORE the wait (spec §8)
+        let completed =
+            wait_until(wait, || drain_obs(&self.board).observed_requeue >= ticket).await;
+        let o = drain_obs(&self.board);
+        // The result that answered this ticket: its own, or a later scan's
+        // (coalesced). The drain stores `last_requeue` before it bumps
+        // `observed_requeue`, so a completed ticket always finds it. An
+        // unobserved ticket reports no counts.
+        let r = if completed {
+            o.last_requeue.filter(|r| r.ticket >= ticket)
+        } else {
+            None
+        };
+        encode(&RetryStrandedResult {
+            ticket,
+            completed,
+            coalesced: r.as_ref().is_some_and(|r| r.coalesced || r.ticket > ticket),
+            requeued: r.as_ref().map(|r| r.requeued),
+            already_queued: r.as_ref().map(|r| r.already_queued),
+            backoff_cut: r.as_ref().is_some_and(|r| r.backoff_cut),
+            scan_error: r.as_ref().and_then(|r| r.scan_error.clone()),
+            paused: self.drain_ctl.pause_requested(),
+            note: RETRY_NOTE.to_string(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -489,5 +526,111 @@ mod tests {
                 .unwrap_err();
         assert_eq!(e.code, ErrorCode::BadRequest);
         assert!(!h.st.drain_ctl.pause_requested());
+    }
+
+    /// Stands in for the drain's requeue observation (PR 2): publishes a
+    /// RequeueResult for each new ticket.
+    fn fake_requeue_drain(h: &Harness) -> tokio::task::JoinHandle<()> {
+        let st = Arc::clone(&h.st);
+        tokio::spawn(async move {
+            let mut observed = 0u64;
+            loop {
+                let t = st.drain_ctl.requeue_requested();
+                if t > observed {
+                    st.board
+                        .drain
+                        .last_requeue
+                        .store(Some(Arc::new(RequeueResult {
+                            ticket: t,
+                            requeued: 3,
+                            already_queued: 1,
+                            scan_error: None,
+                            backoff_cut: true,
+                            coalesced: false,
+                            at_ms: unix_ms_now(),
+                        })));
+                    st.board.drain.observed_requeue.store(t, Ordering::Release);
+                    observed = t;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn retry_stranded_reports_the_observed_requeue() {
+        let h = harness(ReloadMode::Live);
+        let drain = fake_requeue_drain(&h);
+        let res = h.st.drain_retry_stranded(&args(json!({}))).await.unwrap();
+        assert!(res["ticket"].as_u64().unwrap() >= 1);
+        assert_eq!(res["completed"], true);
+        assert_eq!(res["requeued"], 3);
+        assert_eq!(res["already_queued"], 1);
+        assert_eq!(res["backoff_cut"], true);
+        assert_eq!(res["coalesced"], false);
+        assert_eq!(res["scan_error"], Value::Null);
+        assert_eq!(res["paused"], false);
+        assert!(
+            res["note"]
+                .as_str()
+                .unwrap()
+                .contains("restart from record 0")
+        );
+        drain.abort();
+    }
+
+    #[tokio::test]
+    async fn an_unobserved_retry_returns_its_ticket_without_counts() {
+        let h = harness(ReloadMode::Live);
+        let res =
+            h.st.drain_retry_stranded(&args(json!({"wait_ms": 0})))
+                .await
+                .unwrap();
+        assert!(res["ticket"].as_u64().unwrap() >= 1);
+        assert_eq!(res["completed"], false);
+        assert_eq!(res["requeued"], Value::Null);
+        assert_eq!(res["already_queued"], Value::Null);
+    }
+
+    /// A request answered by a later scan reports itself coalesced, and the
+    /// scan error (admin-only free text) is passed through.
+    #[tokio::test]
+    async fn a_retry_answered_by_a_newer_ticket_is_coalesced() {
+        let h = harness(ReloadMode::Live);
+        let first = h.st.drain_ctl.request_requeue();
+        h.st.board
+            .drain
+            .last_requeue
+            .store(Some(Arc::new(RequeueResult {
+                ticket: first + 1,
+                requeued: 0,
+                already_queued: 2,
+                scan_error: Some("permission denied on shard-0".into()),
+                backoff_cut: false,
+                coalesced: true,
+                at_ms: unix_ms_now(),
+            })));
+        h.st.board
+            .drain
+            .observed_requeue
+            .store(first + 1, Ordering::Release);
+        let res =
+            h.st.drain_retry_stranded(&args(json!({"wait_ms": 500})))
+                .await
+                .unwrap();
+        assert_eq!(res["completed"], true);
+        assert_eq!(res["coalesced"], true);
+        assert_eq!(res["scan_error"], "permission denied on shard-0");
+    }
+
+    #[tokio::test]
+    async fn retry_stranded_is_refused_after_t0() {
+        let h = harness(ReloadMode::Live);
+        h.level_tx.send(ShutdownLevel::Graceful).unwrap();
+        let e =
+            h.st.drain_retry_stranded(&args(json!({"wait_ms": 0})))
+                .await
+                .unwrap_err();
+        assert_eq!(e.code, ErrorCode::ShuttingDown);
     }
 }
