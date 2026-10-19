@@ -1028,6 +1028,79 @@ fn server_exits_and_socket_disappears_after_sigterm() {
     );
 }
 
+/// Spec §16 system test 13, a gate from PR 1 onward: SIGTERM exits within
+/// shutdown_timeout + 5 s with an idle producer connection still open, and
+/// exits 0. It guards the sequencing every later Foundations PR rewrites
+/// (signal task, lame duck, joins, drain stop).
+#[test]
+fn sigterm_exits_within_the_bound_with_an_idle_connection_open() {
+    const SHUTDOWN_TIMEOUT_SECS: u64 = 2;
+    let bound = Duration::from_secs(SHUTDOWN_TIMEOUT_SECS + 5);
+    let mut srv = weir_server!("sigterm_bound")
+        .shutdown_timeout_secs(SHUTDOWN_TIMEOUT_SECS)
+        .start();
+    let mut busy = srv.client();
+    busy.push(b"acked-before-sigterm", Durability::Durable)
+        .unwrap();
+    let mut idle = srv.client();
+    idle.health_check().unwrap(); // connected, then left idle across the signal
+    let t0 = Instant::now();
+    unsafe {
+        libc::kill(srv.child_pid() as libc::pid_t, libc::SIGTERM);
+    }
+    let status = srv
+        .wait_for_exit(bound)
+        .unwrap_or_else(|| panic!("weir-server still running {bound:?} after SIGTERM"));
+    assert!(status.success(), "exit status {status}");
+    assert!(t0.elapsed() < bound, "took {:?}", t0.elapsed());
+    drop((busy, idle));
+}
+
+/// The PR 1 status gauges on a real daemon: after the first 5 s poll a
+/// serving daemon reports ready, serving, every shard up, the cap clear,
+/// and the noop sink as an active warning condition.
+#[test]
+fn a_serving_daemon_reports_ready_through_the_new_gauges() {
+    let srv = weir_server!("status_gauges").shard_count(2).start();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let body = loop {
+        let body = srv.scrape_metrics();
+        if body.contains("weir_ready 1") {
+            break body;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "weir_ready never reached 1:\n{body}"
+        );
+        thread::sleep(Duration::from_millis(250));
+    };
+    for series in [
+        "weir_startup_phase{phase=\"serving\"} 1",
+        "weir_wab_shard_up{shard=\"0\"} 1",
+        "weir_wab_shard_up{shard=\"1\"} 1",
+        "weir_wab_cap_rejecting 0",
+        "weir_condition_active{code=\"noop_sink\",severity=\"warning\"} 1",
+        "weir_condition_active{code=\"starting\",severity=\"info\"} 0",
+    ] {
+        assert!(body.contains(series), "{series:?} missing:\n{body}");
+    }
+    assert!(
+        body.contains(&format!(
+            "weir_build_info{{version=\"{}\"",
+            env!("CARGO_PKG_VERSION")
+        )),
+        "{body}"
+    );
+    // Spec §16: weir-status's `evidence_from_metrics` is tested against a
+    // captured 4.1 exposition. This is the capture; re-bless on an intended
+    // family change and review the diff.
+    if std::env::var_os("WEIR_BLESS").is_some() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../weir-status/tests/fixtures/metrics_4_1.txt");
+        std::fs::write(&path, &body).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    }
+}
+
 // ── Reconnect / restart ───────────────────────────────────────────────────────
 
 #[test]

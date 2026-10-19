@@ -561,4 +561,33 @@ weir_condition_active{code=\"tls_cert_expiring\",severity=\"warning\"} 1
             Evidence::empty(NOW, Source::Metrics).with_recent_absolutes_only()
         );
     }
+
+    #[test]
+    fn captured_expositions_parse() {
+        let old = evidence_from_metrics(include_str!("../tests/fixtures/metrics_4_0_1.txt"), NOW);
+        assert_eq!(old.phase, None);
+        assert!(old.sink.is_some() && old.drain.is_some() && old.config.is_some());
+        assert!(
+            !readiness(&old).ok,
+            "an old daemon's readiness is unknown, not ready"
+        );
+        assert_eq!(
+            active_conditions_from_metrics(include_str!("../tests/fixtures/metrics_4_0_1.txt")),
+            None
+        );
+        let new = evidence_from_metrics(include_str!("../tests/fixtures/metrics_4_1.txt"), NOW);
+        assert_eq!(new.phase, Some(Phase::Serving));
+        assert!(
+            new.shards.is_some()
+                && new.workers.is_some()
+                && new.wab_cap.is_some()
+                && new.backlog.is_some()
+                && new.listeners.is_some()
+        );
+        assert!(readiness(&new).ok, "{:?}", readiness(&new).failing);
+        assert!(
+            active_conditions_from_metrics(include_str!("../tests/fixtures/metrics_4_1.txt"))
+                .is_some()
+        );
+    }
 }
