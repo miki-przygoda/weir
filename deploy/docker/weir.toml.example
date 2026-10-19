@@ -24,6 +24,13 @@ wab_dir = "/var/lib/weir/wab"
 # Env: WEIR_WAB_DIR_LOCK
 wab_dir_lock = "required"
 
+# Admin Unix socket for weir-ctl status / reload / drain (daemon uid and root only).
+# Default path: <parent of wab_dir>/<name of wab_dir>.admin.sock. The parent
+# directory must be writable only by the daemon user. Env: WEIR_ADMIN_SOCKET_ENABLED,
+# WEIR_ADMIN_SOCKET_PATH.
+# admin_socket_enabled = true
+# admin_socket_path = "/var/lib/weir/wab.admin.sock"
+
 # Number of WAB shards (one flusher thread per shard). Range: 1-256.
 # Default 1 is correct for single-disk deployments.
 # Env: WEIR_SHARD_COUNT

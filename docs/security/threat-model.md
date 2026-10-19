@@ -29,6 +29,11 @@ This means:
   match the daemon's. (If the daemon itself runs as root, then root is the
   trusted uid — but running as root is discouraged; see the assumptions
   below.)
+- The admin socket deliberately also admits root (euid 0) besides the
+  daemon's own uid: `sudo weir-ctl drain pause` is an expected way to call
+  it. This diverges from the producer rule above on purpose. Root can already
+  read and rewrite the WAB and signal the daemon, so admitting it grants
+  nothing new.
 - With `peer_uid_check` disabled, the access control falls back to the
   socket file's permissions alone, so the trusted set becomes any OS user
   who can `connect(2)` to the socket path.
@@ -39,6 +44,41 @@ This means:
 - Beyond the peer-uid check there is no per-client application-level
   authentication on the Unix path: a connection that passes the uid check is
   treated as fully authorised, and payloads are opaque bytes.
+
+### Admin socket
+
+The admin socket (`weir-ctl status`, `reload`, `drain pause|resume|retry-stranded`)
+is a second Unix socket, separate from the producer socket:
+
+- **Path and mode.** It binds at mode 0o600 at a path derived from `wab_dir`
+  (`<parent of wab_dir>/<name of wab_dir>.admin.sock`, so
+  `/var/lib/weir/wab.admin.sock` by default), never on the producer socket's
+  volume. `admin_socket_path` overrides it.
+- **Private parent required.** The bind refuses a parent directory that is
+  group- or world-writable, or owned by a non-root user other than the
+  daemon's, because anyone who can create names there could bind the path
+  first and impersonate the control plane. An explicit path refused this
+  way stops startup; the derived default only disables the admin socket
+  (ERROR log, `admin_unavailable` condition).
+- **Peer check, always on.** On every accept the peer's effective uid must
+  be the daemon's or 0. This is independent of `peer_uid_check`, which
+  governs only the producer socket, and fail-closed: if the peer
+  credentials cannot be read, the connection is refused. The check runs
+  before a byte is read. A refused peer gets one error line with code
+  `forbidden` that carries no daemon identity, then EOF; the refusal counts
+  as `weir_admin_requests_total{verb="_connect",outcome="refused"}` and logs
+  a WARN naming only the peer's numeric uid (or that it had no credentials).
+- **Bounded framing.** One JSON object per line, protocol v1. A line may be
+  at most 64 KiB, enforced while reading, so a longer one is never buffered;
+  each request must arrive within 5 s, an idle connection is closed after
+  10 s, each reply write is bounded at 5 s, a connection serves at most 64
+  requests, and at most 4 connections are served at once.
+- **Identity.** Every reply to an authorized peer carries the daemon's
+  identity (pid, `wab_dir`, `socket_path`, the `wab_dir` (dev, ino), start
+  time), so `weir-ctl` can tell which daemon answered.
+- **No secrets.** The `status` reply's document is built from the typed
+  config view, which classifies bearer tokens, S3 secrets and URL passwords
+  as never shown; no verb reads or returns them.
 
 ### TCP + mutual TLS path (optional, `--features tls`)
 
@@ -86,10 +126,11 @@ Threats the daemon defends against:
 | Queue saturation | `QUEUE_PUSH_TIMEOUT` (5s) caps the time a connection blocks waiting for a queue slot. Excess is nacked, not held. |
 | Socket bind path TOCTOU | `bind_hardened` (see `docs/security/socket-bind.md`) uses dirfd + AT_SYMLINK_NOFOLLOW + umask-tightened bind to eliminate the post-bind chmod vulnerability. |
 | Symlink attacks on WAB files | Segment creation uses `O_CREAT \| O_EXCL \| O_NOFOLLOW` with explicit mode 0o600. Recovery uses `O_NOFOLLOW` on **both** passes — the read/validation open and the truncate/seal open — so a symlink swapped in at the segment path is refused in either case. |
-| Stale socket files | A connect-only liveness probe decides: a socket nobody is listening on (a SIGKILLed predecessor's) is unlinked through the pinned parent dirfd and replaced; a live socket, or one whose state the probe cannot tell, is refused and left in place. Never removes anything that isn't a socket. See [`socket-bind.md`](socket-bind.md#stale-socket-removal-and-the-liveness-probe). |
+| Stale socket files | A connect-only liveness probe decides: a socket nobody is listening on (a SIGKILLed predecessor's) is unlinked through the pinned parent dirfd and replaced; a live socket, or one whose state the probe cannot tell, is refused and left in place. Never removes anything that isn't a socket. See [`socket-bind.md`](socket-bind.md#stale-socket-removal-and-the-liveness-probe). The admin socket follows the same probe-then-unlink rule, and the same own-inode-only removal at exit. |
 | Second daemon on the same `wab_dir` | `<wab_dir>/.weir.lock` is taken with an exclusive `flock` before recovery, preflight or anything else reads the WAB, and held for the life of the process. A second instance refuses to start with `wab_dir … is locked by another weir-server (pid … on host …, started …, version …, socket …)` and exit status 1. Contention is never overridable. See [Single ownership](#single-ownership-of-wab_dir-and-socket_path). |
 | Second daemon on the same `socket_path` | Preflight probes `socket_path` before recovery and refuses a live socket (`socket_path '…' is in use by a running process; refusing to remove it.`); the late bind repeats the probe. A live socket is never unlinked, and at shutdown a daemon removes the socket file only if it is still the inode it bound. |
 | Another instance taking over a running daemon's `wab_dir` | A once-a-second integrity check re-verifies the held lock. On proof that another instance holds it, every new push is Nacked `InternalError` before it reaches the queue and the daemon exits with status **3** without sealing. See [Single ownership](#single-ownership-of-wab_dir-and-socket_path), including the residual window. |
+| Local process reaching the admin socket | Two threats. **An unauthorized local process driving it:** the socket is 0o600 in a parent the bind requires to be private, and every accept checks that the peer euid is the daemon's or root, fail-closed, before a byte is read; a refusal gets one `forbidden` line with no daemon identity, counts as `weir_admin_requests_total{verb="_connect",outcome="refused"}` and logs a WARN. An authorized peer is still bounded: 64 KiB lines enforced while reading, 5 s per request, 10 s idle, 64 requests per connection, 4 connections. No verb reaches a secret: the `status` document's config view excludes bearer tokens, S3 secrets and URL passwords by type. **A squatter impersonating it:** the bind refuses a non-private parent and a live socket at the path, and `weir-ctl` authenticates the server before trusting a reply, by the socket's `lstat` mode, the parent's mode, the peer uid and the `wab_dir` (dev, ino) the reply names. See [The admin socket](socket-bind.md#the-admin-socket). |
 | A stray SIGHUP (`systemctl reload`, a log-rotation script, a terminal hang-up) | SIGHUP is set to ignored at the top of `main`, before the config is read, and once the runtime is up it is a counted reload request (`weir_config_reloads_total{trigger="sighup"}`). It no longer terminates the daemon. Before this, any daemon without a TLS listener died on SIGHUP and skipped the seal and drain. |
 | WAB segment tampering (mode tightening) | `audit_segment_modes` runs at startup and warns on any `.wab`/`.wab.sealed`/`.wab.confirmed` file whose permissions are not 0o600. Increments `weir_wab_unexpected_mode_total`. |
 | Bad CRCs (header or payload) | Reject with `Nack(BadHeaderCrc \| BadPayloadCrc)` and close the connection; counter incremented. |
@@ -322,8 +363,15 @@ The hardening above assumes the operator has:
   (max_connections, queue capacity). Cannot exhaust memory or block the
   daemon indefinitely; can only consume their share of the connection
   budget.
+- **Producer or sidecar sharing the socket volume**: no admin access —
+  the admin socket is not on that volume, and a same-uid producer in another
+  container cannot reach `/var/lib/weir`.
 - **Compromised process running as the daemon uid**: out of scope.
-  Equivalent to the daemon itself. Defense is OS-level isolation.
+  Equivalent to the daemon itself. Defense is OS-level isolation. This does
+  not extend to producer containers that share the daemon's uid only so that
+  `peer_uid_check` admits them: they reach the producer socket, never the
+  admin socket or the WAB, as long as the `wab_dir` parent is not mounted
+  into them.
 
 ## Reporting
 
