@@ -1419,13 +1419,20 @@ def main():
             try:
                 pm = crash_postmortem(
                     wab_dir, crash_reason or "the run ended before its final pass")
+                # Only if it exists: an exception before or inside
+                # stack.setup() never created it, and report.md must not point
+                # the operator at an image that is not there.
+                pm["image_kept"] = (
+                    stack.backing_file if os.path.exists(stack.backing_file) else None)
                 pm_path = write_crash_postmortem(run_dir, pm)
                 print(f"crash path: WAB post-mortem written to {pm_path}",
                       file=sys.stderr)
             except Exception as exc:
                 print(f"cleanup: crash post-mortem failed: {exc}", file=sys.stderr)
         try:
-            stack.teardown()
+            # The crash path keeps wab.img: the post-mortem above is a summary,
+            # the image is the WAB itself, readable after a read-only mount.
+            stack.teardown(keep_image=not final_pass_ran)
         except Exception as exc:
             print(f"cleanup: storage teardown failed: {exc}", file=sys.stderr)
         if daemon_log:

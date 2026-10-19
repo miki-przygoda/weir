@@ -470,6 +470,33 @@ class TestTeardownStackOrder(unittest.TestCase):
                 s.teardown()
             self.assertEqual([c[0] for c in fake.calls], ["umount", "losetup"])
 
+    def test_keep_image_detaches_but_leaves_the_backing_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            img = os.path.join(tmp, "wab.img")
+            open(img, "wb").close()
+            mnt = os.path.join(tmp, "mnt")
+            os.makedirs(mnt)
+            s = dm_stack.StorageStack(img, size_mb=128, mount_point=mnt)
+            s.loop_device = "/dev/loop7"
+            fake = _fake_run({})
+            with mock.patch.object(dm_stack, "_run", fake):
+                s.teardown(keep_image=True)
+            self.assertEqual([c[0] for c in fake.calls], ["umount", "losetup"])
+            self.assertTrue(os.path.exists(img), "the crash evidence must survive")
+            self.assertIsNone(s.loop_device)
+
+    def test_default_teardown_still_removes_the_image(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            img = os.path.join(tmp, "wab.img")
+            open(img, "wb").close()
+            mnt = os.path.join(tmp, "mnt")
+            os.makedirs(mnt)
+            s = dm_stack.StorageStack(img, size_mb=128, mount_point=mnt)
+            s.loop_device = "/dev/loop7"
+            with mock.patch.object(dm_stack, "_run", _fake_run({})):
+                s.teardown()
+            self.assertFalse(os.path.exists(img))
+
     def test_teardown_removes_the_dm_mapping_between_umount_and_detach(self):
         # _dm_remove is Task 4's polling guard, not yet defined. `create=True`
         # lets us patch a module attribute that doesn't exist yet — this test

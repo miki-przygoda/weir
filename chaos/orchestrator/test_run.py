@@ -1217,6 +1217,13 @@ class TestCrashPostmortem(unittest.TestCase):
         self.assertIn("if not final_pass_ran", fin)
         self.assertIn("final_pass_ran = True", body)
 
+    def test_teardown_keeps_the_image_on_the_crash_path(self):
+        fin = self._main_source()
+        fin = fin[fin.index("\n    finally:\n"):]
+        # The call line, not the comment at the top of `finally` that names it.
+        call = fin[fin.index("\n            stack.teardown("):][:80]
+        self.assertIn("keep_image=not final_pass_ran", call)
+
     def test_a_leftover_crash_file_blocks_a_rerun_of_the_seed(self):
         body = self._main_source()
         self.assertIn(
