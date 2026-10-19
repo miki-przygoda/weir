@@ -310,7 +310,7 @@ mod tests {
                 while i < 1_000 || !stop.load(Ordering::Relaxed) {
                     i += 1;
                     if t == 0 {
-                        b.drain.set_state(if i % 2 == 0 {
+                        b.drain.set_state(if i.is_multiple_of(2) {
                             DrainStateValue::draining
                         } else {
                             DrainStateValue::retrying_transient
