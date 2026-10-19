@@ -57,6 +57,46 @@ LEDGER_FLUSH_THRESHOLD = 256
 LOADGEN_STOP_TIMEOUT_SECS = 60
 
 
+class HarnessInterrupted(BaseException):
+    """A termination signal reached run.py.
+
+    Raised FROM the signal handler so `main()`'s `finally` runs: the WAB
+    post-mortem, the teardown of the loop device, dm mapping and mount, and
+    the report. With Python's default SIGTERM disposition none of that ran.
+    A BaseException, like KeyboardInterrupt, so that the `except Exception`
+    guards inside the episode loop and `final_pass` cannot swallow it.
+    """
+
+
+def install_interrupt_handlers(signal_fn=signal.signal, getsignal_fn=signal.getsignal):
+    """Maps SIGTERM and SIGHUP onto HarnessInterrupted. Returns the signals it took.
+
+    One-shot: a second signal while `finally` is cleaning up is logged and
+    ignored, because raising again mid-teardown would strand exactly the
+    devices the first one is releasing. A SIGHUP that is already SIG_IGN
+    (run under nohup) is left ignored, so a dropped SSH session does not stop a
+    run the operator deliberately detached.
+    """
+    fired = []
+
+    def _raise(signum, _frame):
+        name = signal.Signals(signum).name
+        if fired:
+            print(f"run.py: {name} again during cleanup; ignored so teardown "
+                  "can finish", file=sys.stderr)
+            return None
+        fired.append(signum)
+        raise HarnessInterrupted(f"received {name}")
+
+    taken = []
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        if getsignal_fn(sig) == signal.SIG_IGN:
+            continue
+        signal_fn(sig, _raise)
+        taken.append(sig)
+    return taken
+
+
 def fault_kind(sched):
     """Which fault this schedule injects. Defaults to Phase 1's `kill_random`.
 
@@ -863,6 +903,10 @@ class Daemon:
 def main():
     if os.geteuid() != 0:
         sys.exit("run.py must run as root (it owns loopback devices and mounts)")
+    # Before anything that needs undoing: from here on a SIGTERM or SIGHUP
+    # unwinds through the `finally` below (post-mortem, teardown, report)
+    # instead of killing the process with the loop device still attached.
+    install_interrupt_handlers()
 
     schedule_path = sys.argv[1] if len(sys.argv) > 1 else "../schedules/smoke.toml"
     sched = load_schedule(schedule_path)

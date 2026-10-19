@@ -1233,5 +1233,51 @@ class TestCrashPostmortem(unittest.TestCase):
         )
 
 
+class TestInterruptHandlers(unittest.TestCase):
+    def _install(self, current):
+        installed = {}
+
+        def signal_fn(sig, handler):
+            installed[sig] = handler
+
+        def getsignal_fn(sig):
+            return current.get(sig, signal.SIG_DFL)
+
+        sigs = run.install_interrupt_handlers(
+            signal_fn=signal_fn, getsignal_fn=getsignal_fn)
+        return sigs, installed
+
+    def test_sigterm_raises_so_the_finally_block_runs(self):
+        sigs, installed = self._install({})
+        self.assertIn(signal.SIGTERM, sigs)
+        with self.assertRaises(run.HarnessInterrupted):
+            installed[signal.SIGTERM](signal.SIGTERM, None)
+
+    def test_it_is_a_BaseException_so_no_except_Exception_swallows_it(self):
+        # final_pass wraps acc.check in `except Exception`; a SIGTERM landing
+        # there must not be recorded as "final_check_failed" and carry on.
+        self.assertFalse(issubclass(run.HarnessInterrupted, Exception))
+
+    def test_a_second_signal_during_cleanup_is_ignored(self):
+        _, installed = self._install({})
+        with self.assertRaises(run.HarnessInterrupted):
+            installed[signal.SIGTERM](signal.SIGTERM, None)
+        self.assertIsNone(installed[signal.SIGTERM](signal.SIGTERM, None))
+        self.assertIsNone(installed[signal.SIGHUP](signal.SIGHUP, None))
+
+    def test_a_nohup_ignored_hangup_stays_ignored(self):
+        sigs, installed = self._install({signal.SIGHUP: signal.SIG_IGN})
+        self.assertNotIn(signal.SIGHUP, installed)
+        self.assertNotIn(signal.SIGHUP, sigs)
+
+    def test_main_installs_them_first(self):
+        run_py = os.path.join(os.path.dirname(os.path.abspath(run.__file__)), "run.py")
+        with open(run_py) as f:
+            body = f.read()
+        body = body[body.index("def main("):]
+        self.assertLess(
+            body.index("install_interrupt_handlers()"), body.index("stack.setup()"))
+
+
 if __name__ == "__main__":
     unittest.main()
