@@ -3876,10 +3876,10 @@ fn a_restart_over_the_cap_is_not_ready_at_once_and_recovers_with_zero_pushes() {
     // The first answer past startup names the cap; it is never a 200.
     let deadline = Instant::now() + Duration::from_secs(15);
     let (status, body) = loop {
-        if let Some((s, b)) = readyz() {
-            if !b.contains("starting") {
-                break (s, b);
-            }
+        if let Some((s, b)) = readyz()
+            && !b.contains("starting")
+        {
+            break (s, b);
         }
         assert!(Instant::now() < deadline, "the daemon never left startup");
         thread::sleep(Duration::from_millis(20));
