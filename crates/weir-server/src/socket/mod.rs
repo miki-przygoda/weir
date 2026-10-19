@@ -449,6 +449,80 @@ async fn drain_join_set(join_set: &mut JoinSet<()>) {
     while join_set.join_next().await.is_some() {}
 }
 
+/// How a listener's connection drain ended.
+#[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))] // Task 4.7's listeners call it; remove there
+pub(crate) enum ConnDrain {
+    Clean,
+    TimedOut { aborted: usize },
+    Forced { aborted: usize },
+}
+
+/// Waits for in-flight connections after the accept loop broke: up to
+/// `timeout` (`shutdown_timeout_secs`), or until the level becomes `Forced`,
+/// whichever comes first; then aborts what is left and counts it in
+/// `weir_connections_aborted_at_shutdown`. Shared by the Unix and TCP
+/// listeners (Foundations §5.7).
+///
+/// The aborted tasks are awaited before returning, so every handler's
+/// `QueueSender` clone is dropped by then. Only a push already parked in
+/// `spawn_blocking` can outlive that, for at most `QUEUE_PUSH_TIMEOUT`, which
+/// is why main waits on the queue's live-sender count (Task 4.8) rather than
+/// asserting it.
+#[cfg_attr(not(test), allow(dead_code))] // Task 4.7's listeners call it; remove there
+pub(crate) async fn drain_connections(
+    join_set: &mut JoinSet<()>,
+    timeout: Duration,
+    level: &mut tokio::sync::watch::Receiver<crate::lifecycle::ShutdownLevel>,
+    metrics: &Metrics,
+    who: &'static str,
+) -> ConnDrain {
+    enum Why {
+        Done,
+        Timeout,
+        Forced,
+    }
+    // The select's futures borrow `join_set`; decide first, act after they drop.
+    let why = tokio::select! {
+        biased;
+        _ = crate::lifecycle::forced(level) => Why::Forced,
+        r = time::timeout(timeout, drain_join_set(join_set)) => {
+            if r.is_ok() { Why::Done } else { Why::Timeout }
+        }
+    };
+    let remaining = join_set.len();
+    let out = match why {
+        Why::Done => {
+            info!("{who}: all connections drained cleanly");
+            return ConnDrain::Clean;
+        }
+        Why::Timeout => {
+            error!(
+                remaining,
+                timeout_secs = timeout.as_secs(),
+                "{who}: shutdown timeout reached; aborting remaining connections — producers \
+                 of those records may see no ack/nack response"
+            );
+            ConnDrain::TimedOut { aborted: remaining }
+        }
+        Why::Forced => {
+            warn!(
+                remaining,
+                "{who}: forced shutdown; aborting remaining connections now"
+            );
+            ConnDrain::Forced { aborted: remaining }
+        }
+    };
+    metrics
+        .connections_aborted_at_shutdown
+        .inc_by(remaining as u64);
+    join_set.abort_all();
+    // Reap the aborted tasks so every handler's queue sender is dropped
+    // before the caller moves on.
+    while join_set.join_next().await.is_some() {}
+    out
+}
+
 /// Backoff applied when `accept(2)` fails with a resource-exhaustion errno.
 /// Long enough to yield the CPU and let a descriptor or buffer be returned,
 /// short enough that throughput recovers promptly once pressure clears.
@@ -2777,5 +2851,81 @@ mod tests {
         assert!(!path.exists(), "the Unix socket is never bound");
         drop(taken);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── Bounded connection drain (Foundations §5.7) ───────────────────────────
+
+    use crate::lifecycle::ShutdownLevel;
+
+    #[tokio::test]
+    async fn drain_connections_aborts_at_forced_without_waiting_out_the_timeout() {
+        let metrics = test_metrics();
+        let mut js: JoinSet<()> = JoinSet::new();
+        js.spawn(std::future::pending::<()>());
+        let (tx, mut rx) = tokio::sync::watch::channel(ShutdownLevel::Graceful);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            tx.send_replace(ShutdownLevel::Forced);
+            // Keep the sender alive past the abort.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let t0 = Instant::now();
+        let out =
+            drain_connections(&mut js, Duration::from_secs(30), &mut rx, &metrics, "test").await;
+        assert_eq!(out, ConnDrain::Forced { aborted: 1 });
+        assert!(
+            t0.elapsed() < Duration::from_millis(500),
+            "took {:?}",
+            t0.elapsed()
+        );
+        assert_eq!(metrics.connections_aborted_at_shutdown.get(), 1);
+        assert!(
+            js.is_empty(),
+            "aborted handlers must be reaped before returning"
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_connections_aborts_at_the_timeout() {
+        let metrics = test_metrics();
+        let mut js: JoinSet<()> = JoinSet::new();
+        js.spawn(std::future::pending::<()>());
+        let (_tx, mut rx) = tokio::sync::watch::channel(ShutdownLevel::Graceful);
+        let out = drain_connections(
+            &mut js,
+            Duration::from_millis(100),
+            &mut rx,
+            &metrics,
+            "test",
+        )
+        .await;
+        assert_eq!(out, ConnDrain::TimedOut { aborted: 1 });
+        assert_eq!(metrics.connections_aborted_at_shutdown.get(), 1);
+        assert!(js.is_empty(), "the aborted handler is reaped");
+    }
+
+    #[tokio::test]
+    async fn drain_connections_is_clean_when_handlers_finish() {
+        let metrics = test_metrics();
+        let mut js: JoinSet<()> = JoinSet::new();
+        js.spawn(async { tokio::time::sleep(Duration::from_millis(20)).await });
+        let (_tx, mut rx) = tokio::sync::watch::channel(ShutdownLevel::Graceful);
+        let out =
+            drain_connections(&mut js, Duration::from_secs(5), &mut rx, &metrics, "test").await;
+        assert_eq!(out, ConnDrain::Clean);
+        assert_eq!(metrics.connections_aborted_at_shutdown.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn drain_connections_aborts_at_once_when_already_forced() {
+        let metrics = test_metrics();
+        let mut js: JoinSet<()> = JoinSet::new();
+        js.spawn(std::future::pending::<()>());
+        let (_tx, mut rx) = tokio::sync::watch::channel(ShutdownLevel::Forced);
+        let t0 = Instant::now();
+        let out =
+            drain_connections(&mut js, Duration::from_secs(30), &mut rx, &metrics, "test").await;
+        assert_eq!(out, ConnDrain::Forced { aborted: 1 });
+        assert!(t0.elapsed() < Duration::from_millis(100));
     }
 }
