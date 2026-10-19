@@ -115,3 +115,44 @@ def oracle_fault(kind, cut):
     if kind in LEGACY_KINDS:
         return kind
     return "power_loss" if cut == "power_loss" else "kill_random"
+
+
+#: XORed into the schedule seed so the plan has its OWN random stream:
+#: run.kill_delays draws from Random(seed), and sharing it would reshuffle
+#: every historical steady-state sequence the moment a trigger draws.
+FAULT_PLAN_SALT = 0xF0D5
+
+
+def fault_plan(seed, count, kind, faults_cfg):
+    """One step per episode: when to cut and what the trigger varies.
+
+    Every step holds `cut_after_secs`, plus `stall_sink` for the shutdown
+    triggers, `second_signal_secs` for `double_sigterm`, `pause_hold_secs`
+    and `cut_while_paused` for `admin_pause_resume`, and `recovery_delay_ms`
+    (copied from [faults], not drawn) for `sigterm_in_recovery`.
+
+    Draw order is fixed (second signal, pause hold, cut-while-paused, stall,
+    cut), so a seed reproduces its plan exactly. Pure.
+    """
+    rng = random.Random(seed ^ FAULT_PLAN_SALT)
+
+    def secs(lo, hi):
+        return rng.uniform(faults_cfg[lo], faults_cfg[hi]) / 1000.0
+
+    plan = []
+    for _ in range(count):
+        step = {}
+        if kind == "double_sigterm":
+            step["second_signal_secs"] = secs("second_signal_lo_ms", "second_signal_hi_ms")
+        if kind == "admin_pause_resume":
+            step["pause_hold_secs"] = secs("pause_hold_lo_ms", "pause_hold_hi_ms")
+            step["cut_while_paused"] = (
+                rng.random() < faults_cfg.get("pause_cut_while_paused_probability", 0.0))
+        if kind in SHUTDOWN_TRIGGERS:
+            step["stall_sink"] = rng.random() < faults_cfg.get("stall_sink_probability", 0.0)
+        if kind == "sigterm_in_recovery":
+            # A constant, not a draw, so the draw order is unchanged.
+            step["recovery_delay_ms"] = int(faults_cfg["recovery_delay_ms"])
+        step["cut_after_secs"] = secs("cut_lo_ms", "cut_hi_ms")
+        plan.append(step)
+    return plan
