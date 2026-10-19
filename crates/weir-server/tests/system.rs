@@ -5531,10 +5531,10 @@ fn routing_avoids_a_shard_whose_counter_scan_failed() {
         0,
         "nothing may be routed to the offline shard"
     );
-    // Spec §16: a test-hooks build says so at startup.
+    // Spec §16: a test-hooks build says so at startup, and that it is armed.
     let log = fs::read_to_string(srv.tmp_dir.join("weir.log")).unwrap();
     assert!(
-        log.contains("built with the test-hooks feature") && log.contains("active=true"),
+        log.contains("THIS BINARY CONTAINS TEST HOOKS") && log.contains("armed=true"),
         "no test-hooks startup WARN:\n{log}"
     );
 }
@@ -5563,4 +5563,17 @@ fn no_live_shard_refuses_connections_and_counts_them() {
         .unwrap();
     // wait_ready's own probe connection is refused too.
     assert!(refused >= 2.0, "refused = {refused}");
+}
+
+/// A binary built with the hooks says so loudly at startup, armed or not.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_binary_with_test_hooks_announces_them() {
+    let srv = weir_server!("hooks_announce").log_level("info").start();
+    let log = read_log(&srv);
+    assert!(
+        log.contains("THIS BINARY CONTAINS TEST HOOKS"),
+        "the startup WARN is missing\nlog:\n{log}"
+    );
+    srv.shutdown();
 }

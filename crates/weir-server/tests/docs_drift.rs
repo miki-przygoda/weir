@@ -30,6 +30,7 @@ const CONFIGURATION: &str = include_str!("../../../docs/operations/configuration
 const CONFIG_EXAMPLE: &str = include_str!("../../../deploy/docker/weir.toml.example");
 const CONFIG_ENV_SRC: &str = include_str!("../src/config/env.rs");
 const CONFIG_CLI_SRC: &str = include_str!("../src/config/cli.rs");
+const CI_YML: &str = include_str!("../../../.github/workflows/ci.yml");
 
 /// `Version: 2.1.0  ` → `2.1.0`.
 fn latest_md_version() -> &'static str {
@@ -884,12 +885,17 @@ fn the_test_hooks_system_tests_run_in_ci() {
         cargo.contains("\ntest-hooks = []"),
         "the test-hooks feature is gone from Cargo.toml"
     );
-    let ci = include_str!("../../../.github/workflows/ci.yml");
+    let ci = CI_YML;
     assert!(
         ci.lines().any(|l| l.contains("cargo test -p weir-server")
             && l.contains("--test system")
             && l.contains("--all-features")),
         "no CI line runs tests/system.rs with --all-features, so every \
          #[cfg(feature = \"test-hooks\")] system test is skipped"
+    );
+    // And no release build may carry the hooks (Foundations §16).
+    assert!(
+        !RELEASE_YML.contains("test-hooks") && !RELEASE_YML.contains("--all-features"),
+        "the release workflow must never build weir-server with the test hooks"
     );
 }
