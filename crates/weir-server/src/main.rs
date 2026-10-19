@@ -195,17 +195,25 @@ fn require_sink_url(
 }
 
 /// Wraps a built sink and spawns the drain — the tail shared by every sink arm.
-/// `drain::spawn` is generic over the sink but returns the same
-/// `JoinHandle<()>`, so each arm produces a uniform handle for the join
-/// sequence later in `main`.
+/// `drain::spawn_with` is generic over the sink but returns the same
+/// `JoinHandle<drain::DrainExit>`, so each arm produces a uniform handle for
+/// the join sequence.
 fn build_and_spawn_drain<S: sink::Sink + 'static>(
     sink: S,
     drain_rx: crossbeam_channel::Receiver<std::path::PathBuf>,
     drain_config: DrainConfig,
     metrics: Arc<metrics::Metrics>,
     heartbeat: DrainHeartbeat,
-) -> std::thread::JoinHandle<()> {
-    drain::spawn(drain_rx, Arc::new(sink), drain_config, metrics, heartbeat)
+    runtime: drain::DrainRuntime,
+) -> std::thread::JoinHandle<drain::DrainExit> {
+    drain::spawn_with(
+        drain_rx,
+        Arc::new(sink),
+        drain_config,
+        metrics,
+        heartbeat,
+        runtime,
+    )
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -535,9 +543,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .set(1.0);
 
-    // Sink selection. drain::spawn is generic over the sink type but returns
-    // the same JoinHandle<()> regardless, so both arms produce a uniform
-    // drain_handle for the join sequence later in this function.
+    // Sink selection. `drain::spawn_with` is generic over the sink but returns
+    // the same `JoinHandle<drain::DrainExit>`, so each arm produces a uniform
+    // handle for the join sequence.
     let drain_handle = match config.sink_type {
         SinkType::Noop => {
             warn!(
@@ -550,6 +558,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 drain_config,
                 Arc::clone(&metrics),
                 drain_heartbeat.clone(),
+                drain::DrainRuntime::detached(),
             )
         }
         #[cfg(feature = "http-sink")]
@@ -617,6 +626,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 drain_config,
                 Arc::clone(&metrics),
                 drain_heartbeat.clone(),
+                drain::DrainRuntime::detached(),
             )
         }
         #[cfg(feature = "mysql-sink")]
@@ -657,6 +667,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 drain_config,
                 Arc::clone(&metrics),
                 drain_heartbeat.clone(),
+                drain::DrainRuntime::detached(),
             )
         }
         #[cfg(feature = "postgres-sink")]
@@ -691,6 +702,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 drain_config,
                 Arc::clone(&metrics),
                 drain_heartbeat.clone(),
+                drain::DrainRuntime::detached(),
             )
         }
         #[cfg(feature = "clickhouse-sink")]
@@ -722,6 +734,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 drain_config,
                 Arc::clone(&metrics),
                 drain_heartbeat.clone(),
+                drain::DrainRuntime::detached(),
             )
         }
         #[cfg(feature = "s3-sink")]
@@ -789,6 +802,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 drain_config,
                 Arc::clone(&metrics),
                 drain_heartbeat.clone(),
+                drain::DrainRuntime::detached(),
             )
         }
     };

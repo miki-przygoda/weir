@@ -14,6 +14,7 @@
 )]
 
 use std::{
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{
@@ -24,7 +25,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::status::unix_ms_now;
+use crate::status::{DrainExitReason, StatusBoard, unix_ms_now};
 
 /// At most one operator-driven stranded-segment rescan per this interval;
 /// requests inside it are answered from the previous scan (`coalesced: true`).
@@ -253,6 +254,43 @@ impl DrainControl {
     pub(crate) fn generation(&self) -> u64 {
         self.0.generation.load(Acquire)
     }
+}
+
+/// Everything the drain is started with besides its sink and config (spec §5.4).
+/// Kept out of `DrainConfig` so the existing `DrainConfig { .. }` test literals
+/// compile unchanged.
+pub(crate) struct DrainRuntime {
+    pub(crate) control: DrainControl,
+    /// `None` = unobserved (tests); production passes the board from PR 1.
+    pub(crate) board: Option<Arc<StatusBoard>>,
+    /// The startup replay list, handed over in memory (PR 3/4). Used on the
+    /// drain's FIRST start only; a respawn recovers it through its rescan.
+    pub(crate) initial_backlog: Vec<PathBuf>,
+}
+
+impl DrainRuntime {
+    /// Today's wiring: Detached, no board, no backlog.
+    pub(crate) fn detached() -> Self {
+        Self {
+            control: DrainControl::detached(),
+            board: None,
+            initial_backlog: Vec::new(),
+        }
+    }
+}
+
+/// Why and how the drain stopped. The input to main's T3 summary (PR 4),
+/// built without new I/O.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DrainExit {
+    pub(crate) reason: DrainExitReason,
+    /// The segment left partly delivered (`segment_identity`, records processed).
+    pub(crate) abandoned: Option<(String, u64)>,
+    /// Paths still in `pending` plus what was left in the channel.
+    pub(crate) pending_left: usize,
+    pub(crate) backlog_left: usize,
+    /// The last drain panic's message, sanitised (admin view only).
+    pub(crate) last_panic: Option<String>,
 }
 
 #[cfg(test)]

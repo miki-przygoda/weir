@@ -67,11 +67,36 @@ use crate::{
     wab::{SegmentReader, read_segment_record_count, segment::segment_identity},
 };
 
+pub(crate) use control::{DrainControl, DrainExit, DrainRuntime};
+use publish::Publisher;
+
+use crate::status::DrainExitReason;
 use confirmed::confirm_and_delete;
 use dead_letter::DeadLetterWriter;
 use ledger::{Admit, DeadLetterCarry, SegmentLedger, TransientCause};
 #[cfg(test)]
 use ledger::{ErrClass, ParkReason};
+
+/// What the drain's inner functions need besides their data: the intent to
+/// obey, the board to publish to, the heartbeat to bump. Borrowed for one
+/// drain incarnation.
+#[allow(
+    dead_code,
+    reason = "control and publish are first read in Task 2.4, which removes this"
+)]
+pub(crate) struct DrainCtx<'a> {
+    pub(crate) control: &'a DrainControl,
+    pub(crate) publish: &'a Publisher,
+    pub(crate) hb: &'a DrainHeartbeat,
+}
+
+/// How one `drain_thread_with` incarnation ended (a panic never returns one).
+struct ThreadExit {
+    reason: DrainExitReason,
+    abandoned: Option<(PathBuf, u64)>,
+    pending_left: usize,
+    backlog_left: usize,
+}
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -314,9 +339,27 @@ enum DeadLetterFailure {
 
 // ── Public interface ──────────────────────────────────────────────────────────
 
-/// Spawns the drain thread. Returns a `JoinHandle` that completes once the
-/// `drain_rx` channel closes (i.e. all WAB flusher threads have exited) and all
-/// in-flight segments have been processed or explicitly abandoned.
+/// Spawns the supervised drain thread. The handle yields how the drain ended
+/// ([`DrainExit`]). A Detached drain (today's production wiring) ends once the
+/// `drain_rx` channel closes (all WAB flusher threads have exited) and every
+/// queued segment has been processed or explicitly abandoned.
+pub(crate) fn spawn_with<S: Sink + 'static>(
+    drain_rx: crossbeam_channel::Receiver<PathBuf>,
+    sink: Arc<S>,
+    config: DrainConfig,
+    metrics: Arc<Metrics>,
+    heartbeat: DrainHeartbeat,
+    runtime: DrainRuntime,
+) -> std::thread::JoinHandle<DrainExit> {
+    std::thread::Builder::new()
+        .name("weir-drain".into())
+        .spawn(move || run_drain_supervised(drain_rx, sink, config, metrics, heartbeat, runtime))
+        .expect("failed to spawn drain thread")
+}
+
+/// The pre-Foundations entry point, kept with its signature for the existing
+/// tests: a Detached drain with no board (spec §5.4 "Entry points").
+#[cfg(test)]
 pub fn spawn<S: Sink + 'static>(
     drain_rx: crossbeam_channel::Receiver<PathBuf>,
     sink: Arc<S>,
@@ -326,7 +369,16 @@ pub fn spawn<S: Sink + 'static>(
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("weir-drain".into())
-        .spawn(move || run_drain_supervised(drain_rx, sink, config, metrics, heartbeat))
+        .spawn(move || {
+            run_drain_supervised(
+                drain_rx,
+                sink,
+                config,
+                metrics,
+                heartbeat,
+                DrainRuntime::detached(),
+            );
+        })
         .expect("failed to spawn drain thread")
 }
 
@@ -340,7 +392,7 @@ pub fn spawn<S: Sink + 'static>(
 /// never refilled: five distinct poison segments spend it and stop delivery.
 pub(crate) const MAX_DRAIN_RESPAWNS: u32 = 10;
 
-/// Runs [`drain_thread`] under panic supervision. A panic in the drain (a sink
+/// Runs [`drain_thread_with`] under panic supervision. A panic in the drain (a sink
 /// impl, `process_segment`, `confirm_and_delete`, a `DeadLetterWriter::open`
 /// failure, …) is caught and the drain is respawned with a fresh runtime +
 /// dead-letter writer, reading from the same channel so buffered segments
@@ -372,13 +424,23 @@ fn run_drain_supervised<S: Sink>(
     config: DrainConfig,
     metrics: Arc<Metrics>,
     heartbeat: DrainHeartbeat,
-) {
+    runtime: DrainRuntime,
+) -> DrainExit {
+    let DrainRuntime {
+        control,
+        board,
+        initial_backlog,
+    } = runtime;
+    let publish = Publisher::new(board);
+    // The replay list goes to the FIRST incarnation only (spec §5.4
+    // "Supervisor"): a respawn recovers whatever it lost through its rescan.
+    let mut first_backlog = Some(initial_backlog);
     let mut attempts = 0u32;
-    // Owned here, not by `drain_thread`, so it survives a panic and respawn: a
+    // Owned here, not by `drain_thread_with`, so it survives a panic and respawn: a
     // respawned drain still knows which segments are owned by a disposition,
     // parked or cooling down, and where each stranded segment resumes.
     let mut ledger = SegmentLedger::new(Arc::new(ledger::LedgerCounts::default()));
-    loop {
+    let exit = loop {
         let rx = drain_rx.clone();
         let sink = Arc::clone(&sink);
         let cfg = config.clone();
@@ -386,15 +448,29 @@ fn run_drain_supervised<S: Sink>(
         let hb = heartbeat.clone();
         // True on the first start; false on every respawn (a panic destroys
         // `pending`, so a respawn must treat its first healthy probe as a
-        // recovery edge and rescan the disk — see `drain_thread`'s
+        // recovery edge and rescan the disk — see `drain_thread_with`'s
         // `initial_health_ok`).
         let first_start = attempts == 0;
         let lent = &mut ledger;
+        let backlog = first_backlog.take().unwrap_or_default();
+        let (ctl, pb) = (&control, &publish);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            drain_thread(rx, sink, cfg, m, first_start, hb, lent)
+            drain_thread_with(rx, sink, cfg, m, first_start, hb, lent, ctl, pb, backlog)
         }));
-        // A clean Ok(()) return means the channel closed (all flushers gone) — done.
-        let Err(_) = result else { break };
+        // A clean return means the incarnation ended on its own terms (a
+        // Detached drain: the channel closed, all flushers gone) — done.
+        let _payload = match result {
+            Ok(t) => {
+                break DrainExit {
+                    reason: t.reason,
+                    abandoned: t.abandoned.map(|(p, n)| (segment_identity(&p), n)),
+                    pending_left: t.pending_left,
+                    backlog_left: t.backlog_left,
+                    last_panic: None,
+                };
+            }
+            Err(payload) => payload,
+        };
         attempts += 1;
         metrics.drain_panics.inc();
         // Charge the panic to the segment in flight, if any, and park it at the
@@ -428,7 +504,13 @@ fn run_drain_supervised<S: Sink>(
                 "drain thread panicked too many times; giving up — delivery is \
                  stopped and the WAB will accumulate on disk until restart"
             );
-            break;
+            break DrainExit {
+                reason: DrainExitReason::GaveUp,
+                abandoned: None,
+                pending_left: drain_rx.len(),
+                backlog_left: 0,
+                last_panic: None,
+            };
         }
         error!(
             attempts,
@@ -438,11 +520,11 @@ fn run_drain_supervised<S: Sink>(
         std::thread::sleep(Duration::from_millis(
             100u64.saturating_mul(attempts as u64),
         ));
-    }
+    };
     // EVERY exit from the loop above lands here — there is no other way out of
-    // it. The `Ok(())` arm breaks on a clean channel close (shutdown — all WAB
+    // it. The `Ok` arm breaks on a clean channel close (shutdown — all WAB
     // flushers exited), and the respawn-budget arm breaks once panics (which
-    // now include a `DeadLetterWriter::open` failure — see `drain_thread` —
+    // now include a `DeadLetterWriter::open` failure — see `drain_thread_with` —
     // as well as a sink impl / `process_segment` / `confirm_and_delete` panic)
     // exhaust `MAX_DRAIN_RESPAWNS`. So one assignment covers both.
     //
@@ -461,6 +543,7 @@ fn run_drain_supervised<S: Sink>(
     // honest signal, and it tells the operator the health reading is stale.
     set_drain_state(&metrics, DrainStateValue::stopped);
     info!("drain supervisor exiting");
+    exit
 }
 
 // ── Drain state helper ────────────────────────────────────────────────────────
@@ -944,7 +1027,8 @@ fn quarantine_bytes_on_disk(wab_dir: &Path) -> u64 {
     total
 }
 
-fn drain_thread<S: Sink>(
+#[allow(clippy::too_many_arguments)]
+fn drain_thread_with<S: Sink>(
     drain_rx: crossbeam_channel::Receiver<PathBuf>,
     sink: Arc<S>,
     config: DrainConfig,
@@ -964,7 +1048,24 @@ fn drain_thread<S: Sink>(
     heartbeat: DrainHeartbeat,
     // Owned by `run_drain_supervised` so it outlives a panic; see `ledger`.
     ledger: &mut SegmentLedger,
-) {
+    // The intent to obey (spec §5.4). Shared with the supervisor and every
+    // respawn, so a pause or a stop outlives a panic.
+    control: &DrainControl,
+    // The board to publish to; a no-op without one (tests).
+    publish: &Publisher,
+    // The startup replay list, on the first incarnation only (empty on a
+    // respawn, which recovers it through its rescan).
+    initial_backlog: Vec<PathBuf>,
+) -> ThreadExit {
+    let ctx = DrainCtx {
+        control,
+        publish,
+        hb: &heartbeat,
+    };
+    let generation = control.begin_generation();
+    publish.generation(generation);
+    metrics.drain_generation.set(generation as f64);
+
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -988,7 +1089,8 @@ fn drain_thread<S: Sink>(
     };
 
     let mut state = DrainState::Draining;
-    let mut pending: VecDeque<PathBuf> = VecDeque::new();
+    // Task 2.5 moves the replay list into its own `backlog` queue.
+    let mut pending: VecDeque<PathBuf> = initial_backlog.into();
 
     // The start of the current dead-letter-full blocking episode, if any. An
     // episode spans a flapping cap (unblock → reblock the same segment without
@@ -1022,7 +1124,7 @@ fn drain_thread<S: Sink>(
     // not just per-retry.
     let mut shutdown_backoff_left = SHUTDOWN_RETRY_BACKOFF_BUDGET;
 
-    'outer: loop {
+    let reason = 'outer: loop {
         // See `DrainHeartbeat`: bumped unconditionally on every pass through
         // this loop, whatever state does or doesn't happen below — a sink
         // call that blocks this thread (rather than yielding) is exactly the
@@ -1120,7 +1222,9 @@ fn drain_thread<S: Sink>(
                             }
                         },
                         Err(RecvTimeoutError::Timeout) => break None,
-                        Err(RecvTimeoutError::Disconnected) => break 'outer,
+                        Err(RecvTimeoutError::Disconnected) => {
+                            break 'outer DrainExitReason::Stopped;
+                        }
                     }
                 };
 
@@ -1145,7 +1249,7 @@ fn drain_thread<S: Sink>(
                             &mut dead_letter,
                             ledger,
                             skip,
-                            &heartbeat,
+                            &ctx,
                         );
                         transition_from_draining(
                             segment,
@@ -1371,7 +1475,7 @@ fn drain_thread<S: Sink>(
                     &mut dead_letter,
                     ledger,
                     processed,
-                    &heartbeat,
+                    &ctx,
                 );
                 // Subsequent failure: spend one retry and double the delay
                 // (exponential backoff). retries_left is >= 1 here — a spent
@@ -1522,7 +1626,7 @@ fn drain_thread<S: Sink>(
                         path = %segment.display(),
                         "drain: shutdown while blocked; segment not confirmed"
                     );
-                    break 'outer;
+                    break 'outer DrainExitReason::Stopped;
                 } else {
                     DrainState::BlockedDeadLetterFull {
                         segment,
@@ -1533,7 +1637,7 @@ fn drain_thread<S: Sink>(
                 }
             }
         };
-    }
+    };
 
     // One best-effort pass over outstanding dispositions on the way out: a
     // sidecar or quarantine move that can complete now saves a re-delivery on
@@ -1541,6 +1645,40 @@ fn drain_thread<S: Sink>(
     ledger.retry_dispositions(&config.wab_dir, &metrics, &heartbeat);
     publish_ledger_counts(ledger.counts(), &metrics);
     info!("drain thread exiting");
+    ThreadExit {
+        reason,
+        abandoned: None,
+        pending_left: pending.len() + drain_rx.len(),
+        backlog_left: 0,
+    }
+}
+
+/// The pre-Foundations entry, kept with its signature for the existing tests:
+/// Detached, unobserved, no backlog.
+#[cfg(test)]
+fn drain_thread<S: Sink>(
+    drain_rx: crossbeam_channel::Receiver<PathBuf>,
+    sink: Arc<S>,
+    config: DrainConfig,
+    metrics: Arc<Metrics>,
+    initial_health_ok: bool,
+    heartbeat: DrainHeartbeat,
+    ledger: &mut SegmentLedger,
+) {
+    let control = DrainControl::detached();
+    let publish = Publisher::none();
+    drain_thread_with(
+        drain_rx,
+        sink,
+        config,
+        metrics,
+        initial_health_ok,
+        heartbeat,
+        ledger,
+        &control,
+        &publish,
+        Vec::new(),
+    );
 }
 
 /// Maps a [`ProcessResult`] to the next [`DrainState`]. The three terminal
@@ -1681,8 +1819,9 @@ fn attempt_segment<S: Sink>(
     dead_letter: &mut DeadLetterWriter,
     ledger: &mut SegmentLedger,
     skip: u64,
-    hb: &DrainHeartbeat,
+    ctx: &DrainCtx<'_>,
 ) -> ProcessResult {
+    let hb = ctx.hb;
     ledger.begin_attempt(segment);
     let result = 'attempt: {
         // `skip` may come from a state rather than from admission; either
@@ -1698,7 +1837,7 @@ fn attempt_segment<S: Sink>(
             }
         };
         let last_chance = local_read_escalates_next(segment, config, ledger);
-        rt.block_on(process_segment(
+        rt.block_on(process_segment_ctl(
             segment,
             sink,
             config,
@@ -1706,7 +1845,7 @@ fn attempt_segment<S: Sink>(
             dead_letter,
             skip,
             last_chance,
-            hb,
+            ctx,
         ))
     };
     ledger.end_attempt();
@@ -1848,7 +1987,7 @@ fn local_read_escalation_due(
 }
 
 /// True when one more segment-class local read failure of `segment` would
-/// escalate it — the `last_local_read_chance` of [`process_segment`]. It is
+/// escalate it — the `last_local_read_chance` of [`process_segment_ctl`]. It is
 /// evaluated after [`SegmentLedger::begin_attempt`], against the same attempt
 /// start [`escalate_local_read`] then ages the failures to, so the two always
 /// agree on which attempt is the escalating one.
@@ -1961,7 +2100,7 @@ fn enter_blocked(
 /// before quarantining (spec §4.2), which needs the sink — so it happens here
 /// rather than in [`escalate_local_read`].
 #[allow(clippy::too_many_arguments)]
-async fn process_segment<S: Sink>(
+async fn process_segment_ctl<S: Sink>(
     segment: &Path,
     sink: &S,
     config: &DrainConfig,
@@ -1969,8 +2108,9 @@ async fn process_segment<S: Sink>(
     dead_letter: &mut DeadLetterWriter,
     skip: u64,
     last_local_read_chance: bool,
-    hb: &DrainHeartbeat,
+    ctx: &DrainCtx<'_>,
 ) -> ProcessResult {
+    let hb = ctx.hb;
     // The whole attempt is reading the segment, except where a nested guard
     // says otherwise: each commit (`SinkCommit`), a dead-letter write, a
     // quarantine move. The heartbeat itself moves after every commit and every
@@ -2162,7 +2302,7 @@ async fn process_segment<S: Sink>(
             let full_batch = std::mem::replace(&mut batch, Vec::with_capacity(max_batch));
             let full_ids = std::mem::replace(&mut batch_ids, Vec::with_capacity(max_batch));
             let n = full_batch.len() as u64;
-            let result = commit_batch(
+            let result = commit_batch_ctl(
                 &full_batch,
                 &full_ids,
                 segment_created_at,
@@ -2170,7 +2310,7 @@ async fn process_segment<S: Sink>(
                 config,
                 metrics,
                 dead_letter,
-                hb,
+                ctx,
             )
             .instrument(segment_span.clone())
             .await;
@@ -2183,7 +2323,7 @@ async fn process_segment<S: Sink>(
 
     if !batch.is_empty() {
         let n = batch.len() as u64;
-        let result = commit_batch(
+        let result = commit_batch_ctl(
             &batch,
             &batch_ids,
             segment_created_at,
@@ -2191,7 +2331,7 @@ async fn process_segment<S: Sink>(
             config,
             metrics,
             dead_letter,
-            hb,
+            ctx,
         )
         .instrument(segment_span.clone())
         .await;
@@ -2300,6 +2440,39 @@ async fn process_segment<S: Sink>(
     ProcessResult::Confirmed {
         record_count: read_index,
     }
+}
+
+/// Pre-Foundations signature for the existing tests: Detached, unobserved.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn process_segment<S: Sink>(
+    segment: &Path,
+    sink: &S,
+    config: &DrainConfig,
+    metrics: &Metrics,
+    dead_letter: &mut DeadLetterWriter,
+    skip: u64,
+    last_local_read_chance: bool,
+    hb: &DrainHeartbeat,
+) -> ProcessResult {
+    let control = DrainControl::detached();
+    let publish = Publisher::none();
+    let ctx = DrainCtx {
+        control: &control,
+        publish: &publish,
+        hb,
+    };
+    process_segment_ctl(
+        segment,
+        sink,
+        config,
+        metrics,
+        dead_letter,
+        skip,
+        last_local_read_chance,
+        &ctx,
+    )
+    .await
 }
 
 /// Applies a sub-batch of `n` records, starting after record `*durable_through`,
@@ -2728,7 +2901,7 @@ fn move_to_quarantine(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn commit_batch<S: Sink>(
+async fn commit_batch_ctl<S: Sink>(
     payloads: &[Payload],
     record_ids: &[RecordId],
     segment_created_at: i64,
@@ -2736,8 +2909,9 @@ async fn commit_batch<S: Sink>(
     config: &DrainConfig,
     metrics: &Metrics,
     dead_letter: &mut DeadLetterWriter,
-    hb: &DrainHeartbeat,
+    ctx: &DrainCtx<'_>,
 ) -> BatchResult {
+    let hb = ctx.hb;
     // Derive the batch's dedup token. This runs on the drain thread — off the
     // fsync path entirely — and costs ~170 us per 256 KiB against a sink commit
     // measured in milliseconds.
@@ -2908,6 +3082,39 @@ async fn commit_batch<S: Sink>(
             BatchResult::Ok
         }
     }
+}
+
+/// Pre-Foundations signature for the existing tests: Detached, unobserved.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn commit_batch<S: Sink>(
+    payloads: &[Payload],
+    record_ids: &[RecordId],
+    segment_created_at: i64,
+    sink: &S,
+    config: &DrainConfig,
+    metrics: &Metrics,
+    dead_letter: &mut DeadLetterWriter,
+    hb: &DrainHeartbeat,
+) -> BatchResult {
+    let control = DrainControl::detached();
+    let publish = Publisher::none();
+    let ctx = DrainCtx {
+        control: &control,
+        publish: &publish,
+        hb,
+    };
+    commit_batch_ctl(
+        payloads,
+        record_ids,
+        segment_created_at,
+        sink,
+        config,
+        metrics,
+        dead_letter,
+        &ctx,
+    )
+    .await
 }
 
 /// Dead-letters `records` under the `dead_letter_max_bytes` cap, bumping the
@@ -9436,4 +9643,7 @@ mod tests {
             "the same episode does not repeat it: {again}"
         );
     }
+
+    // ── Foundations: drain control (operability spec §5.4, §8) ───────────────
+    mod foundations;
 }
