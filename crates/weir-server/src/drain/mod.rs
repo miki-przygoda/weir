@@ -2,7 +2,7 @@
 //!
 //! # State machine
 //!
-//! The drain thread operates in one of three states:
+//! The drain thread operates in one of four states (`Held` only while paused):
 //!
 //! ```text
 //! Draining
@@ -19,6 +19,10 @@
 //! BlockedDeadLetterFull  ──(the blocked write fits)──▶  RetryingTransient (same
 //!                                            segment, RESUMING past already-processed
 //!                                            sub-batches — see F05)
+//!
+//! Draining / RetryingTransient ──(pause seen before a commit batch)──▶ Held
+//!   Held ──(resume)──▶ Draining (same segment first, past its cursor)
+//!                   or RetryingTransient (same episode, backoff already served)
 //! ```
 //!
 //! A sub-batch the sink committed but whose rejected records could not be
@@ -40,8 +44,10 @@
 //! delivered again.
 
 mod confirmed;
+pub(crate) mod control;
 pub mod dead_letter;
 pub(crate) mod ledger;
+mod publish;
 
 use std::{
     collections::VecDeque,
@@ -57,19 +63,49 @@ use weir_sink_sdk::RecordId;
 
 use crate::{
     metrics::{
-        DispositionKind, DispositionLabel, DrainStateLabel, DrainStateValue, LocalIoStrandCause,
-        LocalIoStrandLabel, Metrics, Outcome, OutcomeLabel, ParkedLabel, ParkedReason,
-        SinkHealthLabel, SinkHealthState,
+        DispositionKind, DispositionLabel, DrainQueue, DrainQueueLabel, DrainStateLabel,
+        DrainStateValue, LocalIoStrandCause, LocalIoStrandLabel, Metrics, Outcome, OutcomeLabel,
+        ParkedLabel, ParkedReason, SinkHealthLabel, SinkHealthState,
     },
     sink::{Sink, SinkError, SinkHealth},
     wab::{SegmentReader, read_segment_record_count, segment::segment_identity},
 };
 
+pub(crate) use control::{DrainControl, DrainExit, DrainRuntime, Lifetime};
+use publish::{CommitGuard, Publisher};
+
+use crate::status::{
+    DrainExitInfo, DrainExitReason, InFlight, RequeueResult, SinkFailureKind, unix_ms_now,
+};
 use confirmed::confirm_and_delete;
 use dead_letter::DeadLetterWriter;
 use ledger::{Admit, DeadLetterCarry, SegmentLedger, TransientCause};
 #[cfg(test)]
 use ledger::{ErrClass, ParkReason};
+
+/// What the drain's inner functions need besides their data: the intent to
+/// obey, the board to publish to, the heartbeat to bump. Borrowed for one
+/// drain incarnation.
+pub(crate) struct DrainCtx<'a> {
+    pub(crate) control: &'a DrainControl,
+    pub(crate) publish: &'a Publisher,
+    pub(crate) hb: &'a DrainHeartbeat,
+}
+
+impl<'a> DrainCtx<'a> {
+    /// See [`CommitGuard`]: taken immediately before the commit `select!`.
+    pub(crate) fn commit_guard(&self) -> CommitGuard<'a> {
+        CommitGuard::new(self.publish, self.hb)
+    }
+}
+
+/// How one `drain_thread_with` incarnation ended (a panic never returns one).
+struct ThreadExit {
+    reason: DrainExitReason,
+    abandoned: Option<(PathBuf, u64)>,
+    pending_left: usize,
+    backlog_left: usize,
+}
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -207,6 +243,24 @@ enum DrainState {
         /// bookkeeping once the budget runs out: only a sink cause counts as a
         /// sink strand and marks the sink down (D11).
         cause: TransientCause,
+        /// A retry-stranded request has already cut one backoff in this retry
+        /// episode. Carried from retry to retry so a looping caller cannot cut
+        /// every backoff (spec §5.4 "Retry stranded", W2).
+        backoff_cut: bool,
+        /// The backoff was already served (a hold resumed): retry at once.
+        waited: bool,
+    },
+    /// Paused mid-segment between commit batches (spec §5.4, §8). Gauged as
+    /// the state it came from; `weir_drain_paused` says it is paused.
+    Held {
+        segment: PathBuf,
+        processed: u64,
+        resume: HeldResume,
+    },
+    /// An attempt was abandoned at the deadline; the loop exits on its next pass.
+    Abandoned {
+        segment: PathBuf,
+        processed: u64,
     },
     BlockedDeadLetterFull {
         segment: PathBuf,
@@ -219,6 +273,29 @@ enum DrainState {
         /// that blocked it (spec §4.5) — never on a bare `total < cap`.
         needed: u64,
     },
+}
+
+/// How a held segment continues once the pause lifts.
+enum HeldResume {
+    /// It was a first attempt: back through admission and the Draining arm.
+    Fresh,
+    /// It was a retry: continue the same episode without serving the backoff again.
+    Retry {
+        retries_left: u32,
+        next_delay: Duration,
+        cause: TransientCause,
+        backoff_cut: bool,
+    },
+}
+
+impl HeldResume {
+    /// The one-hot `weir_drain_state` a hold keeps showing (spec §5.4 "Gauges").
+    fn gauge_state(&self) -> DrainStateValue {
+        match self {
+            Self::Fresh => DrainStateValue::draining,
+            Self::Retry { .. } => DrainStateValue::retrying_transient,
+        }
+    }
 }
 
 enum ProcessResult {
@@ -263,6 +340,14 @@ enum ProcessResult {
     /// header names a newer format version). Nothing was delivered. Set it aside
     /// for the rest of the run, bytes untouched; the next start replays it.
     Parked { reason: ledger::ParkReason },
+    /// A pause was seen before the next commit batch (spec §5.4). No commit is
+    /// in flight and `processed` is exactly the committed prefix, so resuming
+    /// past it re-sends nothing.
+    Paused { processed: u64 },
+    /// The stop deadline passed before the next batch, or during a commit
+    /// (spec §5.4). `processed` is the committed prefix. Maps to drain exit;
+    /// never confirmed.
+    Abandoned { processed: u64 },
 }
 
 enum BatchResult {
@@ -280,6 +365,10 @@ enum BatchResult {
         needed: u64,
         owed: DeadLetterOwed,
     },
+    /// The stop deadline passed while the sink commit was in flight; the
+    /// commit future was dropped (the `commit_timeout` drop semantics, with no
+    /// retry bump and no backoff).
+    Abandoned,
 }
 
 /// What a sub-batch still owes the dead-letter directory after its sink call:
@@ -312,9 +401,27 @@ enum DeadLetterFailure {
 
 // ── Public interface ──────────────────────────────────────────────────────────
 
-/// Spawns the drain thread. Returns a `JoinHandle` that completes once the
-/// `drain_rx` channel closes (i.e. all WAB flusher threads have exited) and all
-/// in-flight segments have been processed or explicitly abandoned.
+/// Spawns the supervised drain thread. The handle yields how the drain ended
+/// ([`DrainExit`]). A Detached drain (today's production wiring) ends once the
+/// `drain_rx` channel closes (all WAB flusher threads have exited) and every
+/// queued segment has been processed or explicitly abandoned.
+pub(crate) fn spawn_with<S: Sink + 'static>(
+    drain_rx: crossbeam_channel::Receiver<PathBuf>,
+    sink: Arc<S>,
+    config: DrainConfig,
+    metrics: Arc<Metrics>,
+    heartbeat: DrainHeartbeat,
+    runtime: DrainRuntime,
+) -> std::thread::JoinHandle<DrainExit> {
+    std::thread::Builder::new()
+        .name("weir-drain".into())
+        .spawn(move || run_drain_supervised(drain_rx, sink, config, metrics, heartbeat, runtime))
+        .expect("failed to spawn drain thread")
+}
+
+/// The pre-Foundations entry point, kept with its signature for the existing
+/// tests: a Detached drain with no board (spec §5.4 "Entry points").
+#[cfg(test)]
 pub fn spawn<S: Sink + 'static>(
     drain_rx: crossbeam_channel::Receiver<PathBuf>,
     sink: Arc<S>,
@@ -324,7 +431,16 @@ pub fn spawn<S: Sink + 'static>(
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("weir-drain".into())
-        .spawn(move || run_drain_supervised(drain_rx, sink, config, metrics, heartbeat))
+        .spawn(move || {
+            run_drain_supervised(
+                drain_rx,
+                sink,
+                config,
+                metrics,
+                heartbeat,
+                DrainRuntime::detached(),
+            );
+        })
         .expect("failed to spawn drain thread")
 }
 
@@ -338,7 +454,7 @@ pub fn spawn<S: Sink + 'static>(
 /// never refilled: five distinct poison segments spend it and stop delivery.
 pub(crate) const MAX_DRAIN_RESPAWNS: u32 = 10;
 
-/// Runs [`drain_thread`] under panic supervision. A panic in the drain (a sink
+/// Runs [`drain_thread_with`] under panic supervision. A panic in the drain (a sink
 /// impl, `process_segment`, `confirm_and_delete`, a `DeadLetterWriter::open`
 /// failure, …) is caught and the drain is respawned with a fresh runtime +
 /// dead-letter writer, reading from the same channel so buffered segments
@@ -370,13 +486,27 @@ fn run_drain_supervised<S: Sink>(
     config: DrainConfig,
     metrics: Arc<Metrics>,
     heartbeat: DrainHeartbeat,
-) {
+    runtime: DrainRuntime,
+) -> DrainExit {
+    let DrainRuntime {
+        control,
+        board,
+        initial_backlog,
+    } = runtime;
+    let publish = Publisher::new(board);
+    // The replay list goes to the FIRST incarnation only (spec §5.4
+    // "Supervisor"): a respawn recovers whatever it lost through its rescan.
+    let mut first_backlog = Some(initial_backlog);
     let mut attempts = 0u32;
-    // Owned here, not by `drain_thread`, so it survives a panic and respawn: a
+    // Owned here, not by `drain_thread_with`, so it survives a panic and respawn: a
     // respawned drain still knows which segments are owned by a disposition,
     // parked or cooling down, and where each stranded segment resumes.
     let mut ledger = SegmentLedger::new(Arc::new(ledger::LedgerCounts::default()));
-    loop {
+    // The last panic's message, sanitised, carried into every later exit.
+    let mut last_panic: Option<String> = None;
+    // The replay list's size, for zeroing its progress if a panic takes it.
+    let replay_total = first_backlog.as_ref().map_or(0, |b| b.len() as u64);
+    let exit = loop {
         let rx = drain_rx.clone();
         let sink = Arc::clone(&sink);
         let cfg = config.clone();
@@ -384,17 +514,56 @@ fn run_drain_supervised<S: Sink>(
         let hb = heartbeat.clone();
         // True on the first start; false on every respawn (a panic destroys
         // `pending`, so a respawn must treat its first healthy probe as a
-        // recovery edge and rescan the disk — see `drain_thread`'s
+        // recovery edge and rescan the disk — see `drain_thread_with`'s
         // `initial_health_ok`).
         let first_start = attempts == 0;
         let lent = &mut ledger;
+        let backlog = first_backlog.take().unwrap_or_default();
+        let (ctl, pb) = (&control, &publish);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-            drain_thread(rx, sink, cfg, m, first_start, hb, lent)
+            drain_thread_with(rx, sink, cfg, m, first_start, hb, lent, ctl, pb, backlog)
         }));
-        // A clean Ok(()) return means the channel closed (all flushers gone) — done.
-        let Err(_) = result else { break };
+        // A clean return means the incarnation ended on its own terms (a
+        // Detached drain: the channel closed, all flushers gone) — done.
+        let payload = match result {
+            Ok(t) => {
+                break DrainExit {
+                    reason: t.reason,
+                    abandoned: t.abandoned.map(|(p, n)| (segment_identity(&p), n)),
+                    pending_left: t.pending_left,
+                    backlog_left: t.backlog_left,
+                    last_panic: last_panic.clone(),
+                };
+            }
+            Err(payload) => payload,
+        };
         attempts += 1;
         metrics.drain_panics.inc();
+        let message = publish::sanitize_admin_text(crate::wab::panic_message_str(&payload));
+        error!(attempts, panic = %message, "drain thread panicked");
+        last_panic = Some(message);
+        // A panic took the replay list with it; the respawn's rescan recovers
+        // it into the backlog, where backlog_len counts it.
+        if replay_total > 0 {
+            publish.replay(replay_total, 0);
+            metrics.drain_replay_remaining_segments.set(0.0);
+        }
+        // Never respawn after stop (spec §5.4 "Supervisor"): main is waiting
+        // on a bounded exit, and a fresh incarnation would restart delivery.
+        if control.stop_requested() {
+            warn!("drain: panicked after stop was requested; not respawning");
+            break DrainExit {
+                reason: if control.deadline_passed() {
+                    DrainExitReason::DeadlineAbandoned
+                } else {
+                    DrainExitReason::Stopped
+                },
+                abandoned: None,
+                pending_left: drain_rx.len(),
+                backlog_left: 0,
+                last_panic: last_panic.clone(),
+            };
+        }
         // Charge the panic to the segment in flight, if any, and park it at the
         // second (spec §4.12). Without this the respawn's first healthy probe
         // rescans, re-queues the same segment, and a deterministic panic
@@ -426,7 +595,13 @@ fn run_drain_supervised<S: Sink>(
                 "drain thread panicked too many times; giving up — delivery is \
                  stopped and the WAB will accumulate on disk until restart"
             );
-            break;
+            break DrainExit {
+                reason: DrainExitReason::GaveUp,
+                abandoned: None,
+                pending_left: drain_rx.len(),
+                backlog_left: 0,
+                last_panic: last_panic.clone(),
+            };
         }
         error!(
             attempts,
@@ -436,11 +611,11 @@ fn run_drain_supervised<S: Sink>(
         std::thread::sleep(Duration::from_millis(
             100u64.saturating_mul(attempts as u64),
         ));
-    }
+    };
     // EVERY exit from the loop above lands here — there is no other way out of
-    // it. The `Ok(())` arm breaks on a clean channel close (shutdown — all WAB
+    // it. The `Ok` arm breaks on a clean channel close (shutdown — all WAB
     // flushers exited), and the respawn-budget arm breaks once panics (which
-    // now include a `DeadLetterWriter::open` failure — see `drain_thread` —
+    // now include a `DeadLetterWriter::open` failure — see `drain_thread_with` —
     // as well as a sink impl / `process_segment` / `confirm_and_delete` panic)
     // exhaust `MAX_DRAIN_RESPAWNS`. So one assignment covers both.
     //
@@ -458,7 +633,23 @@ fn run_drain_supervised<S: Sink>(
     // "sink is down" signal on every SIGTERM. `drain_state{stopped}` is the
     // honest signal, and it tells the operator the health reading is stale.
     set_drain_state(&metrics, DrainStateValue::stopped);
-    info!("drain supervisor exiting");
+    publish.state(&DrainStateValue::stopped);
+    publish.in_flight(None);
+    publish.exit(DrainExitInfo {
+        reason: exit.reason,
+        abandoned: exit.abandoned.clone(),
+        pending_left: exit.pending_left,
+        backlog_left: exit.backlog_left,
+        last_panic: exit.last_panic.clone(),
+        at_ms: unix_ms_now(),
+    });
+    info!(
+        reason = ?exit.reason,
+        pending_left = exit.pending_left,
+        backlog_left = exit.backlog_left,
+        "drain supervisor exiting"
+    );
+    exit
 }
 
 // ── Drain state helper ────────────────────────────────────────────────────────
@@ -479,6 +670,50 @@ fn set_drain_state(metrics: &Metrics, active: DrainStateValue) {
             .drain_state
             .get_or_create(&DrainStateLabel { state: s })
             .set(v);
+    }
+}
+
+/// Publishes the arm the drain is in: the one-hot gauge, the board state, and
+/// the blocked-since stamp (0 outside BlockedDeadLetterFull). Called wherever
+/// `set_drain_state` was called at an arm head (spec §5.4 "Publication").
+fn enter_arm(
+    publish: &Publisher,
+    metrics: &Metrics,
+    state: DrainStateValue,
+    blocked_since_ms: u64,
+) {
+    publish.state(&state);
+    publish.blocked_since(blocked_since_ms);
+    set_drain_state(metrics, state);
+}
+
+/// Queue lengths to the board and to `weir_drain_pending_segments{queue}`.
+fn publish_queues(publish: &Publisher, metrics: &Metrics, pending: usize, backlog: usize) {
+    publish.queue_lens(pending, backlog);
+    for (queue, n) in [(DrainQueue::live, pending), (DrainQueue::backlog, backlog)] {
+        metrics
+            .drain_pending_segments
+            .get_or_create(&DrainQueueLabel { queue })
+            .set(n as f64);
+    }
+}
+
+/// Startup-replay progress. The replay list sits at the FRONT of the FIFO
+/// backlog and rescans append behind it, so the first `total` backlog pops are
+/// exactly the replay list.
+struct ReplayProgress {
+    total: u64,
+    taken: u64,
+}
+
+impl ReplayProgress {
+    fn took_one(&mut self) {
+        if self.taken < self.total {
+            self.taken += 1;
+        }
+    }
+    fn remaining(&self) -> u64 {
+        self.total - self.taken
     }
 }
 
@@ -573,22 +808,207 @@ fn probe_health<S: Sink>(
     }
 }
 
-/// Probes sink health, updates the `weir_sink_health` gauge, and — on a down→up
-/// recovery edge (was not-healthy, now healthy) — rescans the WAB for stranded
-/// (sealed-but-unconfirmed) segments and re-queues any not already pending, so a
-/// recovered sink drains its backlog automatically rather than waiting for a
-/// daemon restart. Returns the new health-ok state for the caller's
-/// `prev_health_ok`.
+/// Test-only count of stranded-segment scans (every [`requeue_unconfirmed`]
+/// call that reached the directory walk).
+#[cfg(test)]
+static RESCAN_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What one stranded-segment rescan did.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RescanOutcome {
+    /// Paths found on disk and pushed onto the backlog.
+    pub(crate) requeued: u64,
+    /// Paths found on disk that were already queued (or in flight / held).
+    pub(crate) already_queued: u64,
+    /// The scan failed outright (the caller logs it).
+    pub(crate) scan_error: Option<String>,
+    /// A shard could not be listed (already logged by the scan); the list is
+    /// partial.
+    pub(crate) incomplete: bool,
+}
+
+/// The single rescan path, shared by the automatic resume and the operator's
+/// retry-stranded verb (spec §5.4).
 ///
-/// `in_flight` is the segment the caller is *currently* holding outside `pending`
-/// — the one being retried (`RetryingTransient`) or parked (`BlockedDeadLetterFull`).
-/// It is excluded from the re-queue so the rescan can run from those arms (M2)
-/// without double-queuing the segment the arm is about to resume on its own. The
-/// `Draining` caller holds nothing across the rescan and passes `None`.
+/// 1. Moves whatever is already in the drain channel into `pending`, so the
+///    up-to-256 sealed paths still in flight there are visible to the dedup.
+/// 2. Scans for sealed-but-unconfirmed segments, skipping ledger-owned paths
+///    (`exclude`, the ledger's `excludes`, spec §4.0: segments owned by an
+///    outstanding disposition, parked, or cooling down; the scan skips them
+///    before its confirmed-check, so they are neither re-queued nor touched).
+/// 3. Dedups against `pending ∪ backlog ∪ {in_flight}`, through a HashSet
+///    membership view (O(n+m), not `VecDeque::contains` per segment: matters
+///    when a long outage strands many segments, F-rescan). `in_flight` is the
+///    segment the calling arm is retrying, blocked on, or holding, so it is
+///    never re-queued from under the arm about to resume it (M2).
+/// 4. Pushes the rest onto `backlog` and counts them in
+///    `weir_drain_segments_resumed_total`.
 ///
-/// `exclude` is the drain ledger's `excludes` (spec §4.0): segments owned by an
-/// outstanding disposition, parked, or cooling down. The scan skips them before
-/// its confirmed-check, so they are neither re-queued nor touched.
+/// Any residual double-queue is absorbed by the ledger's admission check and
+/// the NotFound no-op in `process_segment`.
+#[allow(clippy::too_many_arguments)]
+fn requeue_unconfirmed(
+    config: &DrainConfig,
+    metrics: &Metrics,
+    rx: Option<&crossbeam_channel::Receiver<PathBuf>>,
+    pending: &mut VecDeque<PathBuf>,
+    backlog: &mut VecDeque<PathBuf>,
+    in_flight: Option<&Path>,
+    exclude: &dyn Fn(&Path) -> bool,
+    hb: &DrainHeartbeat,
+) -> RescanOutcome {
+    if let Some(rx) = rx {
+        while let Ok(p) = rx.try_recv() {
+            pending.push_back(p);
+        }
+    }
+    #[cfg(test)]
+    RESCAN_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let scan = {
+        let _busy = BusyGuard::new(hb, BusyKind::DirScan);
+        // `None` shard_count: skip the beyond-configured-count advisory — that's
+        // a startup-replay concern, not a recovery one.
+        crate::wab::scan_unconfirmed_sealed(
+            &config.wab_dir,
+            None,
+            metrics,
+            exclude,
+            config.orphan_cleanup,
+        )
+    };
+    match scan {
+        Ok(crate::wab::SealedScan {
+            segments,
+            incomplete,
+        }) => {
+            let (fresh, already_queued) = {
+                let mut queued: std::collections::HashSet<&Path> = pending
+                    .iter()
+                    .chain(backlog.iter())
+                    .map(PathBuf::as_path)
+                    .collect();
+                if let Some(seg) = in_flight {
+                    queued.insert(seg);
+                }
+                let (dupes, fresh): (Vec<PathBuf>, Vec<PathBuf>) = segments
+                    .into_iter()
+                    .partition(|s| queued.contains(s.as_path()));
+                (fresh, dupes.len() as u64)
+            };
+            let requeued = fresh.len() as u64;
+            backlog.extend(fresh);
+            if requeued > 0 {
+                metrics.drain_segments_resumed.inc_by(requeued);
+            }
+            RescanOutcome {
+                requeued,
+                already_queued,
+                scan_error: None,
+                incomplete,
+            }
+        }
+        Err(e) => RescanOutcome {
+            scan_error: Some(e.to_string()),
+            ..RescanOutcome::default()
+        },
+    }
+}
+
+/// Probes sink health, publishes it (the `weir_sink_health` gauge and the
+/// board's sink cell), and — on a down→up recovery edge (was not-healthy, now
+/// healthy), or while the drain is idle — runs [`requeue_unconfirmed`], so a
+/// recovered sink drains its stranded backlog automatically rather than
+/// waiting for a daemon restart. Returns the new health-ok state for the
+/// caller's `prev_health_ok`.
+///
+/// "Idle" means BOTH queues are empty: during a replay the backlog is
+/// non-empty, and rescanning on every poll would only find the backlog again
+/// (spec §5.4).
+///
+/// `in_flight` is the segment the caller is *currently* holding outside the
+/// queues — the one being retried (`RetryingTransient`) or parked
+/// (`BlockedDeadLetterFull`). It is excluded from the re-queue so the rescan
+/// can run from those arms (M2) without double-queuing the segment the arm is
+/// about to resume on its own. The `Draining` caller holds nothing across the
+/// rescan and passes `None`.
+///
+/// `exclude` is the drain ledger's `excludes` (spec §4.0); see
+/// [`requeue_unconfirmed`]. `rx` is the drain channel, drained into `pending`
+/// before the scan so its paths take part in the dedup; `None` skips that.
+#[allow(clippy::too_many_arguments)]
+fn probe_and_resume_stranded_with<S: Sink>(
+    rt: &tokio::runtime::Runtime,
+    sink: &S,
+    config: &DrainConfig,
+    metrics: &Metrics,
+    rx: Option<&crossbeam_channel::Receiver<PathBuf>>,
+    pending: &mut VecDeque<PathBuf>,
+    backlog: &mut VecDeque<PathBuf>,
+    prev_health_ok: bool,
+    in_flight: Option<&Path>,
+    exclude: &dyn Fn(&Path) -> bool,
+    ctx: &DrainCtx<'_>,
+) -> bool {
+    let health = probe_health(rt, sink, config.health_probe_timeout, ctx.hb);
+    // Deliverable, not perfect. `Degraded` means "reachable but not fully
+    // healthy" — the HTTP probe returns it for any 4xx outside 401/403/405/501,
+    // which includes 404, what a method-routed framework answers for HEAD on a
+    // POST-only ingest path (`sink/http.rs:645`). Commits over such a sink
+    // succeed; only the probe 4xxes. Requiring `Healthy` here made Degraded a
+    // STICKIER failure than Down — a sink that went down and came back healthy
+    // un-stranded its backlog, while one that came back degraded never did, for
+    // the life of the process. Only `Down` means "do not bother".
+    let now_ok = !matches!(health, SinkHealth::Down(_));
+    ctx.publish.sink_health(&health);
+    set_sink_health(metrics, health);
+
+    // Recovered, or idle. The edge alone is not enough: a segment strands after
+    // `sink_max_retries` transient COMMIT failures, which need not change what
+    // the PROBE answers, so a sink that holds one health state across the whole
+    // episode strands a segment with no edge on either side of it. An idle drain
+    // is precisely when such a segment is invisible and when a directory walk
+    // costs nothing, so it rescans unconditionally. The edge stays as the cost
+    // control for the busy case: with either queue non-empty the scan is
+    // skipped, and the segments in them are about to be processed anyway.
+    if now_ok && (!prev_health_ok || (pending.is_empty() && backlog.is_empty())) {
+        let out = requeue_unconfirmed(
+            config, metrics, rx, pending, backlog, in_flight, exclude, ctx.hb,
+        );
+        if out.requeued > 0 {
+            info!(
+                resumed = out.requeued,
+                "drain: sink recovered; re-queued stranded segment(s) for delivery"
+            );
+        }
+        if let Some(e) = &out.scan_error {
+            warn!(
+                error = %e,
+                "drain: sink recovered but the stranded-segment rescan failed; will retry on the next recovery edge"
+            );
+            // Keep the recovery edge LIVE: return the caller's previous
+            // health-ok state (still `false` on a down→up edge) rather than
+            // `now_ok`. If we returned `now_ok` (true), `prev_health_ok` would
+            // flip true and the `now_ok && !prev_health_ok` edge would never
+            // fire again, so a transient rescan failure would strand segments
+            // until restart — contradicting the "will retry on the next
+            // recovery edge" promise (H1). The gauge above already reflects the
+            // healthy probe; only the edge-tracking state is held back.
+            return prev_health_ok;
+        }
+        // A shard could not be listed (already logged by the scan): the
+        // readable shards are resumed above, and the edge is held live exactly
+        // as for a failed scan (H1, above), so the next poll scans again and
+        // picks up the skipped shard once it reads.
+        if out.incomplete {
+            return prev_health_ok;
+        }
+    }
+    now_ok
+}
+
+/// The pre-Foundations signature, kept for the existing tests: no channel, no
+/// board, and the rescan's finds land in `pending` as they used to.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn probe_and_resume_stranded<S: Sink>(
     rt: &tokio::runtime::Runtime,
@@ -601,97 +1021,129 @@ fn probe_and_resume_stranded<S: Sink>(
     exclude: &dyn Fn(&Path) -> bool,
     hb: &DrainHeartbeat,
 ) -> bool {
-    let health = probe_health(rt, sink, config.health_probe_timeout, hb);
-    // Deliverable, not perfect. `Degraded` means "reachable but not fully
-    // healthy" — the HTTP probe returns it for any 4xx outside 401/403/405/501,
-    // which includes 404, what a method-routed framework answers for HEAD on a
-    // POST-only ingest path (`sink/http.rs:645`). Commits over such a sink
-    // succeed; only the probe 4xxes. Requiring `Healthy` here made Degraded a
-    // STICKIER failure than Down — a sink that went down and came back healthy
-    // un-stranded its backlog, while one that came back degraded never did, for
-    // the life of the process. Only `Down` means "do not bother".
-    let now_ok = !matches!(health, SinkHealth::Down(_));
-    set_sink_health(metrics, health);
+    let control = DrainControl::detached();
+    let publish = Publisher::none();
+    let ctx = DrainCtx {
+        control: &control,
+        publish: &publish,
+        hb,
+    };
+    let mut backlog = VecDeque::new();
+    let ok = probe_and_resume_stranded_with(
+        rt,
+        sink,
+        config,
+        metrics,
+        None,
+        pending,
+        &mut backlog,
+        prev_health_ok,
+        in_flight,
+        exclude,
+        &ctx,
+    );
+    pending.extend(backlog);
+    ok
+}
 
-    // Recovered, or idle. The edge alone is not enough: a segment strands after
-    // `sink_max_retries` transient COMMIT failures, which need not change what
-    // the PROBE answers, so a sink that holds one health state across the whole
-    // episode strands a segment with no edge on either side of it. An idle drain
-    // is precisely when such a segment is invisible and when a directory walk
-    // costs nothing, so it rescans unconditionally. The edge stays as the cost
-    // control for the busy case: with `pending` non-empty the scan is skipped,
-    // and the segments in it are about to be processed anyway.
-    if now_ok && (!prev_health_ok || pending.is_empty()) {
-        // `None` shard_count: skip the beyond-configured-count advisory — that's
-        // a startup-replay concern, not a recovery one.
-        let scan = {
-            let _busy = BusyGuard::new(hb, BusyKind::DirScan);
-            crate::wab::scan_unconfirmed_sealed(
-                &config.wab_dir,
-                None,
-                metrics,
-                exclude,
-                config.orphan_cleanup,
-            )
-        };
-        match scan {
-            Ok(crate::wab::SealedScan {
-                segments: sealed,
-                incomplete,
-            }) => {
-                // Dedup against what's already queued via a HashSet membership view
-                // (O(n+m)) rather than VecDeque::contains per segment (O(n·m)) —
-                // matters when a long outage strands many segments (F-rescan). The
-                // caller's in-flight segment (if any) is folded into the same view
-                // so it is never re-queued from under the arm resuming it (M2).
-                let mut already: std::collections::HashSet<&Path> =
-                    pending.iter().map(PathBuf::as_path).collect();
-                if let Some(seg) = in_flight {
-                    already.insert(seg);
-                }
-                let fresh: Vec<PathBuf> = sealed
-                    .into_iter()
-                    .filter(|seg| !already.contains(seg.as_path()))
-                    .collect();
-                let mut resumed = 0u64;
-                for seg in fresh {
-                    pending.push_back(seg);
-                    resumed += 1;
-                }
-                if resumed > 0 {
-                    metrics.drain_segments_resumed.inc_by(resumed);
-                    info!(
-                        resumed,
-                        "drain: sink recovered; re-queued stranded segment(s) for delivery"
-                    );
-                }
-                // A shard could not be listed (already logged by the scan): the
-                // readable shards are resumed above, and the edge is held live
-                // exactly as for a failed scan (H1, below), so the next poll
-                // scans again and picks up the skipped shard once it reads.
-                if incomplete {
-                    return prev_health_ok;
-                }
-            }
-            Err(e) => {
-                warn!(
-                    error = %e,
-                    "drain: sink recovered but the stranded-segment rescan failed; will retry on the next recovery edge"
-                );
-                // Keep the recovery edge LIVE: return the caller's previous
-                // health-ok state (still `false` here, since we only reach this
-                // arm on a down→up edge) rather than `now_ok`. If we returned
-                // `now_ok` (true), `prev_health_ok` would flip true and the
-                // `now_ok && !prev_health_ok` edge would never fire again, so a
-                // transient rescan failure would strand segments until restart —
-                // contradicting the "will retry on the next recovery edge"
-                // promise (H1). The gauge above already reflects the healthy
-                // probe; only the edge-tracking state is held back.
-                return prev_health_ok;
-            }
+/// Test-only count of verb-driven scans (those [`RequeueService::service`] ran).
+#[cfg(test)]
+static VERB_RESCANS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Resolves operator retry-stranded tickets (spec §5.4 "Retry stranded").
+///
+/// At most one scan per [`control::REQUEUE_MIN_INTERVAL`]; a ticket inside the
+/// window is answered from the previous scan with `coalesced: true`. A running
+/// retry backoff is cut at most once per retry episode (`backoff_cut` travels
+/// with the episode's `RetryingTransient` state), never below
+/// `base_retry_delay`. In absorb mode the ticket is resolved without scanning,
+/// so an admin client never waits on a drain that is shutting down.
+///
+/// Owned by one drain incarnation. A respawn starts from the control's
+/// observed ticket, so a ticket a panic interrupted is still answered.
+struct RequeueService {
+    /// The last ticket this service resolved.
+    seen: u64,
+    /// When the last real scan ran, for the coalescing window.
+    last_scan_at: Option<Instant>,
+    /// The last published result, the answer to a coalesced ticket.
+    last: Option<RequeueResult>,
+}
+
+impl RequeueService {
+    fn new(control: &DrainControl) -> Self {
+        Self {
+            seen: control.requeue_observed(),
+            last_scan_at: None,
+            last: None,
         }
     }
-    now_ok
+
+    /// Resolves the outstanding ticket, if there is one. `scan` runs
+    /// [`requeue_unconfirmed`] (bypassing the health-edge gate); `cut`
+    /// shortens a running backoff and says whether it did.
+    fn service(
+        &mut self,
+        ctx: &DrainCtx<'_>,
+        scan: impl FnOnce() -> RescanOutcome,
+        cut: impl FnOnce() -> bool,
+    ) {
+        let ticket = ctx.control.requeue_requested();
+        if ticket <= self.seen {
+            return;
+        }
+        let now = Instant::now();
+        let result = match (&self.last, self.last_scan_at) {
+            (Some(last), Some(at)) if now.duration_since(at) < control::REQUEUE_MIN_INTERVAL => {
+                RequeueResult {
+                    ticket,
+                    backoff_cut: false,
+                    coalesced: true,
+                    at_ms: unix_ms_now(),
+                    ..last.clone()
+                }
+            }
+            _ => {
+                let outcome = if ctx.control.absorbing() {
+                    RescanOutcome {
+                        scan_error: Some("skipped: the daemon is shutting down".into()),
+                        ..RescanOutcome::default()
+                    }
+                } else {
+                    #[cfg(test)]
+                    VERB_RESCANS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    scan()
+                };
+                self.last_scan_at = Some(now);
+                let backoff_cut = cut();
+                info!(
+                    ticket,
+                    requeued = outcome.requeued,
+                    already_queued = outcome.already_queued,
+                    backoff_cut,
+                    scan_failed = outcome.scan_error.is_some(),
+                    incomplete = outcome.incomplete,
+                    "drain: retry-stranded: rescanned the WAB for stranded segments"
+                );
+                RequeueResult {
+                    ticket,
+                    requeued: outcome.requeued,
+                    already_queued: outcome.already_queued,
+                    scan_error: outcome
+                        .scan_error
+                        .as_deref()
+                        .map(publish::sanitize_admin_text),
+                    backoff_cut,
+                    coalesced: false,
+                    at_ms: unix_ms_now(),
+                }
+            }
+        };
+        self.seen = ticket;
+        ctx.publish.requeue(&result);
+        ctx.control.observe_requeue(ticket);
+        self.last = Some(result);
+    }
 }
 
 // ── Heartbeat (liveness observed from outside the drain's own runtime) ────────
@@ -942,7 +1394,167 @@ fn quarantine_bytes_on_disk(wab_dir: &Path) -> u64 {
     total
 }
 
-fn drain_thread<S: Sink>(
+/// What one [`wait_slice`] produced.
+#[derive(Debug, PartialEq, Eq)]
+enum Wait {
+    /// A segment arrived on the channel.
+    Segment(PathBuf),
+    /// The slice elapsed (in Attached mode, also after the channel is gone).
+    TimedOut,
+    /// `stop` is set and its deadline has passed: stop waiting.
+    Stop,
+    /// The channel disconnected and the drain is Detached: today's shutdown.
+    Disconnected,
+}
+
+/// The drain's single way to wait (spec §5.4 "Wait helper"), replacing the
+/// three `recv_timeout` sites: the Draining idle wait, the retry backoff and the
+/// dead-letter-full block.
+///
+/// One slice of at most [`control::SLICE`], with a [`control::SLICE`] FLOOR
+/// while a pause is requested, so a paused hold whose deadline has already
+/// elapsed can never spin on `recv_timeout(0)`; never past a stop deadline. In
+/// absorb mode it first moves everything already in the channel into
+/// `pending`. Every slice bumps the heartbeat (a waiting drain is alive: see
+/// [`DrainHeartbeat`]) and publishes the channel depth and the queue lengths.
+///
+/// Attached mode: a disconnected channel is a non-event. One WARN, then plain
+/// sleeps (a disconnected `recv_timeout` returns at once and would spin); the
+/// drain keeps delivering its queues and rescans until stopped.
+fn wait_slice(
+    rx: &crossbeam_channel::Receiver<PathBuf>,
+    ctx: &DrainCtx<'_>,
+    dur: Duration,
+    pending: &mut VecDeque<PathBuf>,
+    backlog_len: usize,
+    channel_gone: &mut bool,
+) -> Wait {
+    ctx.hb.bump();
+    if ctx.control.stop_requested() {
+        ctx.publish.stopping(ctx.control.deadline_unix_ms());
+    }
+    if ctx.control.absorbing() {
+        while let Ok(p) = rx.try_recv() {
+            pending.push_back(p);
+        }
+    }
+    ctx.publish.channel_depth(rx.len());
+    ctx.publish.queue_lens(pending.len(), backlog_len);
+    if ctx.control.stop_requested() && ctx.control.deadline_passed() {
+        return Wait::Stop;
+    }
+    let mut slice = dur.min(control::SLICE);
+    if ctx.control.pause_requested() {
+        slice = control::SLICE;
+    }
+    if let Some(left) = ctx.control.time_left() {
+        slice = slice.min(left.max(Duration::from_millis(1)));
+    }
+    if *channel_gone {
+        std::thread::sleep(slice);
+        return Wait::TimedOut;
+    }
+    match rx.recv_timeout(slice) {
+        Ok(p) => Wait::Segment(p),
+        Err(RecvTimeoutError::Timeout) => Wait::TimedOut,
+        Err(RecvTimeoutError::Disconnected) => match ctx.control.mode() {
+            Lifetime::Detached => Wait::Disconnected,
+            Lifetime::Attached => {
+                warn!("drain: all flushers gone; continuing to deliver the on-disk backlog");
+                *channel_gone = true;
+                std::thread::sleep(slice);
+                Wait::TimedOut
+            }
+        },
+    }
+}
+
+/// The Draining head's exit check (spec §5.4 "Lifetime"). With `stop` set: exit
+/// at the deadline, or once input is closed and nothing is left (no queued
+/// path, nothing in the channel). Without `stop`: never. Held and in-flight
+/// segments are the arms' own business; the head holds neither.
+fn stop_exit(
+    control: &DrainControl,
+    queues_empty: bool,
+    rx: &crossbeam_channel::Receiver<PathBuf>,
+) -> Option<DrainExitReason> {
+    if !control.stop_requested() {
+        return None;
+    }
+    let nothing_left = queues_empty && rx.is_empty();
+    if control.deadline_passed() {
+        return Some(if nothing_left {
+            DrainExitReason::Stopped
+        } else {
+            DrainExitReason::DeadlineAbandoned
+        });
+    }
+    (control.input_closed() && nothing_left).then_some(DrainExitReason::Stopped)
+}
+
+/// Picks the next queued segment, alternating the live side (`pending`, then
+/// the channel) with the `backlog` (spec §5.4 "Two queues"). While both have
+/// work, the channel is served at least every other segment, so a long replay
+/// or a large requeue never stalls the flushers' hand-off for more than one
+/// backlog segment. Either side alone is drained in FIFO order.
+fn next_queued(
+    pending: &mut VecDeque<PathBuf>,
+    backlog: &mut VecDeque<PathBuf>,
+    rx: &crossbeam_channel::Receiver<PathBuf>,
+    backlog_turn: &mut bool,
+) -> Option<PathBuf> {
+    if !(*backlog_turn && !backlog.is_empty())
+        && let Some(p) = pending.pop_front().or_else(|| rx.try_recv().ok())
+    {
+        *backlog_turn = true;
+        return Some(p);
+    }
+    let p = backlog.pop_front()?;
+    *backlog_turn = false;
+    Some(p)
+}
+
+/// The drain's runtime, shut down with `shutdown_timeout(100 ms)` on every way
+/// out of `drain_thread_with`, a sink panic unwinding through it included.
+///
+/// Not a plain `Runtime`: dropping one waits, without limit, for its
+/// spawn_blocking pool, and a sink can leave work there (a DNS lookup:
+/// hyper-util's GaiResolver, tokio::net::lookup_host). On a normal return that
+/// would turn a clean exit into PR 4's orphan path; on a panic it would hold
+/// the respawn (or, after stop, the exit) for as long as that work runs. The
+/// abandoned blocking thread holds no drain state and finishes on its own
+/// (spec §5.4, engineering question (e)).
+///
+/// Engineering question (e) audit (spec §20), by grepping the clients' sources
+/// for `spawn_blocking` / `lookup_host`: every network sink resolves its host
+/// on the blocking pool. `http`, `clickhouse` and `s3` go through reqwest,
+/// whose default resolver is hyper-util's `GaiResolver`
+/// (`client/legacy/connect/dns.rs`, `spawn_blocking` around `getaddrinfo`);
+/// `postgres` calls `tokio::net::lookup_host` (tokio-postgres `connect.rs`);
+/// `mysql` calls `TcpStream::connect((host, port))` (mysql_async `io/mod.rs`),
+/// which resolves through the same `lookup_host`. `noop` does no I/O. None
+/// of them holds a lock, a file or drain state across that
+/// blocking call, so abandoning the thread after 100 ms only skips waiting for
+/// a lookup whose answer nobody reads.
+struct BoundedRuntime(Option<tokio::runtime::Runtime>);
+
+impl std::ops::Deref for BoundedRuntime {
+    type Target = tokio::runtime::Runtime;
+    fn deref(&self) -> &tokio::runtime::Runtime {
+        self.0.as_ref().expect("present until drop")
+    }
+}
+
+impl Drop for BoundedRuntime {
+    fn drop(&mut self) {
+        if let Some(rt) = self.0.take() {
+            rt.shutdown_timeout(Duration::from_millis(100));
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drain_thread_with<S: Sink>(
     drain_rx: crossbeam_channel::Receiver<PathBuf>,
     sink: Arc<S>,
     config: DrainConfig,
@@ -962,11 +1574,30 @@ fn drain_thread<S: Sink>(
     heartbeat: DrainHeartbeat,
     // Owned by `run_drain_supervised` so it outlives a panic; see `ledger`.
     ledger: &mut SegmentLedger,
-) {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("drain tokio runtime");
+    // The intent to obey (spec §5.4). Shared with the supervisor and every
+    // respawn, so a pause or a stop outlives a panic.
+    control: &DrainControl,
+    // The board to publish to; a no-op without one (tests).
+    publish: &Publisher,
+    // The startup replay list, on the first incarnation only (empty on a
+    // respawn, which recovers it through its rescan).
+    initial_backlog: Vec<PathBuf>,
+) -> ThreadExit {
+    let ctx = DrainCtx {
+        control,
+        publish,
+        hb: &heartbeat,
+    };
+    let generation = control.begin_generation();
+    publish.generation(generation);
+    metrics.drain_generation.set(generation as f64);
+
+    let rt = BoundedRuntime(Some(
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("drain tokio runtime"),
+    ));
 
     let mut dead_letter = match DeadLetterWriter::open(&config.wab_dir) {
         Ok(dl) => dl,
@@ -986,7 +1617,35 @@ fn drain_thread<S: Sink>(
     };
 
     let mut state = DrainState::Draining;
+    // Set once an Attached drain sees its channel disconnect (every flusher
+    // gone): from then on `wait_slice` sleeps its slices instead of spinning.
+    let mut channel_gone = false;
+    // Live segments the drain has taken off the channel but not yet
+    // processed (buffered by the waits below, or by a rescan's channel drain).
     let mut pending: VecDeque<PathBuf> = VecDeque::new();
+    // The startup replay list and every rescan's finds. Alternates with
+    // `pending` and the channel; see `next_queued`.
+    let mut backlog: VecDeque<PathBuf> = initial_backlog.into();
+    let mut backlog_turn = false;
+    // Startup-replay progress, published as the replay list is taken.
+    let mut replay = ReplayProgress {
+        total: backlog.len() as u64,
+        taken: 0,
+    };
+    if replay.total > 0 {
+        publish.replay(replay.total, replay.total);
+        metrics
+            .drain_replay_remaining_segments
+            .set(replay.total as f64);
+    }
+    // Resolves operator retry-stranded tickets (spec §5.4).
+    let mut requeue = RequeueService::new(control);
+    // When the current pause took effect (unix ms), shared by every hold: the
+    // Draining head, `Held` and a paused retry backoff. `None` while delivering.
+    let mut paused_since: Option<u64> = None;
+    // The segment an exit leaves partly delivered, and its committed prefix
+    // (spec §5.4 "Stop and deadline"): reported in `DrainExit`.
+    let mut abandoned: Option<(PathBuf, u64)> = None;
 
     // The start of the current dead-letter-full blocking episode, if any. An
     // episode spans a flapping cap (unblock → reblock the same segment without
@@ -1020,7 +1679,7 @@ fn drain_thread<S: Sink>(
     // not just per-retry.
     let mut shutdown_backoff_left = SHUTDOWN_RETRY_BACKOFF_BUDGET;
 
-    'outer: loop {
+    let reason = 'outer: loop {
         // See `DrainHeartbeat`: bumped unconditionally on every pass through
         // this loop, whatever state does or doesn't happen below — a sink
         // call that blocks this thread (rather than yielding) is exactly the
@@ -1032,34 +1691,51 @@ fn drain_thread<S: Sink>(
         // another pass through here, so publishing at the loop head keeps the
         // gauges current without threading `metrics` into the ledger.
         publish_ledger_counts(ledger.counts(), &metrics);
+        publish_queues(publish, &metrics, pending.len(), backlog.len());
         state = match state {
             // ── Draining ─────────────────────────────────────────────────────
             DrainState::Draining => {
-                set_drain_state(&metrics, DrainStateValue::draining);
+                enter_arm(publish, &metrics, DrainStateValue::draining, 0);
+                if control.stop_requested() {
+                    publish.stopping(control.deadline_unix_ms());
+                }
+                if let Some(reason) =
+                    stop_exit(control, pending.is_empty() && backlog.is_empty(), &drain_rx)
+                {
+                    break 'outer reason;
+                }
 
                 // Wall-clock health poll + stranded-segment rescan. Runs on the
                 // `health_poll_interval` cadence regardless of channel activity, so
                 // a recovered sink re-drains its stranded backlog even while ingest
                 // is saturating the drain channel (the old idle-only poll never
-                // fired under sustained load). `pending` is drained in submission
-                // order, so re-queued stranded segments interleave with new ones.
+                // fired under sustained load). Re-queued stranded segments go to
+                // the `backlog`, which alternates with live segments (spec §5.4).
                 //
                 // Order (spec §4.0): outstanding dispositions first — they never
                 // deliver, and finishing one can change what the rescan may
                 // pick up — then the probe + rescan, then the gauges.
-                if last_health_poll.elapsed() >= config.health_poll_interval {
+                //
+                // Absorb mode (T0, spec §5.4): skip the probe, the rescan and
+                // the gauge walks; a probe can block for health_probe_timeout
+                // and overrun the exit grace. The disposition retry runs once
+                // more on the way out (the tail of this function).
+                if !control.absorbing() && last_health_poll.elapsed() >= config.health_poll_interval
+                {
                     ledger.retry_dispositions(&config.wab_dir, &metrics, &heartbeat);
                     let now = Instant::now();
-                    prev_health_ok = probe_and_resume_stranded(
+                    prev_health_ok = probe_and_resume_stranded_with(
                         &rt,
                         &*sink,
                         &config,
                         &metrics,
+                        Some(&drain_rx),
                         &mut pending,
+                        &mut backlog,
                         prev_health_ok,
                         None,
                         &|p| ledger.excludes(p, now),
-                        &heartbeat,
+                        &ctx,
                     );
                     // Refresh the dead-letter size gauge too, so an out-of-band
                     // `weir-ctl dl drop` (an operator deleting files while the
@@ -1086,74 +1762,175 @@ fn drain_thread<S: Sink>(
                     last_health_poll = Instant::now();
                 }
 
-                // Both sources pass the ledger's admission check (spec §4.0):
-                // the channel is not enumerable, so a path can sit in it AND in
-                // `pending` (re-queued by a rescan, or buffered by one of the
-                // waits below). A copy the ledger owns is dropped here; the
-                // rescan is its way back once it becomes admissible.
-                let next_segment = loop {
-                    if let Some(p) = pending.pop_front() {
-                        match ledger.admit(&p, Instant::now()) {
-                            Admit::Process { skip } => break Some((p, skip)),
-                            Admit::Drop(owner) => {
-                                debug!(path = %p.display(), owner, "drain: not admitting queued segment");
-                                continue;
+                // An operator's retry-stranded ticket: rescan now, bypassing
+                // the health-edge gate (spec §5.4 "Retry stranded").
+                {
+                    let now = Instant::now();
+                    requeue.service(
+                        &ctx,
+                        || {
+                            requeue_unconfirmed(
+                                &config,
+                                &metrics,
+                                Some(&drain_rx),
+                                &mut pending,
+                                &mut backlog,
+                                None,
+                                &|p| ledger.excludes(p, now),
+                                &heartbeat,
+                            )
+                        },
+                        || false,
+                    );
+                }
+
+                // Pause (spec §5.4): after the health poll and the verbs, so
+                // probes and gauges keep running; before taking a segment. The
+                // channel keeps being emptied into `pending`, one 50 ms slice
+                // at a time, so the flushers never block on a paused drain.
+                if control.pause_requested() {
+                    // Pause honoured at stop (owner decision): queued segments
+                    // stay sealed and replay on the next start.
+                    if control.stop_requested() {
+                        info!(
+                            "drain: stop while paused; queued segments stay sealed and replay on \
+                             the next start (pause honoured)"
+                        );
+                        break 'outer DrainExitReason::Stopped;
+                    }
+                    let since = *paused_since.get_or_insert_with(|| {
+                        info!(
+                            "drain: paused before the next segment; ingest keeps buffering on disk"
+                        );
+                        unix_ms_now()
+                    });
+                    publish.paused(since, false);
+                    metrics.drain_paused.set(1.0);
+                    match wait_slice(
+                        &drain_rx,
+                        &ctx,
+                        control::SLICE,
+                        &mut pending,
+                        backlog.len(),
+                        &mut channel_gone,
+                    ) {
+                        Wait::Segment(p) => pending.push_back(p),
+                        Wait::TimedOut | Wait::Stop => {}
+                        // A Detached shutdown while paused honours the pause too.
+                        Wait::Disconnected => break 'outer DrainExitReason::Stopped,
+                    }
+                    DrainState::Draining
+                } else {
+                    if paused_since.take().is_some() {
+                        publish.paused(0, false);
+                        metrics.drain_paused.set(0.0);
+                        info!("drain: resumed");
+                    }
+
+                    // Every source passes the ledger's admission check (spec §4.0):
+                    // the channel is not enumerable, so a path can sit in it AND in
+                    // a queue (re-queued by a rescan, or buffered by one of the
+                    // waits below). A copy the ledger owns is dropped here; the
+                    // rescan is its way back once it becomes admissible.
+                    //
+                    // `next_queued` alternates the live side (`pending`, then the
+                    // channel) with the `backlog` (the replay list and rescan
+                    // finds), so a long replay never holds the flushers' hand-off
+                    // up for more than one backlog segment (spec §5.4).
+                    let next_segment = loop {
+                        let backlog_before = backlog.len();
+                        let picked =
+                            next_queued(&mut pending, &mut backlog, &drain_rx, &mut backlog_turn);
+                        if backlog.len() < backlog_before {
+                            replay.took_one();
+                            publish.replay(replay.total, replay.remaining());
+                            metrics
+                                .drain_replay_remaining_segments
+                                .set(replay.remaining() as f64);
+                        }
+                        if let Some(p) = picked {
+                            match ledger.admit(&p, Instant::now()) {
+                                Admit::Process { skip } => break Some((p, skip)),
+                                Admit::Drop(owner) => {
+                                    debug!(path = %p.display(), owner, "drain: not admitting queued segment");
+                                    continue;
+                                }
                             }
                         }
-                    }
-                    // Idle: wait for a new segment, but no longer than the time
-                    // left until the next health poll, then re-enter Draining so
-                    // the wall-clock poll above runs. Channel closure (all WAB
-                    // flushers exited) still ends the loop.
-                    let until_next_poll = config
-                        .health_poll_interval
-                        .saturating_sub(last_health_poll.elapsed())
-                        .max(Duration::from_millis(1));
-                    match drain_rx.recv_timeout(until_next_poll) {
-                        Ok(p) => match ledger.admit(&p, Instant::now()) {
-                            Admit::Process { skip } => break Some((p, skip)),
-                            Admit::Drop(owner) => {
-                                debug!(path = %p.display(), owner, "drain: not admitting segment from the channel");
-                                break None;
-                            }
-                        },
-                        Err(RecvTimeoutError::Timeout) => break None,
-                        Err(RecvTimeoutError::Disconnected) => break 'outer,
-                    }
-                };
+                        // Idle: nothing queued on either side and the channel is
+                        // empty. Wait for a new segment, but no longer than the time
+                        // left until the next health poll (and one slice at most),
+                        // then re-enter Draining so the wall-clock poll above runs.
+                        // A Detached drain's channel closure (all WAB flushers
+                        // exited) still ends the loop; an Attached drain's does not.
+                        publish.in_flight(None);
+                        let until_next_poll = config
+                            .health_poll_interval
+                            .saturating_sub(last_health_poll.elapsed())
+                            .max(Duration::from_millis(1));
+                        match wait_slice(
+                            &drain_rx,
+                            &ctx,
+                            until_next_poll,
+                            &mut pending,
+                            backlog.len(),
+                            &mut channel_gone,
+                        ) {
+                            Wait::Segment(p) => match ledger.admit(&p, Instant::now()) {
+                                Admit::Process { skip } => break Some((p, skip)),
+                                Admit::Drop(owner) => {
+                                    debug!(path = %p.display(), owner, "drain: not admitting segment from the channel");
+                                    break None;
+                                }
+                            },
+                            // Back to the head: the poll, the stop check and the
+                            // verbs run there, at least once per slice.
+                            Wait::TimedOut | Wait::Stop => break None,
+                            Wait::Disconnected => break 'outer DrainExitReason::Stopped,
+                        }
+                    };
 
-                match next_segment {
-                    // Idle timeout with nothing queued (or a dropped channel
-                    // copy): re-enter Draining so the wall-clock health poll
-                    // above runs on schedule.
-                    None => DrainState::Draining,
-                    Some((segment, skip)) => {
-                        // A fresh segment starts at 0; one the ledger holds a
-                        // cursor for (it stranded earlier in this run) resumes
-                        // past its durable prefix. The health gauge + rescan are
-                        // refreshed by the wall-clock poll above, so we no longer
-                        // probe the sink after every segment (which, under
-                        // sustained load, meant a HEAD request per segment).
-                        let result = attempt_segment(
-                            &rt,
-                            &segment,
-                            &*sink,
-                            &config,
-                            &metrics,
-                            &mut dead_letter,
-                            ledger,
-                            skip,
-                            &heartbeat,
-                        );
-                        transition_from_draining(
-                            segment,
-                            result,
-                            &config,
-                            &metrics,
-                            &mut block_episode,
-                            ledger,
-                            &heartbeat,
-                        )
+                    match next_segment {
+                        // Idle timeout with nothing queued (or a dropped channel
+                        // copy): re-enter Draining so the wall-clock health poll
+                        // above runs on schedule.
+                        None => DrainState::Draining,
+                        Some((segment, skip)) => {
+                            // A fresh segment starts at 0; one the ledger holds a
+                            // cursor for (it stranded earlier in this run) resumes
+                            // past its durable prefix. The health gauge + rescan are
+                            // refreshed by the wall-clock poll above, so we no longer
+                            // probe the sink after every segment (which, under
+                            // sustained load, meant a HEAD request per segment).
+                            publish_queues(publish, &metrics, pending.len(), backlog.len());
+                            publish.in_flight(Some(InFlight {
+                                segment: segment_identity(&segment),
+                                attempt: 1,
+                                retries_left: config.max_retries,
+                                processed: skip,
+                                next_retry_at_ms: None,
+                            }));
+                            let result = attempt_segment(
+                                &rt,
+                                &segment,
+                                &*sink,
+                                &config,
+                                &metrics,
+                                &mut dead_letter,
+                                ledger,
+                                skip,
+                                &ctx,
+                            );
+                            transition_from_draining(
+                                segment,
+                                result,
+                                &config,
+                                &metrics,
+                                &mut block_episode,
+                                ledger,
+                                &heartbeat,
+                            )
+                        }
                     }
                 }
             }
@@ -1181,6 +1958,7 @@ fn drain_thread<S: Sink>(
                 next_delay,
                 processed,
                 cause,
+                ..
             } => {
                 ledger.set_not_before(&segment, Instant::now() + next_delay);
                 // The `processed` cursor SURVIVES the strand (spec §4.0,
@@ -1264,102 +2042,267 @@ fn drain_thread<S: Sink>(
                 retries_left,
                 next_delay,
                 processed,
-                cause: _,
+                cause,
+                backoff_cut,
+                waited,
             } => {
-                set_drain_state(&metrics, DrainStateValue::retrying_transient);
-
-                // Interruptible backoff: consume next_delay in short slices via
-                // recv_timeout so a shutdown — which the drain only learns of as the
-                // drain channel disconnecting (all WAB flushers have exited) — cuts
-                // the wait short instead of sleeping out a multi-minute Retry-After.
-                // On disconnect we shorten the wait but STILL run the retry below
-                // (its commit is bounded by commit_timeout), preserving the existing
-                // "complete in-flight work on shutdown" behaviour; the Draining loop
-                // then observes the same disconnect and exits. In production the
-                // channel only closes on shutdown, so the Retry-After delay is only
-                // ever cut at shutdown, never during normal operation. Segments that
-                // arrive during the wait are buffered (S15).
-                //
-                // W2: the shutdown wait is CLAMPED, not eliminated. Breaking outright
-                // made every remaining attempt fire back-to-back with zero delay —
-                // the chaos harness measured four segments each burning all
-                // MAX_RETRIES inside 0.4 ms before being logged as stranded. Three
-                // attempts inside one instant against a sink that needs milliseconds
-                // to answer fail identically for the same reason, so that spent the
-                // whole budget on what was effectively one attempt and forced a
-                // strand a brief delay might have avoided — neither "retry properly"
-                // nor "don't retry". Sleeping the clamped remainder makes each retry
-                // an independent sample again. `thread::sleep` rather than another
-                // recv_timeout because a disconnected channel returns immediately and
-                // would spin; nothing is missed, since no further segment can arrive.
-                //
-                // The clamp is drawn from a per-process budget so the added shutdown
-                // time cannot compound: a segment that strands makes the Draining
-                // arm's health poll re-queue it (the 4a auto-resume edge), which
-                // starts another retry episode, and with an unbudgeted per-retry
-                // clamp a HEAD-healthy / POST-transient-failing sink would keep that
-                // cycle alive and shutdown would never finish. Once the budget is
-                // spent the waits go to zero and the loop degenerates to the previous
-                // behaviour, which terminates.
-                let wait_end = Instant::now() + next_delay;
-                loop {
-                    // WAITING IS NOT WEDGED. `heartbeat.bump()` at the top of
-                    // `'outer` is never reached while this arm holds the thread,
-                    // and this single wait can legitimately run to
-                    // `MAX_RETRY_DELAY` (300 s) on a `Retry-After`-honouring
-                    // sink — far past the stall warning's
-                    // `health_poll_interval + 15 s` threshold (45 s at the
-                    // defaults). Without a bump here a merely-SLOW sink is
-                    // reported as a drain "wedged inside a sink call that blocks
-                    // its OS thread", which is the worst possible misdirection
-                    // during an incident. Bumping on each 50 ms slice keeps the
-                    // heartbeat meaning what it claims: only a thread that
-                    // cannot reach its own loop at all freezes it.
-                    heartbeat.bump();
-                    let remaining = wait_end.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        break;
-                    }
-                    let poll = remaining.min(Duration::from_millis(50));
-                    match drain_rx.recv_timeout(poll) {
-                        Ok(new_seg) => pending.push_back(new_seg),
-                        Err(RecvTimeoutError::Timeout) => {}
-                        // Channel closed (shutdown): serve the clamped remainder of
-                        // the backoff, then finish the retry.
-                        Err(RecvTimeoutError::Disconnected) => {
-                            let left = wait_end
-                                .saturating_duration_since(Instant::now())
-                                .min(SHUTDOWN_RETRY_BACKOFF_CAP)
-                                .min(shutdown_backoff_left);
-                            shutdown_backoff_left -= left;
-                            std::thread::sleep(left);
+                enter_arm(publish, &metrics, DrainStateValue::retrying_transient, 0);
+                // What the board shows for this retry: the attempt about to
+                // fire and, while it waits, when.
+                let attempt = config
+                    .max_retries
+                    .saturating_sub(retries_left)
+                    .saturating_add(2);
+                let retry_record = |next_retry_at_ms: Option<u64>| InFlight {
+                    segment: segment_identity(&segment),
+                    attempt,
+                    retries_left,
+                    processed,
+                    next_retry_at_ms,
+                };
+                // The episode's cut flag outlives the wait: it is passed on to
+                // the next retry, and to a hold if this attempt pauses.
+                let mut backoff_cut = backoff_cut;
+                // A hold that resumed (`waited`) already served this backoff
+                // and ran the health poll while it held: retry at once.
+                if !waited {
+                    // Interruptible backoff: consume next_delay in short slices via
+                    // `wait_slice` so a shutdown — which a Detached drain only learns
+                    // of as the drain channel disconnecting (all WAB flushers have
+                    // exited), an Attached one as a passed stop deadline — cuts
+                    // the wait short instead of sleeping out a multi-minute Retry-After.
+                    // On disconnect we shorten the wait but STILL run the retry below
+                    // (its commit is bounded by commit_timeout), preserving the existing
+                    // "complete in-flight work on shutdown" behaviour; the Draining loop
+                    // then observes the same disconnect and exits. In production the
+                    // channel only closes on shutdown, so the Retry-After delay is only
+                    // ever cut at shutdown, never during normal operation. Segments that
+                    // arrive during the wait are buffered (S15).
+                    //
+                    // W2: the shutdown wait is CLAMPED, not eliminated. Breaking outright
+                    // made every remaining attempt fire back-to-back with zero delay —
+                    // the chaos harness measured four segments each burning all
+                    // MAX_RETRIES inside 0.4 ms before being logged as stranded. Three
+                    // attempts inside one instant against a sink that needs milliseconds
+                    // to answer fail identically for the same reason, so that spent the
+                    // whole budget on what was effectively one attempt and forced a
+                    // strand a brief delay might have avoided — neither "retry properly"
+                    // nor "don't retry". Sleeping the clamped remainder makes each retry
+                    // an independent sample again. `thread::sleep` rather than another
+                    // recv_timeout because a disconnected channel returns immediately and
+                    // would spin; nothing is missed, since no further segment can arrive.
+                    //
+                    // The clamp is drawn from a per-process budget so the added shutdown
+                    // time cannot compound: a segment that strands makes the Draining
+                    // arm's health poll re-queue it (the 4a auto-resume edge), which
+                    // starts another retry episode, and with an unbudgeted per-retry
+                    // clamp a HEAD-healthy / POST-transient-failing sink would keep that
+                    // cycle alive and shutdown would never finish. Once the budget is
+                    // spent the waits go to zero and the loop degenerates to the previous
+                    // behaviour, which terminates.
+                    //
+                    // A retry-stranded request may cut the backoff, at most once per
+                    // retry episode and never below `base_retry_delay` from the
+                    // wait's start (W2): see `RequeueService`.
+                    let wait_start = Instant::now();
+                    let mut wait_end = wait_start + next_delay;
+                    publish.in_flight(Some(retry_record(Some(unix_ms_now().saturating_add(
+                        u64::try_from(next_delay.as_millis()).unwrap_or(u64::MAX),
+                    )))));
+                    loop {
+                        // Spec §5.4: a backoff that would end after the
+                        // deadline is abandoned now, not served. A pause
+                        // outranks it: the paused branch below exits at once
+                        // too, as `Stopped` (pause honoured at stop).
+                        if control.stop_requested()
+                            && !control.pause_requested()
+                            && (control.deadline_passed()
+                                || control.deadline().is_some_and(|d| wait_end > d))
+                        {
+                            info!(
+                                path = %segment.display(),
+                                processed,
+                                "drain: stop requested and this retry would fire after the deadline; \
+                                 leaving the segment unconfirmed"
+                            );
+                            abandoned = Some((segment.clone(), processed));
+                            break 'outer DrainExitReason::DeadlineAbandoned;
+                        }
+                        let cut_before = backoff_cut;
+                        {
+                            let now = Instant::now();
+                            let base = config.base_retry_delay;
+                            requeue.service(
+                                &ctx,
+                                || {
+                                    requeue_unconfirmed(
+                                        &config,
+                                        &metrics,
+                                        Some(&drain_rx),
+                                        &mut pending,
+                                        &mut backlog,
+                                        Some(&segment),
+                                        &|p| ledger.excludes(p, now),
+                                        &heartbeat,
+                                    )
+                                },
+                                || {
+                                    if backoff_cut {
+                                        return false;
+                                    }
+                                    // Never below base_retry_delay from the wait's start (W2).
+                                    let cut_to =
+                                        wait_end.min(Instant::now().max(wait_start + base));
+                                    if cut_to < wait_end {
+                                        wait_end = cut_to;
+                                        backoff_cut = true;
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                },
+                            );
+                        }
+                        // A cut moved the retry earlier: the board follows.
+                        if backoff_cut && !cut_before {
+                            publish.in_flight(Some(retry_record(Some(
+                                unix_ms_now().saturating_add(
+                                    u64::try_from(
+                                        wait_end
+                                            .saturating_duration_since(Instant::now())
+                                            .as_millis(),
+                                    )
+                                    .unwrap_or(u64::MAX),
+                                ),
+                            ))));
+                        }
+                        // WAITING IS NOT WEDGED. `heartbeat.bump()` at the top of
+                        // `'outer` is never reached while this arm holds the thread,
+                        // and this single wait can legitimately run to
+                        // `MAX_RETRY_DELAY` (300 s) on a `Retry-After`-honouring
+                        // sink — far past the stall warning's
+                        // `health_poll_interval + 15 s` threshold (45 s at the
+                        // defaults). Without a bump here a merely-SLOW sink is
+                        // reported as a drain "wedged inside a sink call that blocks
+                        // its OS thread", which is the worst possible misdirection
+                        // during an incident. `wait_slice` bumps on each 50 ms
+                        // slice, which keeps the heartbeat meaning what it claims:
+                        // only a thread that cannot reach its own loop at all
+                        // freezes it.
+                        //
+                        // A pause holds the backoff (spec §5.4): the wait ends
+                        // only once it has elapsed AND no pause is requested.
+                        // While paused, `wait_slice`'s 50 ms floor keeps an
+                        // elapsed backoff from spinning, and `retries_left`,
+                        // `processed` and the episode's `backoff_cut` are kept.
+                        let paused = control.pause_requested();
+                        if paused {
+                            if control.stop_requested() {
+                                abandoned = Some((segment.clone(), processed));
+                                break 'outer DrainExitReason::Stopped; // pause honoured at stop
+                            }
+                            let since = *paused_since.get_or_insert_with(|| {
+                                info!(
+                                    path = %segment.display(),
+                                    "drain: paused during a retry backoff; holding the segment"
+                                );
+                                unix_ms_now()
+                            });
+                            publish.paused(since, true);
+                            metrics.drain_paused.set(1.0);
+                            // Health while held: the M2 probe below is not reached
+                            // until the hold ends, so the poll runs here on cadence.
+                            if !control.absorbing()
+                                && last_health_poll.elapsed() >= config.health_poll_interval
+                            {
+                                let now = Instant::now();
+                                prev_health_ok = probe_and_resume_stranded_with(
+                                    &rt,
+                                    &*sink,
+                                    &config,
+                                    &metrics,
+                                    Some(&drain_rx),
+                                    &mut pending,
+                                    &mut backlog,
+                                    prev_health_ok,
+                                    Some(&segment),
+                                    &|p| ledger.excludes(p, now),
+                                    &ctx,
+                                );
+                                last_health_poll = Instant::now();
+                            }
+                        } else if paused_since.take().is_some() {
+                            publish.paused(0, false);
+                            metrics.drain_paused.set(0.0);
+                            info!(path = %segment.display(), "drain: resumed during a retry backoff");
+                        }
+                        let remaining = wait_end.saturating_duration_since(Instant::now());
+                        if remaining.is_zero() && !paused {
                             break;
                         }
+                        match wait_slice(
+                            &drain_rx,
+                            &ctx,
+                            remaining,
+                            &mut pending,
+                            backlog.len(),
+                            &mut channel_gone,
+                        ) {
+                            Wait::Segment(new_seg) => pending.push_back(new_seg),
+                            Wait::TimedOut => {}
+                            // The deadline passed inside the backoff: the retry
+                            // never fires (spec §5.4).
+                            Wait::Stop => {
+                                abandoned = Some((segment.clone(), processed));
+                                break 'outer DrainExitReason::DeadlineAbandoned;
+                            }
+                            // Detached shutdown: serve the clamped remainder of the
+                            // backoff (W2), then finish the retry.
+                            Wait::Disconnected => {
+                                if control.pause_requested() {
+                                    abandoned = Some((segment.clone(), processed));
+                                    break 'outer DrainExitReason::Stopped; // Detached shutdown honours the pause
+                                }
+                                let left = wait_end
+                                    .saturating_duration_since(Instant::now())
+                                    .min(SHUTDOWN_RETRY_BACKOFF_CAP)
+                                    .min(shutdown_backoff_left);
+                                shutdown_backoff_left -= left;
+                                std::thread::sleep(left);
+                                break;
+                            }
+                        }
+                    }
+
+                    // Rescan for OTHER stranded segments before the retry (M2). A long
+                    // backoff here would otherwise starve the Draining-arm rescan, so a
+                    // sink that recovers mid-backoff wouldn't re-drain segments stranded
+                    // by an earlier outage until this segment resolved. Excludes the
+                    // segment being retried (`segment`) — this arm processes it directly
+                    // below, so re-queuing it would double-process. The borrow ends
+                    // before `segment` is moved into process_segment / the next state.
+                    // Ledger-owned paths are skipped too (spec §4.0). Not in
+                    // absorb mode (spec §5.4): a probe can overrun the exit grace.
+                    if !control.absorbing() {
+                        let now = Instant::now();
+                        prev_health_ok = probe_and_resume_stranded_with(
+                            &rt,
+                            &*sink,
+                            &config,
+                            &metrics,
+                            Some(&drain_rx),
+                            &mut pending,
+                            &mut backlog,
+                            prev_health_ok,
+                            Some(&segment),
+                            &|p| ledger.excludes(p, now),
+                            &ctx,
+                        );
                     }
                 }
 
-                // Rescan for OTHER stranded segments before the retry (M2). A long
-                // backoff here would otherwise starve the Draining-arm rescan, so a
-                // sink that recovers mid-backoff wouldn't re-drain segments stranded
-                // by an earlier outage until this segment resolved. Excludes the
-                // segment being retried (`segment`) — this arm processes it directly
-                // below, so re-queuing it would double-process. The borrow ends
-                // before `segment` is moved into process_segment / the next state.
-                // Ledger-owned paths are skipped too (spec §4.0).
-                let now = Instant::now();
-                prev_health_ok = probe_and_resume_stranded(
-                    &rt,
-                    &*sink,
-                    &config,
-                    &metrics,
-                    &mut pending,
-                    prev_health_ok,
-                    Some(&segment),
-                    &|p| ledger.excludes(p, now),
-                    &heartbeat,
-                );
-
                 // Resume past the sub-batches already durably processed (F05).
+                publish.in_flight(Some(retry_record(None)));
                 let result = attempt_segment(
                     &rt,
                     &segment,
@@ -1369,7 +2312,7 @@ fn drain_thread<S: Sink>(
                     &mut dead_letter,
                     ledger,
                     processed,
-                    &heartbeat,
+                    &ctx,
                 );
                 // Subsequent failure: spend one retry and double the delay
                 // (exponential backoff). retries_left is >= 1 here — a spent
@@ -1377,17 +2320,28 @@ fn drain_thread<S: Sink>(
                 next_state_after_process(
                     segment,
                     result,
+                    // A pause mid-attempt holds the same episode: same budget,
+                    // same delay, the backoff already served.
+                    HeldResume::Retry {
+                        retries_left,
+                        next_delay,
+                        cause,
+                        backoff_cut,
+                    },
                     &config,
                     &metrics,
                     &mut block_episode,
                     ledger,
                     &heartbeat,
+                    // The same episode: a backoff already cut stays cut.
                     |segment, retry_after, processed, cause| DrainState::RetryingTransient {
                         segment,
                         retries_left: retries_left - 1,
                         next_delay: next_retry_delay(next_delay * 2, retry_after),
                         processed,
                         cause,
+                        backoff_cut,
+                        waited: false,
                     },
                 )
             }
@@ -1399,16 +2353,30 @@ fn drain_thread<S: Sink>(
                 processed,
                 needed,
             } => {
-                set_drain_state(&metrics, DrainStateValue::blocked_dead_letter_full);
+                let blocked_ms = unix_ms_now().saturating_sub(
+                    u64::try_from(blocked_since.elapsed().as_millis()).unwrap_or(u64::MAX),
+                );
+                enter_arm(
+                    publish,
+                    &metrics,
+                    DrainStateValue::blocked_dead_letter_full,
+                    blocked_ms,
+                );
                 metrics
                     .dead_letter_blocked_duration
                     .set(blocked_since.elapsed().as_secs_f64());
 
                 // Drain new segments into the pending buffer while waiting.
-                // Use recv_timeout in short slices to detect channel disconnection.
-                let mut channel_closed = false;
+                // Wait in `wait_slice` slices to notice a shutdown: any stop
+                // request (spec §5.4: Blocked exits on any stop, deadline or
+                // not) or a Detached channel disconnecting.
+                let mut stop_seen = false;
                 let check_end = Instant::now() + config.dead_letter_check_interval;
                 loop {
+                    if control.stop_requested() {
+                        stop_seen = true;
+                        break;
+                    }
                     // Same reasoning as the retry-backoff wait above: this arm
                     // parks for `dead_letter_check_interval` (30 s by default)
                     // and can re-park indefinitely while an operator frees
@@ -1416,17 +2384,42 @@ fn drain_thread<S: Sink>(
                     // never reached. A drain that is blocked and SAYING SO via
                     // `drain_state{blocked_dead_letter_full}` is alive; only a
                     // thread that cannot reach its own loop is wedged.
-                    heartbeat.bump();
+                    // `wait_slice` bumps the heartbeat on every slice.
+                    {
+                        let now = Instant::now();
+                        requeue.service(
+                            &ctx,
+                            || {
+                                requeue_unconfirmed(
+                                    &config,
+                                    &metrics,
+                                    Some(&drain_rx),
+                                    &mut pending,
+                                    &mut backlog,
+                                    Some(&segment),
+                                    &|p| ledger.excludes(p, now),
+                                    &heartbeat,
+                                )
+                            },
+                            || false,
+                        );
+                    }
                     let remaining = check_end.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
                         break;
                     }
-                    let poll = remaining.min(Duration::from_millis(50));
-                    match drain_rx.recv_timeout(poll) {
-                        Ok(new_seg) => pending.push_back(new_seg),
-                        Err(RecvTimeoutError::Timeout) => {}
-                        Err(RecvTimeoutError::Disconnected) => {
-                            channel_closed = true;
+                    match wait_slice(
+                        &drain_rx,
+                        &ctx,
+                        remaining,
+                        &mut pending,
+                        backlog.len(),
+                        &mut channel_gone,
+                    ) {
+                        Wait::Segment(new_seg) => pending.push_back(new_seg),
+                        Wait::TimedOut => {}
+                        Wait::Stop | Wait::Disconnected => {
+                            stop_seen = true;
                             break;
                         }
                     }
@@ -1459,22 +2452,31 @@ fn drain_thread<S: Sink>(
                 // Draining arm would otherwise be starved here: a sink that
                 // recovers while we're parked would not re-drain segments stranded
                 // by an *earlier* outage until the cap cleared. Reusing
-                // probe_and_resume_stranded does the same gauge update plus the
+                // probe_and_resume_stranded_with does the same gauge update plus the
                 // down→up re-queue, excluding `segment` (this arm resumes it on its
                 // own via the RetryingTransient transition below, so re-queuing it
                 // would double-process). Ledger-owned paths are skipped too.
-                let now = Instant::now();
-                prev_health_ok = probe_and_resume_stranded(
-                    &rt,
-                    &*sink,
-                    &config,
-                    &metrics,
-                    &mut pending,
-                    prev_health_ok,
-                    Some(&segment),
-                    &|p| ledger.excludes(p, now),
-                    &heartbeat,
-                );
+                //
+                // Not in absorb mode (spec §5.4): a probe can block for
+                // health_probe_timeout and overrun the exit grace. The local
+                // dead-letter rescan above stays, so an operator freeing
+                // headroom still unblocks this arm during shutdown.
+                if !control.absorbing() {
+                    let now = Instant::now();
+                    prev_health_ok = probe_and_resume_stranded_with(
+                        &rt,
+                        &*sink,
+                        &config,
+                        &metrics,
+                        Some(&drain_rx),
+                        &mut pending,
+                        &mut backlog,
+                        prev_health_ok,
+                        Some(&segment),
+                        &|p| ledger.excludes(p, now),
+                        &ctx,
+                    );
+                }
                 // Unblock on the SAME predicate that blocked: the blocked write
                 // fits. A bare `total < cap` unblocked while the total sat in
                 // `[cap - needed, cap)`, so the retry blocked again at once —
@@ -1512,15 +2514,20 @@ fn drain_thread<S: Sink>(
                         next_delay: config.base_retry_delay,
                         processed,
                         cause: TransientCause::Sink,
+                        // A new retry episode.
+                        backoff_cut: false,
+                        waited: false,
                     }
-                } else if channel_closed {
-                    // No headroom and shutdown requested — leave segment unconfirmed.
-                    // Crash recovery will replay it on next start.
-                    info!(
-                        path = %segment.display(),
-                        "drain: shutdown while blocked; segment not confirmed"
-                    );
-                    break 'outer;
+                } else if stop_seen {
+                    // No headroom and a stop (or a Detached disconnect): leave the
+                    // segment unconfirmed; replay delivers it on the next start.
+                    info!(path = %segment.display(), "drain: stop while blocked; segment not confirmed");
+                    abandoned = Some((segment, processed));
+                    break 'outer if control.deadline_passed() {
+                        DrainExitReason::DeadlineAbandoned
+                    } else {
+                        DrainExitReason::Stopped
+                    };
                 } else {
                     DrainState::BlockedDeadLetterFull {
                         segment,
@@ -1530,8 +2537,144 @@ fn drain_thread<S: Sink>(
                     }
                 }
             }
+
+            // ── Abandoned at the stop deadline (spec §5.4) ────────────────────
+            DrainState::Abandoned { segment, processed } => {
+                warn!(
+                    path = %segment.display(),
+                    processed,
+                    "drain: stop deadline reached; abandoning the segment in flight (left sealed and \
+                     unconfirmed; its first {processed} records re-deliver on replay)"
+                );
+                abandoned = Some((segment, processed));
+                break 'outer DrainExitReason::DeadlineAbandoned;
+            }
+
+            // ── Held: paused mid-segment (spec §5.4, §8) ──────────────────────
+            //
+            // Entered from a `Paused` result: the attempt stopped before a
+            // commit batch, with nothing in flight and the committed prefix
+            // recorded as the ledger's cursor. Nothing is committed here; the
+            // hold keeps emptying the channel, serving the verbs and polling
+            // sink health until the pause lifts or a stop arrives.
+            DrainState::Held {
+                segment,
+                processed,
+                resume,
+            } => {
+                enter_arm(publish, &metrics, resume.gauge_state(), 0);
+                let since = *paused_since.get_or_insert_with(unix_ms_now);
+                publish.paused(since, true);
+                metrics.drain_paused.set(1.0);
+                if control.stop_requested() {
+                    info!(
+                        path = %segment.display(),
+                        processed,
+                        "drain: stop while held; the segment stays sealed and unconfirmed and replays \
+                         on the next start (pause honoured)"
+                    );
+                    abandoned = Some((segment, processed));
+                    break 'outer DrainExitReason::Stopped;
+                }
+                {
+                    let now = Instant::now();
+                    requeue.service(
+                        &ctx,
+                        || {
+                            requeue_unconfirmed(
+                                &config,
+                                &metrics,
+                                Some(&drain_rx),
+                                &mut pending,
+                                &mut backlog,
+                                Some(&segment),
+                                &|p| ledger.excludes(p, now),
+                                &heartbeat,
+                            )
+                        },
+                        || false,
+                    );
+                }
+                // Health while held (spec §5.4): the wall-clock poll keeps
+                // running, with the held segment excluded from the rescan.
+                if !control.absorbing() && last_health_poll.elapsed() >= config.health_poll_interval
+                {
+                    let now = Instant::now();
+                    prev_health_ok = probe_and_resume_stranded_with(
+                        &rt,
+                        &*sink,
+                        &config,
+                        &metrics,
+                        Some(&drain_rx),
+                        &mut pending,
+                        &mut backlog,
+                        prev_health_ok,
+                        Some(&segment),
+                        &|p| ledger.excludes(p, now),
+                        &ctx,
+                    );
+                    last_health_poll = Instant::now();
+                }
+                if control.pause_requested() {
+                    match wait_slice(
+                        &drain_rx,
+                        &ctx,
+                        control::SLICE,
+                        &mut pending,
+                        backlog.len(),
+                        &mut channel_gone,
+                    ) {
+                        Wait::Segment(p) => pending.push_back(p),
+                        Wait::TimedOut | Wait::Stop => {}
+                        // A Detached shutdown while held honours the pause.
+                        Wait::Disconnected => {
+                            abandoned = Some((segment, processed));
+                            break 'outer DrainExitReason::Stopped;
+                        }
+                    }
+                    DrainState::Held {
+                        segment,
+                        processed,
+                        resume,
+                    }
+                } else {
+                    paused_since = None;
+                    publish.paused(0, false);
+                    metrics.drain_paused.set(0.0);
+                    info!(
+                        path = %segment.display(),
+                        processed,
+                        "drain: resumed; continuing the held segment past the records already delivered"
+                    );
+                    match resume {
+                        // Back through admission, which re-reads the cursor
+                        // recorded on entry, pinned to the file's (dev, ino).
+                        HeldResume::Fresh => {
+                            pending.push_front(segment);
+                            backlog_turn = false; // the held segment goes first
+                            DrainState::Draining
+                        }
+                        // The same retry episode, its backoff already served;
+                        // `attempt_segment` re-checks the cursor's pin.
+                        HeldResume::Retry {
+                            retries_left,
+                            next_delay,
+                            cause,
+                            backoff_cut,
+                        } => DrainState::RetryingTransient {
+                            segment,
+                            retries_left,
+                            next_delay,
+                            processed,
+                            cause,
+                            backoff_cut,
+                            waited: true,
+                        },
+                    }
+                }
+            }
         };
-    }
+    };
 
     // One best-effort pass over outstanding dispositions on the way out: a
     // sidecar or quarantine move that can complete now saves a re-delivery on
@@ -1539,6 +2682,44 @@ fn drain_thread<S: Sink>(
     ledger.retry_dispositions(&config.wab_dir, &metrics, &heartbeat);
     publish_ledger_counts(ledger.counts(), &metrics);
     info!("drain thread exiting");
+    // Every exit that leaves a segment partly delivered counts, once, here.
+    if abandoned.is_some() {
+        metrics.drain_segments_abandoned.inc();
+    }
+    ThreadExit {
+        reason,
+        abandoned,
+        pending_left: pending.len() + drain_rx.len(),
+        backlog_left: backlog.len(),
+    }
+}
+
+/// The pre-Foundations entry, kept with its signature for the existing tests:
+/// Detached, unobserved, no backlog.
+#[cfg(test)]
+fn drain_thread<S: Sink>(
+    drain_rx: crossbeam_channel::Receiver<PathBuf>,
+    sink: Arc<S>,
+    config: DrainConfig,
+    metrics: Arc<Metrics>,
+    initial_health_ok: bool,
+    heartbeat: DrainHeartbeat,
+    ledger: &mut SegmentLedger,
+) {
+    let control = DrainControl::detached();
+    let publish = Publisher::none();
+    drain_thread_with(
+        drain_rx,
+        sink,
+        config,
+        metrics,
+        initial_health_ok,
+        heartbeat,
+        ledger,
+        &control,
+        &publish,
+        Vec::new(),
+    );
 }
 
 /// Maps a [`ProcessResult`] to the next [`DrainState`]. The three terminal
@@ -1558,6 +2739,7 @@ fn drain_thread<S: Sink>(
 fn next_state_after_process(
     segment: PathBuf,
     result: ProcessResult,
+    resume: HeldResume,
     config: &DrainConfig,
     metrics: &Metrics,
     block_episode: &mut Option<Instant>,
@@ -1633,6 +2815,29 @@ fn next_state_after_process(
             end_block_episode(block_episode, metrics);
             DrainState::Draining
         }
+        // Paused between commit batches: record the committed prefix as the
+        // cursor, pinned to the file's (dev, ino), so a resume (or a respawn
+        // while held) continues past it.
+        ProcessResult::Paused { processed } => {
+            ledger.record_progress(&segment, processed);
+            info!(
+                path = %segment.display(),
+                processed,
+                "drain: paused between commit batches; holding the segment (nothing in flight, \
+                 nothing re-sent on resume)"
+            );
+            DrainState::Held {
+                segment,
+                processed,
+                resume,
+            }
+        }
+        // The stop deadline passed before a batch or during a commit: never
+        // confirmed. The cursor is recorded like any other partial result.
+        ProcessResult::Abandoned { processed } => {
+            ledger.record_progress(&segment, processed);
+            DrainState::Abandoned { segment, processed }
+        }
     }
 }
 
@@ -1679,8 +2884,9 @@ fn attempt_segment<S: Sink>(
     dead_letter: &mut DeadLetterWriter,
     ledger: &mut SegmentLedger,
     skip: u64,
-    hb: &DrainHeartbeat,
+    ctx: &DrainCtx<'_>,
 ) -> ProcessResult {
+    let hb = ctx.hb;
     ledger.begin_attempt(segment);
     let result = 'attempt: {
         // `skip` may come from a state rather than from admission; either
@@ -1696,7 +2902,7 @@ fn attempt_segment<S: Sink>(
             }
         };
         let last_chance = local_read_escalates_next(segment, config, ledger);
-        rt.block_on(process_segment(
+        rt.block_on(process_segment_ctl(
             segment,
             sink,
             config,
@@ -1704,7 +2910,7 @@ fn attempt_segment<S: Sink>(
             dead_letter,
             skip,
             last_chance,
-            hb,
+            ctx,
         ))
     };
     ledger.end_attempt();
@@ -1846,7 +3052,7 @@ fn local_read_escalation_due(
 }
 
 /// True when one more segment-class local read failure of `segment` would
-/// escalate it — the `last_local_read_chance` of [`process_segment`]. It is
+/// escalate it — the `last_local_read_chance` of [`process_segment_ctl`]. It is
 /// evaluated after [`SegmentLedger::begin_attempt`], against the same attempt
 /// start [`escalate_local_read`] then ages the failures to, so the two always
 /// agree on which attempt is the escalating one.
@@ -1872,6 +3078,7 @@ fn transition_from_draining(
     next_state_after_process(
         segment,
         result,
+        HeldResume::Fresh,
         config,
         metrics,
         block_episode,
@@ -1883,6 +3090,8 @@ fn transition_from_draining(
             next_delay: next_retry_delay(config.base_retry_delay, retry_after),
             processed,
             cause,
+            backoff_cut: false,
+            waited: false,
         },
     )
 }
@@ -1959,7 +3168,7 @@ fn enter_blocked(
 /// before quarantining (spec §4.2), which needs the sink — so it happens here
 /// rather than in [`escalate_local_read`].
 #[allow(clippy::too_many_arguments)]
-async fn process_segment<S: Sink>(
+async fn process_segment_ctl<S: Sink>(
     segment: &Path,
     sink: &S,
     config: &DrainConfig,
@@ -1967,13 +3176,15 @@ async fn process_segment<S: Sink>(
     dead_letter: &mut DeadLetterWriter,
     skip: u64,
     last_local_read_chance: bool,
-    hb: &DrainHeartbeat,
+    ctx: &DrainCtx<'_>,
 ) -> ProcessResult {
+    let hb = ctx.hb;
     // The whole attempt is reading the segment, except where a nested guard
     // says otherwise: each commit (`SinkCommit`), a dead-letter write, a
-    // quarantine move. The heartbeat itself moves after every commit and every
-    // READ_HEARTBEAT_EVERY records (spec §4.8), so one large segment no longer
-    // freezes it for as long as the whole segment takes.
+    // quarantine move. The heartbeat itself moves after every commit (the
+    // commit's `CommitGuard` bumps it on drop) and every READ_HEARTBEAT_EVERY
+    // records (spec §4.8), so one large segment no longer freezes it for as
+    // long as the whole segment takes.
     let _busy = BusyGuard::new(hb, BusyKind::SegmentRead);
     let reader = match open_segment(segment) {
         Ok(r) => r,
@@ -2160,7 +3371,10 @@ async fn process_segment<S: Sink>(
             let full_batch = std::mem::replace(&mut batch, Vec::with_capacity(max_batch));
             let full_ids = std::mem::replace(&mut batch_ids, Vec::with_capacity(max_batch));
             let n = full_batch.len() as u64;
-            let result = commit_batch(
+            if let Some(stop) = batch_gate(ctx, durable_through) {
+                return stop;
+            }
+            let result = commit_batch_ctl(
                 &full_batch,
                 &full_ids,
                 segment_created_at,
@@ -2168,11 +3382,11 @@ async fn process_segment<S: Sink>(
                 config,
                 metrics,
                 dead_letter,
-                hb,
+                ctx,
             )
             .instrument(segment_span.clone())
             .await;
-            hb.bump();
+            // The commit's own `CommitGuard` bumped the heartbeat on its way out.
             if let Err(setback) = apply_batch(result, &mut durable_through, n) {
                 return setback;
             }
@@ -2181,7 +3395,10 @@ async fn process_segment<S: Sink>(
 
     if !batch.is_empty() {
         let n = batch.len() as u64;
-        let result = commit_batch(
+        if let Some(stop) = batch_gate(ctx, durable_through) {
+            return stop;
+        }
+        let result = commit_batch_ctl(
             &batch,
             &batch_ids,
             segment_created_at,
@@ -2189,11 +3406,10 @@ async fn process_segment<S: Sink>(
             config,
             metrics,
             dead_letter,
-            hb,
+            ctx,
         )
         .instrument(segment_span.clone())
         .await;
-        hb.bump();
         if let Err(setback) = apply_batch(result, &mut durable_through, n) {
             return setback;
         }
@@ -2300,6 +3516,58 @@ async fn process_segment<S: Sink>(
     }
 }
 
+/// Checked before every `commit_batch_ctl` (spec §5.4). Nothing is in flight
+/// here and `durable_through` is the committed prefix, so stopping here costs
+/// no duplicate on resume.
+fn batch_gate(ctx: &DrainCtx<'_>, durable_through: u64) -> Option<ProcessResult> {
+    // The deadline outranks a pause: both stop before the batch, but only the
+    // deadline ends the drain.
+    if ctx.control.stop_requested() && ctx.control.deadline_passed() {
+        return Some(ProcessResult::Abandoned {
+            processed: durable_through,
+        });
+    }
+    if ctx.control.pause_requested() {
+        return Some(ProcessResult::Paused {
+            processed: durable_through,
+        });
+    }
+    None
+}
+
+/// Pre-Foundations signature for the existing tests: Detached, unobserved.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn process_segment<S: Sink>(
+    segment: &Path,
+    sink: &S,
+    config: &DrainConfig,
+    metrics: &Metrics,
+    dead_letter: &mut DeadLetterWriter,
+    skip: u64,
+    last_local_read_chance: bool,
+    hb: &DrainHeartbeat,
+) -> ProcessResult {
+    let control = DrainControl::detached();
+    let publish = Publisher::none();
+    let ctx = DrainCtx {
+        control: &control,
+        publish: &publish,
+        hb,
+    };
+    process_segment_ctl(
+        segment,
+        sink,
+        config,
+        metrics,
+        dead_letter,
+        skip,
+        last_local_read_chance,
+        &ctx,
+    )
+    .await
+}
+
 /// Applies a sub-batch of `n` records, starting after record `*durable_through`,
 /// to the cursor: `Ok` advances it past the sub-batch; anything else leaves it
 /// and returns the [`ProcessResult`] to report. What the sub-batch still owes
@@ -2332,6 +3600,7 @@ fn apply_batch(
             needed,
             carry: Some(owed.into_carry(processed + n)),
         }),
+        BatchResult::Abandoned => Err(ProcessResult::Abandoned { processed }),
     }
 }
 
@@ -2726,7 +3995,7 @@ fn move_to_quarantine(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn commit_batch<S: Sink>(
+async fn commit_batch_ctl<S: Sink>(
     payloads: &[Payload],
     record_ids: &[RecordId],
     segment_created_at: i64,
@@ -2734,8 +4003,9 @@ async fn commit_batch<S: Sink>(
     config: &DrainConfig,
     metrics: &Metrics,
     dead_letter: &mut DeadLetterWriter,
-    hb: &DrainHeartbeat,
+    ctx: &DrainCtx<'_>,
 ) -> BatchResult {
+    let hb = ctx.hb;
     // Derive the batch's dedup token. This runs on the drain thread — off the
     // fsync path entirely — and costs ~170 us per 256 KiB against a sink commit
     // measured in milliseconds.
@@ -2772,9 +4042,31 @@ async fn commit_batch<S: Sink>(
     // the thread instead of yielding defeats the timeout, and the guard staying
     // set past `commit_timeout` is how the poll task tells that wedge from a
     // merely slow commit. It is dropped before the dead-letter write below.
+    //
+    // The commit also races the stop deadline (spec §5.4): past it the commit
+    // future is dropped, exactly as `commit_timeout` drops it, but with no
+    // retry bump and no backoff. Without a deadline `deadline_reached()` never
+    // resolves, so `biased` plus its 50 ms poll costs one timer wake per 50 ms
+    // of commit and nothing else.
     let timed = {
         let _busy = BusyGuard::new(hb, BusyKind::SinkCommit);
-        tokio::time::timeout(config.commit_timeout, sink.commit(batch)).await
+        // Every way out of this block (completion, commit_timeout, the
+        // deadline, an unwinding panic) clears the commit marker (spec §5.4).
+        let _commit = ctx.commit_guard();
+        tokio::select! {
+            biased;
+            r = tokio::time::timeout(config.commit_timeout, sink.commit(batch)) => Some(r),
+            () = ctx.control.deadline_reached() => None,
+        }
+    };
+    let Some(timed) = timed else {
+        warn!(
+            records = payloads.len(),
+            "drain: the stop deadline passed during a sink commit; abandoning it (the segment stays \
+             sealed and unconfirmed and replays on the next start; the sink may already have \
+             applied this batch, which its idempotency absorbs)"
+        );
+        return BatchResult::Abandoned;
     };
     let commit = match timed {
         Ok(inner) => inner,
@@ -2791,6 +4083,13 @@ async fn commit_batch<S: Sink>(
             warn!(
                 timeout_secs = config.commit_timeout.as_secs(),
                 "drain: sink commit exceeded commit_timeout; treating as transient, retrying segment"
+            );
+            ctx.publish.sink_failure(
+                SinkFailureKind::Timeout,
+                &format!(
+                    "sink commit exceeded commit_timeout ({}s)",
+                    config.commit_timeout.as_secs()
+                ),
             );
             return BatchResult::Transient {
                 retry_after: None,
@@ -2819,12 +4118,22 @@ async fn commit_batch<S: Sink>(
                     "drain: sink CommitResult does not account for every record; preserving \
                      segment instead of confirming (likely a Sink contract violation)"
                 );
+                ctx.publish.sink_failure(
+                    SinkFailureKind::ContractViolation,
+                    &format!(
+                        "sink CommitResult accounts for {accounted} of {} records",
+                        payloads.len()
+                    ),
+                );
                 return BatchResult::Transient {
                     retry_after: None,
                     cause: TransientCause::Sink,
                     owed: None,
                 };
             }
+            // The sink did its part, whatever the dead-letter write that may
+            // follow does.
+            ctx.publish.sink_success();
             metrics
                 .sink_commit_duration
                 .observe(t.elapsed().as_secs_f64());
@@ -2874,6 +4183,8 @@ async fn commit_batch<S: Sink>(
                 })
                 .inc_by(payloads.len() as u64);
             let retry_after = e.retry_after();
+            ctx.publish
+                .sink_failure(SinkFailureKind::Transient, &e.to_string());
             warn!(
                 error = %e,
                 retry_after_secs = retry_after.map(|d| d.as_secs()),
@@ -2892,6 +4203,8 @@ async fn commit_batch<S: Sink>(
                 .sink_commit_duration
                 .observe(t.elapsed().as_secs_f64());
             error!(error = %e, "drain: permanent sink error; dead-lettering batch");
+            ctx.publish
+                .sink_failure(SinkFailureKind::Permanent, &e.to_string());
 
             // Same silent-data-loss guard as the partial-rejection path above: a
             // failed dead-letter write (or a cap block) preserves the segment for
@@ -2906,6 +4219,39 @@ async fn commit_batch<S: Sink>(
             BatchResult::Ok
         }
     }
+}
+
+/// Pre-Foundations signature for the existing tests: Detached, unobserved.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn commit_batch<S: Sink>(
+    payloads: &[Payload],
+    record_ids: &[RecordId],
+    segment_created_at: i64,
+    sink: &S,
+    config: &DrainConfig,
+    metrics: &Metrics,
+    dead_letter: &mut DeadLetterWriter,
+    hb: &DrainHeartbeat,
+) -> BatchResult {
+    let control = DrainControl::detached();
+    let publish = Publisher::none();
+    let ctx = DrainCtx {
+        control: &control,
+        publish: &publish,
+        hb,
+    };
+    commit_batch_ctl(
+        payloads,
+        record_ids,
+        segment_created_at,
+        sink,
+        config,
+        metrics,
+        dead_letter,
+        &ctx,
+    )
+    .await
 }
 
 /// Dead-letters `records` under the `dead_letter_max_bytes` cap, bumping the
@@ -9434,4 +10780,7 @@ mod tests {
             "the same episode does not repeat it: {again}"
         );
     }
+
+    // ── Foundations: drain control (operability spec §5.4, §8) ───────────────
+    mod foundations;
 }

@@ -136,7 +136,7 @@ pub(crate) enum FlusherExit {
 /// a string literal lands in `&'static str`; `panic!("{}", ...)` lands in
 /// `String`. Anything else gets a placeholder so the log line still says
 /// *something*.
-fn panic_message_str(payload: &Box<dyn std::any::Any + Send>) -> &str {
+pub(crate) fn panic_message_str(payload: &Box<dyn std::any::Any + Send>) -> &str {
     if let Some(s) = payload.downcast_ref::<&'static str>() {
         return s;
     }

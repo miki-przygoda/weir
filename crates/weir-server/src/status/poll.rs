@@ -744,6 +744,12 @@ fn should_warn_wab_growth(samples: &[u64], wab_max_bytes: u64, drain_healthy: bo
 /// value as `drain_healthy` and returns `false` early when it is `true`. So a
 /// swapped `&&`/`||` here silently inverts which failures the warning covers.
 ///
+/// A third input, `weir_drain_paused`, also has to be clear (spec §9.3
+/// condition 11): a paused or held drain is alive but delivers nothing, and a
+/// held segment keeps the `drain_state` series of the state it came from
+/// (`draining` included), so the state gauge alone would read as healthy and
+/// silence the WAB-growth warning for as long as the pause lasts.
+///
 /// Pulled out of the background task's closure (rather than left inline) so this
 /// composition — not just the pure predicate — is unit-tested; a swapped
 /// `&&`/`||` or a wrong label variant here would previously compile and pass
@@ -766,7 +772,10 @@ fn drain_is_healthy(metrics: &crate::metrics::Metrics) -> bool {
         })
         .get()
         > 0.0;
-    sink_healthy && draining
+    // Paused or held (Foundations): the drain is alive but delivers nothing,
+    // and Held keeps its source state's gauge, so read the pause directly.
+    let paused = metrics.drain_paused.get() > 0.0;
+    sink_healthy && draining && !paused
 }
 
 /// The status half of the 5 s task (spec §5.11). `None` in the moved unit
@@ -1655,6 +1664,21 @@ mod drain_is_healthy_tests {
             "a drain that has exited must never compose to healthy — this is what \
              lets the WAB growth warning fire when delivery has stopped for good"
         );
+    }
+
+    /// A held segment keeps `drain_state{draining}` (or retrying) at 1, since
+    /// Held shows the state it came from, so the pause must be read from
+    /// `weir_drain_paused`. A paused drain delivers nothing, and the WAB-growth
+    /// warning must be able to fire on it (spec §9.3 condition 11).
+    #[test]
+    fn a_paused_or_held_drain_is_not_healthy() {
+        let m = Metrics::new().0;
+        set_sink_health(&m, SinkHealthState::healthy);
+        set_drain_state(&m, DrainStateValue::draining);
+        m.drain_paused.set(1.0);
+        assert!(!drain_is_healthy(&m), "paused must not compose to healthy");
+        m.drain_paused.set(0.0);
+        assert!(drain_is_healthy(&m));
     }
 }
 
