@@ -2436,7 +2436,7 @@ fn second_daemon_refuses_a_live_socket() {
         log.contains("weir starting"),
         "B's log must be at info\nlog:\n{log}"
     );
-    for late in ["recover", "metrics endpoint listening"] {
+    for late in ["recover", "metrics and health endpoint listening"] {
         assert!(
             !log.contains(late),
             "B must refuse in preflight, before {late:?}\nlog:\n{log}"
@@ -2696,7 +2696,7 @@ fn refused_duplicate_never_delivers(shared: SharedResource) {
     for late in [
         "recovering",
         "queuing segment for drain replay",
-        "metrics endpoint listening",
+        "metrics and health endpoint listening",
     ] {
         assert!(
             !log.contains(late),
@@ -3609,6 +3609,230 @@ fn sigterm_during_recovery_exits_zero_without_ever_serving() {
         log.contains("WAB recovery complete"),
         "a forced shutdown must not interrupt recovery\n{log}"
     );
+}
+
+// ── HTTP health routes (Foundations, spec §10) ────────────────────────────────
+
+/// One raw HTTP exchange against the metrics/health listener: (status, head, body).
+fn http_exchange(port: u16, request: &str) -> (u16, String, Vec<u8>) {
+    use std::io::{Read, Write};
+    let mut s =
+        std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect metrics listener");
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    s.write_all(request.as_bytes()).unwrap();
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw)
+        .expect("a full response, not a reset");
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("a response head");
+    let head = String::from_utf8_lossy(&raw[..split]).into_owned();
+    let status = head
+        .split(' ')
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .expect("a status code");
+    (status, head, raw[split + 4..].to_vec())
+}
+
+fn http_get(port: u16, path: &str) -> (u16, String, String) {
+    let (s, h, b) = http_exchange(port, &format!("GET {path} HTTP/1.0\r\n\r\n"));
+    (s, h, String::from_utf8_lossy(&b).into_owned())
+}
+
+#[test]
+fn health_routes_answer_on_a_serving_daemon() {
+    let srv = weir_server!("health_routes").start();
+    let p = srv.metrics_port;
+
+    let (s, h, b) = http_get(p, "/livez");
+    assert_eq!((s, b.as_str()), (200, "ok\n"));
+    assert!(
+        h.contains("Cache-Control: no-store") && h.contains("Connection: close"),
+        "{h}"
+    );
+
+    // `serving` is stored after the listener stores (spec §6 step 12), a
+    // hair after wait_ready's connect can succeed: poll briefly.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (s, _, b) = http_get(p, "/readyz");
+        if s == 200 {
+            assert_eq!(b, "ok\n");
+            break;
+        }
+        assert!(Instant::now() < deadline, "/readyz never became 200: {b}");
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(http_get(p, "/startupz").2, "ok\n");
+
+    let (s, h, b) = http_get(p, "/status");
+    assert_eq!(s, 200);
+    assert!(
+        h.contains("Content-Type: application/json; charset=utf-8"),
+        "{h}"
+    );
+    let doc: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert_eq!(doc["schema"], "weir.status/v1");
+    assert_eq!(doc["view"], "public");
+    assert_eq!(doc["verdict"]["ready"], true);
+    assert!(
+        doc.get("pid").is_none() && doc.get("instance").is_none(),
+        "{doc}"
+    );
+
+    for path in ["/metrics", "/", "/foo", "/READYZ", "/readyz/"] {
+        let (s, h, b) = http_get(p, path);
+        assert_eq!(s, 200, "{path}");
+        assert!(
+            h.contains("Content-Type: application/openmetrics-text; version=1.0.0; charset=utf-8"),
+            "{path}: {h}"
+        );
+        assert!(
+            !h.contains("Cache-Control"),
+            "metrics head is byte-identical to 4.0: {h}"
+        );
+        assert!(b.contains("weir_records_accepted"), "{path}");
+    }
+
+    let (s, h, b) = http_exchange(p, "HEAD /readyz HTTP/1.0\r\n\r\n");
+    assert_eq!(s, 200);
+    assert!(h.contains("Content-Length: 3") && b.is_empty(), "{h}");
+    let (s, h, _) = http_exchange(p, "POST /status HTTP/1.0\r\nContent-Length: 0\r\n\r\n");
+    assert_eq!(s, 405);
+    assert!(h.contains("Allow: GET, HEAD"), "{h}");
+}
+
+/// §16 system test 3, the /readyz half (PR 4 owns the socket-gone and
+/// acks half): /readyz answers 503 within 200 ms of SIGTERM, and /livez and
+/// /metrics stay up until exit. A hanging sink keeps the drain inside its
+/// 10 s shutdown budget (spec §7), so the daemon is still running while the
+/// probes are asked. An idle producer connection would not hold it: under
+/// Decision Q5 it gets EOF at the lame duck.
+#[test]
+fn readyz_goes_503_within_200ms_of_sigterm_while_metrics_stay_up() {
+    let hole = RecordingSink::start_hanging();
+    let mut srv = weir_server!("readyz_sigterm")
+        .shutdown_timeout_secs(5)
+        .extra_config(
+            "sink_type = \"http\"\nsink_timeout_secs = 300\nwab_segment_max_bytes = 4096\n\
+             drain_shutdown_budget_secs = 10",
+        )
+        .env("WEIR_SINK_URL", hole.url())
+        .start();
+    let p = srv.metrics_port;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while http_get(p, "/readyz").0 != 200 {
+        assert!(Instant::now() < deadline, "never ready");
+        thread::sleep(Duration::from_millis(20));
+    }
+    // 8 x 2 KiB durable records over 4 KiB segments: sealed segments reach
+    // the drain, whose commit hangs (the same setup as PR 4's system test 3).
+    let mut c = srv.client();
+    for i in 0..8 {
+        let mut payload = format!("rz-{i}-").into_bytes();
+        payload.resize(2048, b'r');
+        c.push(payload, Durability::Durable).unwrap();
+    }
+    drop(c);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while hole.connections() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the drain never reached the sink"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // SAFETY: kill(2) with a pid we spawned and still own (not yet reaped).
+    let rc = unsafe { libc::kill(srv.child_pid() as libc::pid_t, libc::SIGTERM) };
+    assert_eq!(rc, 0);
+    let t = Instant::now();
+    let body = loop {
+        let (s, _, b) = http_get(p, "/readyz");
+        if s == 503 {
+            break b;
+        }
+        assert!(
+            t.elapsed() < Duration::from_secs(2),
+            "/readyz still 200 after SIGTERM"
+        );
+        thread::sleep(Duration::from_millis(5));
+    };
+    assert!(
+        t.elapsed() < Duration::from_millis(200),
+        "/readyz took {:?} to fail",
+        t.elapsed()
+    );
+    assert!(body.contains("shutting_down"), "{body}");
+    assert_eq!(
+        http_get(p, "/livez").0,
+        200,
+        "liveness never fails on shutdown (spec §10)"
+    );
+    assert!(
+        http_get(p, "/metrics").2.contains("weir_"),
+        "/metrics stays up until exit (spec §7 T1)"
+    );
+
+    // shutdown_timeout 5 s + drain budget 10 s + DRAIN_EXIT_GRACE 2 s, well inside 30 s.
+    assert!(
+        srv.wait_for_exit(Duration::from_secs(30)).is_some(),
+        "daemon exits after SIGTERM"
+    );
+}
+
+/// The public surface never shows a secret or free text (spec §9.1, §16
+/// sentinel test; the board-level half is in status::http's unit tests).
+#[test]
+fn public_status_and_verbose_probes_carry_no_secrets() {
+    let wab = std::env::temp_dir().join(format!("weir-SENTINELWABDIR-{}", std::process::id()));
+    fs::create_dir_all(&wab).unwrap();
+    let srv = weir_server!("public_status_secrets")
+        .wab_dir(&wab)
+        .extra_config(
+            "sink_type = \"http\"\n\
+             sink_max_retries = 0\n\
+             health_poll_interval_secs = 1\n\
+             wab_segment_max_age_secs = 1",
+        )
+        // Port 1 refuses at once, so the probe and the commits fail with
+        // errors that name the URL; the admin side would carry them.
+        .env(
+            "WEIR_SINK_URL",
+            "http://SENTINELUSER:SENTINELPASS@127.0.0.1:1/SENTINELPATH?token=SENTINELQUERY",
+        )
+        .env("WEIR_SINK_BEARER_TOKEN", "SENTINELBEARER")
+        .start();
+    let p = srv.metrics_port;
+    srv.client()
+        .push(b"one record to fail delivery", Durability::Durable)
+        .unwrap();
+
+    // Wait until the sink is known down, so every sink field is populated.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let doc: serde_json::Value = serde_json::from_str(&http_get(p, "/status").2).unwrap();
+        if doc["sink"]["health"] == "down" && !doc["sink"]["last_failure"].is_null() {
+            assert_eq!(doc["sink"]["type"], "http");
+            break;
+        }
+        assert!(Instant::now() < deadline, "sink never reported down: {doc}");
+        thread::sleep(Duration::from_millis(200));
+    }
+    for path in ["/status", "/livez?verbose", "/readyz?verbose", "/startupz"] {
+        let (_, h, b) = http_get(p, path);
+        for text in [&h, &b] {
+            assert!(!text.contains("SENTINEL"), "{path} leaked: {text}");
+            assert!(
+                !text.contains("127.0.0.1:1"),
+                "{path} leaked the sink endpoint: {text}"
+            );
+        }
+    }
+    drop(srv);
+    let _ = fs::remove_dir_all(&wab);
 }
 
 // ── File descriptor limit exhaustion ─────────────────────────────────────────

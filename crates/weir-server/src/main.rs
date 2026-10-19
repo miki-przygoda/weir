@@ -469,12 +469,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             config.metrics_port,
         )))
         .map_err(|e| preflight::metrics_bind_error(&config, &e))?;
-    // The router (spec §5.8): a 1 s head phase, then separate scrape and
-    // probe pools. With no status source every path is still metrics.
+    // The router (spec §5.8, §10): a 1 s head phase, then separate scrape
+    // and probe pools. /livez /readyz /startupz /status read the status
+    // board (loads only, spec §9.2); every other path is today's metrics.
     let http_state = metrics::server::HttpState::new(
         Arc::clone(&registry),
         Some(Arc::clone(&metrics)),
-        None, // Task 5.10 wires the status board; until then every path is metrics
+        Some(Arc::clone(&board) as Arc<dyn metrics::router::StatusSource>),
         config.livez_checks.clone(),
         config.metrics_max_connections,
     );
@@ -483,7 +484,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         bind = %config.metrics_bind,
         port = config.metrics_port,
         max_connections = config.metrics_max_connections,
-        "metrics endpoint listening"
+        livez_checks = ?config.livez_checks,
+        "metrics and health endpoint listening (/livez /readyz /startupz /status; any other path: metrics)"
     );
 
     // ── Step 6: TLS material, before a long recovery ──────────────────────────
