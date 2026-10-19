@@ -86,9 +86,10 @@ consecutive polls:
      actually draining, no matter what `drain_state` reads.
    - the immediate `BLOCKED` return (`drain_state{state="blocked_dead_letter_full"}`)
      — reported instantly, not folded into the stability window.
-   - Foundations (4.1) gauges, each a condition only when PRESENT, because a
-     pre-Foundations daemon does not export them and every historical
-     schedule runs against such binaries:
+   - Foundations (4.1) gauges, each a condition only when PRESENT, so the
+     check stays meaningful against a daemon that does not export them.
+     (The orchestrator itself now needs weir-server 4.1 or later: it always
+     passes --drain-shutdown-budget-secs, which an older daemon refuses.)
      `weir_wab_undelivered_segments == 0` (the spec's own drain-out
      condition, §16; weir's 5 s scan, so it lags the filesystem walk in
      condition 1, never leads it), and `weir_drain_paused != 1` (a paused

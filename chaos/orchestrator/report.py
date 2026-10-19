@@ -35,7 +35,8 @@ FINAL = "final"
 MAX_SURVIVORS_SHOWN = 20
 
 #: The phase-2 corpus's duplicate rate, which the Foundations gate reports
-#: against (spec §16). Exactly 1.000 across 706 Buffered power-loss episodes.
+#: against (spec §16). Exactly 1.000 across the 5,311 episodes of the 24 h
+#: Durable power-loss run (`powerloss-durable.toml`, run 1729848005600002).
 PHASE2_DUPLICATE_RATE = 1.000
 PHASE2_DUPLICATE_RATE_SOURCE = (
     "docs/benchmarks/chaos-phase2/2026-08-28-first-power-loss-measurement.md")

@@ -21,6 +21,11 @@ Design: [`docs/superpowers/specs/2026-07-25-chaos-fault-injection-design.md`](..
   deferred, not landed, and "the observers are unprivileged" should be read
   as a design goal the code does not yet enforce.
 - **Python 3** (stdlib only) and `losetup` / `dmsetup` / `mkfs.ext4`.
+- **weir-server 4.1 or later** under test. The orchestrator always passes
+  `--drain-shutdown-budget-secs` (3600 unless a schedule sets it, so the final
+  pass still drains), and an older daemon refuses unknown flags at startup.
+  Re-running a phase-1 or phase-2 schedule against a 4.0.x binary therefore
+  fails at once; use the harness from that release instead.
 
 ## Running
 
