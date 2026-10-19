@@ -428,6 +428,30 @@ Behaviour an operator can notice on upgrade:
   is a terminal. An invalid `log_level` is logged as a WARN instead of silently becoming `info`.
   Commit-path log lines name their segment. A dead-letter-blocked episode WARNs when it starts.
 - Build: `arc-swap` is always compiled (it was optional behind `tls`).
+- **Shutdown is bounded.** After SIGTERM the daemon goes lame duck, waits at
+  most `shutdown_timeout_secs` for open connections, seals and hands off every
+  active segment, then gives the drain `drain_shutdown_budget_secs` (new key,
+  default 10, range 0-3600). Whatever is still undelivered stays sealed and
+  unconfirmed on disk and is delivered by the next start; the exit status is
+  0. The segment abandoned at the deadline re-delivers its committed prefix on
+  replay (at-least-once, the same window as a crash).
+- **Lame duck at the first signal.** The producer socket is unlinked
+  (inode-checked) and the TCP listener closed at once, so new connects fail
+  fast instead of queueing for `shutdown_timeout_secs`. Idle connections still
+  get EOF; a frame already read is still acked.
+- **A second SIGTERM/SIGINT forces the exit.** Open connections are aborted and
+  the drain deadline becomes "now"; the worker and flusher joins still run, so
+  no acked record is lost. A third signal only logs. It used to be swallowed.
+- **Startup no longer waits on the sink.** `/metrics` answers before WAB
+  recovery and reports `weir_startup_phase`; the replay backlog is handed to
+  the drain in memory, so a slow or unreachable sink no longer delays the
+  producer socket.
+- **SIGHUP is served from before WAB recovery**, because the runtime and its
+  handler now start right after the lock and preflight. It used to be ignored
+  through recovery and the startup replay.
+- **The shipped grace periods are 45 s** (`shutdown_timeout_secs +
+  drain_shutdown_budget_secs + 5`): systemd `TimeoutStopSec=45`, compose
+  `stop_grace_period: 45s`.
 
 ### Upgrading from 4.0.x
 
@@ -511,6 +535,15 @@ which now come before recovery:
 - **A `socket_path` longer than the platform's `sun_path`**, or a non-socket
   entry (a file, directory or symlink) at `socket_path`: refused as before,
   with the same fix, but before recovery.
+
+One change needs action although it refuses nothing:
+
+- **SIGTERM no longer delivers the whole backlog.** It delivers for at most
+  `drain_shutdown_budget_secs` (10 s) once ingest is sealed; the rest is
+  delivered by the next start. Before decommissioning a host, stop the
+  producers and wait for `weir_wab_undelivered_segments` to reach 0, or raise
+  `drain_shutdown_budget_secs` for that stop. Raise your orchestrator's grace
+  period to at least 45 s.
 
 ## [4.0.1] - 2026-09-28
 

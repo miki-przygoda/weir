@@ -205,12 +205,13 @@ serve the admin socket's `reload` verb later (`trigger="admin"` is reserved).
 | The 8-deep reload queue is full (a SIGHUP flood), or the reload loop has stopped | unchanged | `outcome="dropped"` +1, WARN; the request never ran |
 
 **SIGHUP during startup.** SIGHUP is ignored from the first line of `main`
-until the runtime starts, which covers WAB recovery and the startup replay.
-A HUP in that window is dropped. That is safe: the TLS listener's load
-happens later and reads the files current at that time. Preflight also
-validates the TLS material before recovery. A daemon whose cert, key or CA
-does not load refuses to start (`failed to load TLS config: …`) before it
-touches the WAB.
+until the runtime starts, which now happens before WAB recovery (lock and
+preflight come first). A HUP in that short window is dropped. From then on it
+is served: during recovery the TLS material has already been loaded (it loads
+right after the metrics listener, before recovery), so a HUP reloads it as
+usual. Preflight also validates the TLS material before recovery. A daemon
+whose cert, key or CA does not load refuses to start (`failed to load TLS
+config: …`) before it touches the WAB.
 
 **Fail-safe reload**: if the new files are missing, unreadable, or contain
 invalid PEM, the daemon:

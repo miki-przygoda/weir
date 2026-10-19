@@ -899,3 +899,42 @@ fn the_test_hooks_system_tests_run_in_ci() {
         "the release workflow must never build weir-server with the test hooks"
     );
 }
+
+const ARCHITECTURE: &str = include_str!("../../../docs/architecture.md");
+
+/// The startup order in architecture.md names the six lifecycle phases in the
+/// order the daemon publishes them (Foundations §6), and no longer claims the
+/// metrics endpoint binds after recovery.
+#[test]
+fn the_startup_order_doc_lists_the_phases_in_order() {
+    let section = ARCHITECTURE
+        .split("### Startup order")
+        .nth(1)
+        .and_then(|s| s.split("\n## ").next())
+        .expect("docs/architecture.md must keep a `### Startup order` section");
+    let mut at = 0;
+    for phase in [
+        "initializing",
+        "recovering",
+        "handoff",
+        "binding",
+        "serving",
+        "shutting_down",
+    ] {
+        // Anchored on the diagram's arrow: the bare word also occurs in prose
+        // ("something binding in between"), which let a swapped diagram pass.
+        let step = format!("→ {phase}");
+        let pos = section[at..].find(&step).unwrap_or_else(|| {
+            panic!("`### Startup order` must name phase `{phase}` after the previous one")
+        });
+        at += pos + step.len();
+    }
+    assert!(
+        !section.contains("replay of sealed-but-unconfirmed segments into the drain channel"),
+        "the blocking replay is gone; the replay list is handed to the drain in memory"
+    );
+    assert!(
+        !ARCHITECTURE.contains("CancellationToken"),
+        "the socket layer takes a watch<ShutdownLevel>, not a CancellationToken"
+    );
+}

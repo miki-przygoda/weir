@@ -119,8 +119,10 @@ VOLUME ["/var/lib/weir/wab", "/run/weir"]
 
 # Weir's signal handlers expect SIGTERM for graceful shutdown. Make this
 # explicit so orchestrators that override Docker's default still get the
-# clean shutdown path. SIGTERM unwinds the pipeline in dependency order
-# and waits for in-flight connections to drain (shutdown_timeout_secs).
+# clean shutdown path. SIGTERM unwinds the pipeline in dependency order:
+# it goes lame duck, waits for in-flight connections (shutdown_timeout_secs),
+# seals, and gives the drain drain_shutdown_budget_secs; a second SIGTERM
+# forces it.
 # SIGHUP never stops it: `docker kill --signal=HUP` reloads TLS material when
 # tcp_bind is set and is a counted no-op otherwise.
 STOPSIGNAL SIGTERM

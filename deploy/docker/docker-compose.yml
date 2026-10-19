@@ -43,8 +43,8 @@ services:
     user: weir
 
     healthcheck:
-      # The metrics endpoint doubles as a liveness probe. It binds after WAB
-      # recovery and the startup replay, shortly before the producer socket.
+      # The metrics endpoint doubles as a liveness probe. It binds before WAB
+      # recovery, so it answers during a long recovery too.
       #
       # The runtime image (debian:bookworm-slim) ships ONLY ca-certificates —
       # there is NO wget or curl — so an HTTP-client probe would always fail with

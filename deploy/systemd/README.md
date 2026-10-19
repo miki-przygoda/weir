@@ -60,9 +60,11 @@ material only). Editing `weir.toml` or `weir.env` requires a restart.
 
 SIGHUP never stops the daemon:
 
-- **During startup** it is ignored. `main` sets SIGHUP to `SIG_IGN` before it
-  reads the config, and it stays ignored through WAB recovery and the startup
-  replay. A HUP in that window is dropped.
+- **During startup** it is ignored only until the runtime starts. `main` sets
+  SIGHUP to `SIG_IGN` before it reads the config; the runtime, and with it the
+  SIGHUP handler, starts right after the `wab_dir` lock and preflight, before
+  WAB recovery. A HUP before that point is dropped; from then on, recovery
+  included, it is served.
 - **Once the runtime is up** each SIGHUP is a reload request, counted in
   `weir_config_reloads_total{trigger="sighup",outcome=…}`:
   - **without TLS** (no `tcp_bind`): nothing is reloadable. The daemon logs
