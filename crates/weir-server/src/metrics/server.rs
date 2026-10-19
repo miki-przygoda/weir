@@ -880,6 +880,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_head_slot_is_released_before_the_route_phase() {
+        // Spec §5.8: the head slot covers the head phase only. An oversized
+        // head puts the handler into its 100 ms post-response drain; the peer
+        // keeps its half open, so the handler is still running when the
+        // response's FIN arrives. Its head slot must already be free.
+        let (state, _m) = routed(8);
+        let head = Arc::clone(&state.pools.head);
+        let addr = start(state).await;
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        let mut req = b"GET /livez HTTP/1.1\r\nX-Pad: ".to_vec();
+        req.extend(std::iter::repeat_n(b'a', 6000));
+        s.write_all(&req).await.unwrap();
+        let mut out = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), s.read_to_end(&mut out))
+            .await
+            .expect("response within 5 s")
+            .expect("a full response, not a reset");
+        assert!(out.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        // `s` is still open, so the handler is inside its drain window.
+        assert_eq!(
+            head.available_permits(),
+            HEAD_READ_SLOTS,
+            "the head slot was held past the head phase"
+        );
+        drop(s);
+    }
+
+    #[tokio::test]
     async fn metrics_only_keeps_the_any_path_contract() {
         let (_m, registry) = Metrics::new();
         let registry = Arc::new(registry);
