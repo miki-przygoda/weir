@@ -382,6 +382,111 @@ class TestSigtermInRecovery(unittest.TestCase):
                          "recovery has no bound of its own, so alive is not an anomaly")
 
 
+def ok_reply(result):
+    return {"v": 1, "id": 1, "instance": {}, "ok": True, "result": result}
+
+
+PAUSED = ok_reply({"generation": 1, "pause_requested": True,
+                   "paused": True, "held": False})
+RESUMED = ok_reply({"generation": 1, "pause_requested": False, "was_paused": True})
+
+
+class TestAdminPauseResume(unittest.TestCase):
+    def step(self, cut_while_paused=False):
+        return {"pause_hold_secs": 4.0, "cut_while_paused": cut_while_paused,
+                "cut_after_secs": 1.0}
+
+    def ops(self, **kw):
+        kw.setdefault("admin_replies", {"drain.pause": PAUSED, "drain.resume": RESUMED})
+        kw.setdefault("scrapes", [{faults.PAUSED_SERIES: 1.0}])
+        kw.setdefault("delivered", [100, 100])
+        return FakeOps(**kw)
+
+    def test_pause_hold_resume_then_cut(self):
+        ops = self.ops()
+        r = faults.run_trigger("admin_pause_resume", self.step(), ops)
+        self.assertEqual(ops.names(), ["admin", "scrape", "admin", "cut"])
+        self.assertEqual(ops.calls[0][1], "drain.pause")
+        self.assertAlmostEqual(ops.calls[2][2], 4.0, delta=0.01)
+        self.assertAlmostEqual(ops.calls[3][1], 5.0, delta=0.01)
+        self.assertEqual(r["action"], "resume")
+        self.assertTrue(r["was_paused"])
+        self.assertEqual(r["delivered_while_paused_bytes"], 0)
+        self.assertEqual(r["anomaly_reasons"], [])
+
+    def test_a_cut_while_paused_never_resumes(self):
+        ops = self.ops()
+        r = faults.run_trigger("admin_pause_resume", self.step(True), ops)
+        self.assertEqual(ops.names(), ["admin", "scrape", "cut"])
+        self.assertEqual(r["action"], "cut_while_paused")
+
+    def test_deliveries_while_paused_are_an_anomaly(self):
+        r = faults.run_trigger("admin_pause_resume", self.step(),
+                               self.ops(delivered=[100, 250]))
+        self.assertIn("delivered_while_paused(bytes=150)", r["anomaly_reasons"])
+
+    def test_held_counts_as_paused(self):
+        held = ok_reply({"generation": 1, "pause_requested": True,
+                         "paused": False, "held": True})
+        r = faults.run_trigger("admin_pause_resume", self.step(), self.ops(
+            admin_replies={"drain.pause": held, "drain.resume": RESUMED}))
+        self.assertTrue(r["pause_observed"])
+        self.assertEqual(r["anomaly_reasons"], [])
+
+    def test_requested_but_not_observed_is_an_anomaly_and_no_leak_is_judged(self):
+        late = ok_reply({"generation": 1, "pause_requested": True,
+                         "paused": False, "held": False})
+        r = faults.run_trigger("admin_pause_resume", self.step(), self.ops(
+            admin_replies={"drain.pause": late,
+                           "drain.resume": ok_reply({"was_paused": False})},
+            delivered=[100, 999]))
+        self.assertEqual(r["anomaly_reasons"], ["pause_not_observed"])
+
+    def test_a_refused_pause_is_an_anomaly(self):
+        refused = {"v": 1, "id": 1, "instance": {}, "ok": False,
+                   "error": {"code": "shutting_down", "message": "m", "retryable": False}}
+        r = faults.run_trigger("admin_pause_resume", self.step(), self.ops(
+            admin_replies={"drain.pause": refused, "drain.resume": RESUMED}))
+        self.assertIn("admin_pause_refused(shutting_down)", r["anomaly_reasons"])
+
+    def test_an_identity_mismatch_is_an_anomaly_and_the_episode_still_cuts(self):
+        import admin
+        ops = self.ops(admin_replies={
+            "drain.pause": admin.AdminError("identity mismatch: peer uid 1000"),
+            "drain.resume": RESUMED})
+        r = faults.run_trigger("admin_pause_resume", self.step(), ops)
+        self.assertTrue(r["anomaly_reasons"][0].startswith("admin_error(drain.pause"))
+        self.assertEqual(ops.names()[-1], "cut")
+
+    def test_a_resume_that_did_not_see_the_pause_is_an_anomaly(self):
+        r = faults.run_trigger("admin_pause_resume", self.step(), self.ops(
+            admin_replies={"drain.pause": PAUSED,
+                           "drain.resume": ok_reply({"was_paused": False})}))
+        self.assertIn("resume_did_not_see_pause", r["anomaly_reasons"])
+
+    def test_the_paused_gauge_must_agree(self):
+        r = faults.run_trigger("admin_pause_resume", self.step(),
+                               self.ops(scrapes=[{faults.PAUSED_SERIES: 0.0}]))
+        self.assertIn("paused_gauge_not_set(0.0)", r["anomaly_reasons"])
+
+
+class TestPlanFeedsTriggers(unittest.TestCase):
+    """Task 9.17 passes `fault_plan`'s steps straight to `run_trigger`. The
+    trigger tests above build their steps by hand, so this is the test that
+    catches a key a trigger reads but the plan never writes."""
+
+    def test_every_kind_runs_on_its_own_plan_step(self):
+        rec = {"kind": "sigterm_in_recovery", "cut": "power_loss", "cut_lo_ms": 0,
+               "cut_hi_ms": 8000, "recovery_delay_ms": 3000}
+        for kind, cfg in (("sigterm_at", SIGTERM_AT), ("double_sigterm", DOUBLE),
+                          ("sigterm_in_recovery", rec), ("admin_pause_resume", ADMIN)):
+            with self.subTest(kind):
+                step = faults.fault_plan(1, 1, kind, cfg)[0]
+                ops = FakeOps(scrapes=[{faults.RECOVERING_SERIES: 1.0, faults.PAUSED_SERIES: 1.0}],
+                              admin_replies={"drain.pause": PAUSED, "drain.resume": RESUMED})
+                faults.run_trigger(kind, step, ops)
+
+
 class TestDaemonLogContract(unittest.TestCase):
     """The triggers judge weir by two log lines, two env vars and two series
     that PR 1, PR 2 and PR 4 introduce. Pin them against the source so a

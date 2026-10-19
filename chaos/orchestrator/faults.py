@@ -398,10 +398,85 @@ def _sigterm_in_recovery(step, ops):
     return result
 
 
+ADMIN_WAIT_MS = 5000
+#: Covers the recorder finishing the response that was in flight when the
+#: pause took effect (it fsyncs before its 200), so growth after this point
+#: is a delivery the paused drain started.
+PAUSE_SETTLE_SECS = 1.0
+
+
+def _admin(ops, verb, args):
+    try:
+        return ops.admin(verb, args), None
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+
+
+def _error_code(reply):
+    return (reply.get("error") or {}).get("code", "unknown")
+
+
+def _admin_pause_resume(step, ops):
+    """drain.pause under live load, hold, then either drain.resume and cut, or
+    cut while still paused. Pause is in-memory only, so the restart after the
+    cut resumes delivery. spec §8/§15: pause adds no duplicates and loses
+    nothing; the cut's own window is the only duplicate source."""
+    result = {"trigger": "admin_pause_resume",
+              "action": "cut_while_paused" if step["cut_while_paused"] else "resume",
+              "pause_hold_secs": round(step["pause_hold_secs"], 3),
+              "cut_after_secs": round(step["cut_after_secs"], 3)}
+    reasons = []
+    t0 = ops.now()
+    reply, err = _admin(ops, "drain.pause", {"wait_ms": ADMIN_WAIT_MS})
+    observed = False
+    if err:
+        reasons.append(f"admin_error(drain.pause: {err})")
+    elif not reply.get("ok"):
+        reasons.append(f"admin_pause_refused({_error_code(reply)})")
+    else:
+        r = reply.get("result") or {}
+        result.update(paused=bool(r.get("paused")), held=bool(r.get("held")),
+                      generation=r.get("generation"))
+        observed = result["paused"] or result["held"]
+        if not observed:
+            reasons.append("pause_not_observed")
+    result["pause_observed"] = observed
+    ops.sleep(PAUSE_SETTLE_SECS)
+    before = ops.delivered_bytes()
+    try:
+        gauge = ops.scrape().get(PAUSED_SERIES)
+    except Exception:
+        gauge = None
+    result["paused_gauge"] = gauge
+    if observed and gauge != 1.0:
+        reasons.append(f"paused_gauge_not_set({gauge})")
+    ops.sleep(t0 + step["pause_hold_secs"] - ops.now())
+    leak = ops.delivered_bytes() - before
+    result["delivered_while_paused_bytes"] = leak
+    if observed and leak > 0:
+        reasons.append(f"delivered_while_paused(bytes={leak})")
+    if not step["cut_while_paused"]:
+        reply, err = _admin(ops, "drain.resume", {"wait_ms": ADMIN_WAIT_MS})
+        if err:
+            reasons.append(f"admin_error(drain.resume: {err})")
+        elif not reply.get("ok"):
+            reasons.append(f"admin_resume_refused({_error_code(reply)})")
+        else:
+            was = bool((reply.get("result") or {}).get("was_paused"))
+            result["was_paused"] = was
+            if observed and not was:
+                reasons.append("resume_did_not_see_pause")
+    ops.sleep(step["cut_after_secs"])
+    result["canary"] = ops.cut()
+    result["anomaly_reasons"] = reasons
+    return result
+
+
 def run_trigger(kind, step, ops):
     """Runs one lifecycle trigger and the cut that ends it. Returns its record."""
     handlers = {"sigterm_at": _sigterm_at, "double_sigterm": _double_sigterm,
-                "sigterm_in_recovery": _sigterm_in_recovery}
+                "sigterm_in_recovery": _sigterm_in_recovery,
+                "admin_pause_resume": _admin_pause_resume}
     handler = handlers.get(kind)
     if handler is None:
         raise ValueError(f"not a lifecycle trigger: {kind!r}")
