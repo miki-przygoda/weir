@@ -68,11 +68,18 @@ pub struct SocketConfig {
     /// Per-connection idle read timeout in seconds. Caps slowloris-style
     /// connections that never send (or stall mid-frame).
     pub connection_read_timeout_secs: u64,
-    /// Total number of WAB shards. The accept loop assigns each new
-    /// connection a shard_id by round-robin (counter % shard_count) so
-    /// multi-shard deployments actually fan work across all per-shard
-    /// flusher threads. With shard_count = 1 every connection gets
-    /// shard_id = 0.
+    /// Total number of WAB shards. Informational in production: the accept
+    /// loop assigns each new connection a shard through the
+    /// [`route::ShardRouter`] it is handed (live-shard routing). Only the
+    /// `#[cfg(test)]` [`run`] wrapper reads it, to build today's round-robin
+    /// router (counter % shard_count).
+    #[cfg_attr(
+        not(test),
+        allow(
+            dead_code,
+            reason = "read only by the #[cfg(test)] run wrapper; production routing is the ShardRouter's"
+        )
+    )]
     pub shard_count: usize,
     /// When true, the accept loop refuses connections whose peer effective
     /// uid (via SO_PEERCRED / getpeereid) does not match the daemon's. See
@@ -93,14 +100,72 @@ pub struct SocketConfig {
     /// then Nacked before it reaches the queue. The SAME `Arc` every listener
     /// and the `wab_dir` integrity thread get.
     pub wab_ownership_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// The status board, when the daemon runs one. `run` marks the Unix
-    /// listener Bound and the daemon Serving once the socket is bound (every
-    /// other listener is bound before `run` is called), Failed on a bind
-    /// error and Closed on return. PR 3's bind/serve split keeps the hook.
+    /// The status board, when the daemon runs one. One writer per mark
+    /// (README Q6): [`bind`] marks the Unix listener Bound, or Failed on a
+    /// validation or bind error; [`serve`] enters the Serving phase (every
+    /// listener is bound before it is called) and marks the Unix listener
+    /// Closed on return.
     pub board: Option<std::sync::Arc<crate::status::StatusBoard>>,
 }
 
-/// Binds a Unix socket, accepts connections, and drives the frame-parsing layer.
+/// A bound producer (or admin) Unix socket: the path it was bound at plus the
+/// identity of the inode it created (spec §5.7 `BoundUnix`; the identity is
+/// the safety floor's [`BoundSocket`], which [`remove_own_socket`] checks).
+/// Also the SP-N seam: an inherited fd would produce one of these.
+#[derive(Debug)]
+pub(crate) struct BoundUnix {
+    pub(crate) path: PathBuf,
+    pub(crate) socket: BoundSocket,
+}
+
+/// Binds the producer socket: path validation plus the hardened bind, moved
+/// out of the accept loop so startup can bind every listener before serving
+/// any (spec §5.7). A live socket at the path is refused inside
+/// [`bind_hardened`] (safety floor).
+///
+/// README Q6: `bind` is the only writer of the Unix listener's Bound / Failed
+/// marks; [`serve`] writes Serving and Closed; `main` writes neither.
+#[cfg(unix)]
+pub(crate) fn bind(config: &SocketConfig) -> io::Result<BoundUnix> {
+    let failed = |_: &io::Error| {
+        if let Some(b) = &config.board {
+            b.listeners.unix.set(weir_status::ListenerState::Failed);
+        }
+    };
+    validate_socket_path(&config.socket_path).inspect_err(failed)?;
+    let socket = bind_hardened(&config.socket_path).inspect_err(failed)?;
+    if let Some(b) = &config.board {
+        b.listeners.unix.set(weir_status::ListenerState::Bound);
+    }
+    info!(path = %config.socket_path.display(), "socket bound");
+    Ok(BoundUnix {
+        path: config.socket_path.clone(),
+        socket,
+    })
+}
+
+/// bind + serve with today's round-robin routing. Test-only: production binds
+/// every listener first (`bind_all`) and serves with live-shard routing.
+#[cfg(test)]
+pub async fn run(
+    config: SocketConfig,
+    queue_tx: QueueSender<WorkUnit>,
+    shutdown_rx: oneshot::Receiver<()>,
+    metrics: std::sync::Arc<Metrics>,
+    sem: std::sync::Arc<Semaphore>,
+) -> io::Result<()> {
+    let bound = bind(&config)?;
+    let router = route::ShardRouter::round_robin(config.shard_count);
+    serve(config, bound, queue_tx, shutdown_rx, metrics, sem, router).await
+}
+
+/// Accepts on an already-bound socket (see [`bind`]) and drives the
+/// frame-parsing layer.
+///
+/// Each accepted connection is pinned to the shard `router` picks for it; when
+/// no shard can take ingest the connection is dropped before any frame is read
+/// and counted (`weir_connections_refused_no_live_shard_total`), and the loop
+/// keeps accepting.
 ///
 /// Returns when `shutdown_rx` fires or is dropped. Before returning, waits up to
 /// `config.shutdown_timeout_secs` for all in-flight connections to finish.
@@ -113,7 +178,8 @@ pub struct SocketConfig {
 ///
 /// # Bind sequence (TOCTOU hardening)
 ///
-/// The bind sequence is implemented in `bind_hardened`. It uses a dirfd to pin
+/// The bind happens in [`bind`], before this is called; the sequence itself is
+/// implemented in `bind_hardened`. It uses a dirfd to pin
 /// the parent directory, a connect-only liveness probe so it never removes a
 /// socket another process is listening on, `unlinkat` to clear a stale socket
 /// without following symlinks, a tightened umask so `bind(2)` creates the
@@ -125,30 +191,24 @@ pub struct SocketConfig {
 ///
 /// # Shutdown removal
 ///
-/// On the way out `run` removes the socket file only if the path still names
+/// On the way out `serve` removes the socket file only if the path still names
 /// the inode it bound ([`remove_own_socket`]). A successor that replaced the
 /// socket while this instance was running keeps its socket.
-pub async fn run(
+pub async fn serve(
     config: SocketConfig,
+    bound: BoundUnix,
     queue_tx: QueueSender<WorkUnit>,
     shutdown_rx: oneshot::Receiver<()>,
     metrics: std::sync::Arc<Metrics>,
     sem: std::sync::Arc<Semaphore>,
+    router: route::ShardRouter,
 ) -> io::Result<()> {
-    let mark = |state: weir_status::ListenerState| {
-        if let Some(b) = &config.board {
-            b.listeners.unix.set(state);
-        }
-    };
-    validate_socket_path(&config.socket_path)
-        .inspect_err(|_| mark(weir_status::ListenerState::Failed))?;
-    let bound = bind_hardened(&config.socket_path)
-        .inspect_err(|_| mark(weir_status::ListenerState::Failed))?;
-    let listener = &bound.listener;
+    let listener = &bound.socket.listener;
 
-    info!(path = %config.socket_path.display(), "socket listening");
+    info!(path = %bound.path.display(), "socket listening");
+    // README Q6: `serve` is the only writer of the Serving phase. The Bound
+    // mark is `bind`'s.
     if let Some(b) = &config.board {
-        b.listeners.unix.set(weir_status::ListenerState::Bound);
         b.enter_phase(weir_status::Phase::Serving, &metrics);
     }
 
@@ -176,13 +236,10 @@ pub async fn run(
     // stays here; each spawned handler clones the receiver. When shutdown
     // fires we send true; handlers see it on their next read-loop iteration.
     let (handler_shutdown_tx, handler_shutdown_rx) = tokio::sync::watch::channel(false);
-    // Round-robin connection counter for shard_id assignment. Wraps via
-    // modulo at each use; the counter itself can grow without bound for
-    // ~600 years of acceptances at 1M/s, so no overflow handling needed.
+    // Connection counter the router assigns shards from (the n-th accepted
+    // connection). The counter itself can grow without bound for ~600 years of
+    // acceptances at 1M/s, so no overflow handling needed.
     let conn_counter = std::sync::atomic::AtomicU64::new(0);
-    // Guard against shard_count = 0 — Config validation enforces ≥ 1, but
-    // the local guard documents the invariant and keeps the modulo safe.
-    let shard_count = config.shard_count.max(1) as u64;
 
     // Daemon's effective uid; compared against peer uid on each accept when
     // peer_uid_check is enabled. Read once at startup — the daemon never
@@ -238,6 +295,16 @@ pub async fn run(
                                 }
                             }
                         }
+                        // Pin the connection to a shard that can take ingest
+                        // (spec §5.7). None live: drop it before any frame is
+                        // read, so the producer sees a closed connection and
+                        // retries, as with the connection cap below.
+                        let n = conn_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(shard_id) = router.pick(n) else {
+                            router.refuse(&metrics, "unix");
+                            drop(stream);
+                            continue;
+                        };
                         let Ok(permit) = sem.clone().try_acquire_owned() else {
                             warn!(
                                 "connection limit ({}) reached; dropping connection",
@@ -248,8 +315,7 @@ pub async fn run(
                         };
                         let tx = queue_tx.clone();
                         let mut cfg = conn_cfg_template.clone();
-                        let n = conn_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        cfg.shard_id = (n % shard_count) as u32;
+                        cfg.shard_id = shard_id;
                         let m = std::sync::Arc::clone(&metrics);
                         let handler_shutdown = handler_shutdown_rx.clone();
                         join_set.spawn(async move {
@@ -319,12 +385,11 @@ pub async fn run(
     // removal uses the hardened dirfd + fstatat + unlinkat sequence so a
     // by-name remove can't be redirected by a swapped-in inode (F28).
     // Best-effort: the daemon is exiting, so a failure is logged, not fatal.
-    #[cfg(unix)]
-    remove_own_socket(&config.socket_path, &bound);
-    #[cfg(not(unix))]
-    let _ = std::fs::remove_file(&config.socket_path);
+    remove_own_socket(&bound.path, &bound.socket);
     drop(bound);
-    mark(weir_status::ListenerState::Closed);
+    if let Some(b) = &config.board {
+        b.listeners.unix.set(weir_status::ListenerState::Closed);
+    }
     Ok(())
 }
 
@@ -2413,6 +2478,122 @@ mod tests {
             std::fs::metadata(&sub).unwrap().permissions().mode() & 0o777,
             0o700
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── bind / serve split and live-shard routing (PR 3 Task 3.10) ───────────
+
+    /// `bind` binds and returns; nothing accepts until `serve` runs. The
+    /// kernel backlog still completes a connect, so the test checks that no
+    /// frame is answered rather than that the connect fails.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn bind_returns_a_bound_socket_that_serve_then_serves() {
+        let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = umask_immune_dir("bind_then_serve");
+        let path = dir.join("weir.sock");
+        let board = crate::status::test_board(1, 1);
+        let mut cfg = default_config(path.clone());
+        cfg.board = Some(std::sync::Arc::clone(&board));
+        let bound = bind(&cfg).unwrap();
+        assert_eq!(bound.path, path);
+        assert!(path.exists());
+        // README Q6: `bind` is the one writer of the Unix Bound mark; Serving
+        // is `serve`'s, and nothing serves yet.
+        assert_eq!(
+            board.listeners.unix.get(),
+            weir_status::ListenerState::Bound
+        );
+        assert_ne!(board.life.phase(), weir_status::Phase::Serving);
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (queue_tx, _queue_rx) = queue::new::<WorkUnit>(1);
+        let sem = std::sync::Arc::new(Semaphore::new(cfg.max_connections));
+        let handle = tokio::spawn(serve(
+            cfg,
+            bound,
+            queue_tx,
+            shutdown_rx,
+            test_metrics(),
+            sem,
+            route::ShardRouter::round_robin(1),
+        ));
+        let _conn = UnixStream::connect(&path).await.unwrap();
+        // The connect can complete from the kernel backlog before the spawned
+        // `serve` has run its first line, so wait for the phase rather than
+        // assume it.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while board.life.phase() != weir_status::Phase::Serving {
+            assert!(Instant::now() < deadline, "serve never entered Serving");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            board.listeners.unix.get(),
+            weir_status::ListenerState::Bound,
+            "serve does not write Bound"
+        );
+        shutdown_tx.send(()).unwrap();
+        time::timeout(Duration::from_secs(3), handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(!path.exists(), "serve removes the socket it was handed");
+        assert_eq!(
+            board.listeners.unix.get(),
+            weir_status::ListenerState::Closed
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// With no live shard the connection is dropped before any frame and
+    /// counted; the accept loop keeps running.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn serve_drops_and_counts_a_connection_when_no_shard_is_live() {
+        struct NoneLive;
+        impl route::LiveShards for NoneLive {
+            fn pick_live(&self, _n: u64) -> Option<u32> {
+                None
+            }
+        }
+        let _g = umask_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = umask_immune_dir("no_live_shard");
+        let path = dir.join("weir.sock");
+        let cfg = default_config(path.clone());
+        let bound = bind(&cfg).unwrap();
+        let metrics = test_metrics();
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (queue_tx, _queue_rx) = queue::new::<WorkUnit>(1);
+        let sem = std::sync::Arc::new(Semaphore::new(cfg.max_connections));
+        let router = route::ShardRouter::live(std::sync::Arc::new(NoneLive));
+        let handle = tokio::spawn(serve(
+            cfg,
+            bound,
+            queue_tx,
+            shutdown_rx,
+            std::sync::Arc::clone(&metrics),
+            sem,
+            router,
+        ));
+
+        for _ in 0..2 {
+            let mut conn = UnixStream::connect(&path).await.unwrap();
+            let mut buf = [0u8; 1];
+            let n = time::timeout(Duration::from_secs(2), conn.read(&mut buf))
+                .await
+                .unwrap()
+                .unwrap_or(0);
+            assert_eq!(n, 0, "the daemon must close the connection without a byte");
+        }
+        assert_eq!(metrics.connections_refused_no_live_shard.get(), 2);
+
+        shutdown_tx.send(()).unwrap();
+        time::timeout(Duration::from_secs(3), handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         std::fs::remove_dir_all(&dir).ok();
     }
 }

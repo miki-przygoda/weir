@@ -1032,6 +1032,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // from the same permit pool — true global cap.
                     let tcp_sem = Arc::clone(&conn_sem);
                     let tcp_board = Arc::clone(&board);
+                    let tcp_router = socket::route::ShardRouter::round_robin(config.shard_count);
                     let tcp_join = tokio::spawn(async move {
                         // tcp::run owns the handler-shutdown watch internally and
                         // signals handlers BEFORE draining — no extra plumbing needed here.
@@ -1043,6 +1044,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             tcp_sem,
                             tcp_shutdown_rx,
                             tcp_metrics,
+                            tcp_router,
                         )
                         .await;
                         match res {
@@ -1111,7 +1113,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 wab_ownership_lost: Arc::clone(&wab_ownership_lost),
                 board: Some(Arc::clone(&board)),
             };
-            socket::run(socket_config, queue_tx, shutdown_rx, Arc::clone(&metrics), conn_sem).await?;
+            let bound = socket::bind(&socket_config)?;
+            let router = socket::route::ShardRouter::round_robin(config.shard_count);
+            socket::serve(
+                socket_config,
+                bound,
+                queue_tx,
+                shutdown_rx,
+                Arc::clone(&metrics),
+                conn_sem,
+                router,
+            )
+            .await?;
         }
         #[cfg(not(unix))]
         {
