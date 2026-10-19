@@ -133,6 +133,43 @@ impl Lifecycle {
         self.board.life.phase()
     }
 
+    /// Installs the SIGTERM and SIGINT handlers (synchronously, so they are in
+    /// place when this returns) and spawns the task that turns EVERY delivery
+    /// into a `request_shutdown`. Replaces the one-shot task that took the
+    /// first signal and then exited, after which a second SIGTERM was
+    /// swallowed. Must be called inside the runtime. tokio coalesces
+    /// deliveries that arrive before the task is polled, so two signals sent
+    /// microseconds apart may count as one.
+    #[cfg(unix)]
+    pub(crate) fn spawn_signal_task(self: &Arc<Self>) -> std::io::Result<()> {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut term = signal(SignalKind::terminate())?;
+        let mut int = signal(SignalKind::interrupt())?;
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                let cause = tokio::select! {
+                    s = term.recv() => match s { Some(()) => "SIGTERM", None => break },
+                    s = int.recv() => match s { Some(()) => "SIGINT", None => break },
+                };
+                me.request_shutdown(cause);
+            }
+        });
+        Ok(())
+    }
+
+    /// Non-Unix builds have no producer listener; Ctrl-C still escalates.
+    #[cfg(not(unix))]
+    pub(crate) fn spawn_signal_task(self: &Arc<Self>) -> std::io::Result<()> {
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            while tokio::signal::ctrl_c().await.is_ok() {
+                me.request_shutdown("Ctrl-C");
+            }
+        });
+        Ok(())
+    }
+
     /// Resolves once the level leaves `Running`.
     pub(crate) async fn wait_shutdown(&self) -> ShutdownLevel {
         let mut rx = self.subscribe();
@@ -326,5 +363,30 @@ mod tests {
             f.board.life.ever_served(),
             "PR 1's enter(Serving) sets ever_served"
         );
+    }
+
+    /// Two SIGTERMs to this very process: Graceful, then Forced. The handler
+    /// is installed (synchronously) before the first kill, so the test binary
+    /// is never terminated by the default disposition.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn repeated_sigterm_escalates_graceful_then_forced() {
+        let f = fx();
+        f.lc.spawn_signal_task()
+            .expect("install the SIGTERM/SIGINT handlers");
+        let mut rx = f.lc.subscribe();
+        // SAFETY: kill(2) on our own pid with a handler installed above.
+        assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGTERM) }, 0);
+        let level = tokio::time::timeout(Duration::from_secs(1), shutdown_requested(&mut rx))
+            .await
+            .expect("the first SIGTERM must reach the lifecycle");
+        assert_eq!(level, ShutdownLevel::Graceful);
+        // tokio coalesces signals that arrive before the task is polled.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // SAFETY: as above.
+        assert_eq!(unsafe { libc::kill(libc::getpid(), libc::SIGTERM) }, 0);
+        tokio::time::timeout(Duration::from_secs(1), forced(&mut rx))
+            .await
+            .expect("a second SIGTERM must force, not be swallowed");
     }
 }
