@@ -4,6 +4,95 @@
 //! `summary_templates_take_no_free_text` enforces this on the source itself.
 //! Keep each signature on ONE line; the test parses them.
 
+use crate::evidence::{ListenerKind, OfflineReason, Phase};
+use crate::rules::AckTimeoutCause;
+
+fn join_ids(ids: &[u16]) -> String {
+    ids.iter().map(u16::to_string).collect::<Vec<_>>().join(",")
+}
+
+pub(crate) fn starting(phase: Phase, secs: u64) -> String {
+    format!(
+        "startup phase {} for {secs}s; the producer socket binds after recovery seals open segments",
+        phase.as_str()
+    )
+}
+
+pub(crate) fn shutting_down(left_secs: Option<u64>, budget_secs: Option<u64>) -> String {
+    match (left_secs, budget_secs) {
+        (Some(left), Some(budget)) => {
+            format!(
+                "graceful shutdown; new connections refused; drain has {left}s of its {budget}s budget"
+            )
+        }
+        _ => "graceful shutdown; new connections refused".to_string(),
+    }
+}
+
+pub(crate) fn listener_down(kind: ListenerKind) -> String {
+    format!(
+        "{} listener is not accepting; restart re-binds it",
+        kind.as_str()
+    )
+}
+
+pub(crate) fn no_live_shard() -> String {
+    "every shard's flusher or owning worker is offline; new connections are refused; restart re-runs recovery"
+        .to_string()
+}
+
+pub(crate) fn shard_offline(ids: &[u16], reason: OfflineReason) -> String {
+    format!(
+        "shard(s) {} offline ({}); new connections avoid them; connections already pinned to them nack until they reconnect; restart to recover",
+        join_ids(ids),
+        reason.as_str()
+    )
+}
+
+pub(crate) fn worker_exited(worker: u16, shards: &[u16]) -> String {
+    format!(
+        "worker {worker} exited; shards {} cannot accept records",
+        join_ids(shards)
+    )
+}
+
+pub(crate) fn wab_cap_rejecting(bytes: u64, cap: u64, low_water: u64) -> String {
+    format!(
+        "WAB holds {bytes} of the {cap} cap; pushes nack until below {low_water}; the root cause is delivery (see drain/sink conditions)"
+    )
+}
+
+pub(crate) fn drain_backpressure(depth: Option<u64>, ids: &[u16], blocked_secs: u64) -> String {
+    let depth = depth.map_or_else(|| "unknown".to_string(), |d| d.to_string());
+    format!(
+        "drain channel {depth}/256; shard(s) {} blocked handing off for {blocked_secs}s; acks wait behind the hand-off, so producers see ACK_TIMEOUT nacks of durable records (delivery, not storage)",
+        join_ids(ids)
+    )
+}
+
+pub(crate) fn ack_timeouts_recent(count: u64, cause: AckTimeoutCause) -> String {
+    let why = match cause {
+        AckTimeoutCause::DeliveryStallingIngest => "delivery is stalling ingest",
+        AckTimeoutCause::StorageSlowOrFailing => "storage is slow or failing",
+        AckTimeoutCause::FlusherNotCompleting => "a flusher is not completing groups; check shards",
+    };
+    format!("{count} ack timeout(s) in the last 5 min; {why}")
+}
+
+pub(crate) fn wab_scan_stale(never: bool, age_secs: u64) -> String {
+    let tail =
+        "wab_max_bytes is enforced against a stale size (fail-closed); lag figures are stale";
+    if never {
+        format!("no successful WAB scan yet; {tail}")
+    } else {
+        format!("no successful WAB scan for {age_secs}s; {tail}")
+    }
+}
+
+pub(crate) fn wab_growing_unbounded() -> String {
+    "the WAB is growing while delivery is unhealthy and no wab_max_bytes is set; producers are acked into an unbounded buffer".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

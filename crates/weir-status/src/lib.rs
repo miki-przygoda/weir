@@ -11,8 +11,11 @@ pub mod codes;
 pub mod condition;
 pub mod config;
 pub mod evidence;
+mod rules;
 pub mod segment;
 mod summary;
+#[doc(hidden)]
+pub mod testing;
 
 pub use codes::{
     ALL, Affects, CATALOGUE, CatalogueEntry, ConditionCode, Gate, OFFLINE_ONLY, Severity, entry,
@@ -20,4 +23,5 @@ pub use codes::{
 pub use condition::*;
 pub use config::{ConfigValue, PublicConfig};
 pub use evidence::*;
+pub use rules::evaluate;
 pub use segment::SegmentId;
