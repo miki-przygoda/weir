@@ -528,7 +528,6 @@ impl WabPoll {
 
     /// Attaches the status half: the board the scan stamps, the cap flag and
     /// the growth verdict are published on.
-    #[cfg_attr(not(test), allow(dead_code))] // Task 1.23 wires the 5 s task
     pub(crate) fn with_status(mut self, status: PollStatus) -> Self {
         self.status = Some(status);
         self
@@ -793,7 +792,6 @@ pub(crate) struct PollStatus {
     seen_success_ms: Option<u64>,
 }
 
-#[cfg_attr(not(test), allow(dead_code))] // Task 1.23 wires the 5 s task
 impl PollStatus {
     pub(crate) fn new(
         board: Arc<StatusBoard>,
@@ -1234,7 +1232,6 @@ pub(crate) fn update_channel_high(board: &StatusBoard, now_ms: u64, high_depth: 
 /// The 500 ms task (spec §5.11): queue depth into the gauge and the board,
 /// and the channel high-water stamp. Holds a `queue_tx` clone: main aborts
 /// and awaits it at shutdown (from PR 4; today `drop(rt)` releases it).
-#[allow(dead_code)] // Task 1.23 replaces main's 500 ms task with it
 pub(crate) fn spawn_queue_depth_task(
     queue_tx: QueueSender<WorkUnit>,
     metrics: Arc<Metrics>,
@@ -1260,7 +1257,6 @@ pub(crate) fn spawn_queue_depth_task(
 /// scan fails and a cap is set, start rejecting until a poll scan succeeds.
 ///
 /// Returns the scanned size, or `None` when the scan failed.
-#[cfg_attr(not(test), allow(dead_code))] // Task 1.23 calls it from main
 pub(crate) fn startup_cap_gate(
     wab_dir: &Path,
     wab_max_bytes: u64,

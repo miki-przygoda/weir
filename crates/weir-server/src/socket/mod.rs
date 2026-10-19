@@ -86,6 +86,11 @@ pub struct SocketConfig {
     /// then Nacked before it reaches the queue. The SAME `Arc` every listener
     /// and the `wab_dir` integrity thread get.
     pub wab_ownership_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The status board, when the daemon runs one. `run` marks the Unix
+    /// listener Bound and the daemon Serving once the socket is bound (every
+    /// other listener is bound before `run` is called), Failed on a bind
+    /// error and Closed on return. PR 3's bind/serve split keeps the hook.
+    pub board: Option<std::sync::Arc<crate::status::StatusBoard>>,
 }
 
 /// Binds a Unix socket, accepts connections, and drives the frame-parsing layer.
@@ -123,11 +128,22 @@ pub async fn run(
     metrics: std::sync::Arc<Metrics>,
     sem: std::sync::Arc<Semaphore>,
 ) -> io::Result<()> {
-    validate_socket_path(&config.socket_path)?;
-    let bound = bind_hardened(&config.socket_path)?;
+    let mark = |state: weir_status::ListenerState| {
+        if let Some(b) = &config.board {
+            b.listeners.unix.set(state);
+        }
+    };
+    validate_socket_path(&config.socket_path)
+        .inspect_err(|_| mark(weir_status::ListenerState::Failed))?;
+    let bound = bind_hardened(&config.socket_path)
+        .inspect_err(|_| mark(weir_status::ListenerState::Failed))?;
     let listener = &bound.listener;
 
     info!(path = %config.socket_path.display(), "socket listening");
+    if let Some(b) = &config.board {
+        b.listeners.unix.set(weir_status::ListenerState::Bound);
+        b.enter_phase(weir_status::Phase::Serving, &metrics);
+    }
 
     let effective_cap = config
         .max_payload_bytes
@@ -301,6 +317,7 @@ pub async fn run(
     #[cfg(not(unix))]
     let _ = std::fs::remove_file(&config.socket_path);
     drop(bound);
+    mark(weir_status::ListenerState::Closed);
     Ok(())
 }
 
@@ -1212,6 +1229,7 @@ mod tests {
             wab_bytes_now: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             wab_cap_rejecting: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             wab_ownership_lost: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            board: None,
         }
     }
 
@@ -1804,6 +1822,62 @@ mod tests {
             "a clean shutdown must remove the daemon's own socket file"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// With a status board, `run` marks the Unix listener Bound and the
+    /// daemon Serving once the socket is bound, and Closed on return.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn run_marks_the_unix_listener_bound_then_serving_then_closed() {
+        use weir_status::{ListenerState, Phase};
+        let dir = umask_immune_dir("run_marks_board");
+        let path = dir.join("weir.sock");
+        let board = crate::status::test_board(1, 1);
+        let mut cfg = default_config(path.clone());
+        cfg.board = Some(std::sync::Arc::clone(&board));
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (queue_tx, _queue_rx) = queue::new::<WorkUnit>(1);
+        let sem = std::sync::Arc::new(Semaphore::new(cfg.max_connections));
+        assert_eq!(board.listeners.unix.get(), ListenerState::Pending);
+        let handle = tokio::spawn(run(cfg, queue_tx, shutdown_rx, test_metrics(), sem));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while UnixStream::connect(&path).await.is_err() {
+            assert!(Instant::now() < deadline, "run() never started listening");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(board.listeners.unix.get(), ListenerState::Bound);
+        assert_eq!(board.life.phase(), Phase::Serving);
+        assert!(board.life.ever_served());
+        shutdown_tx.send(()).unwrap();
+        time::timeout(Duration::from_secs(3), handle)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(board.listeners.unix.get(), ListenerState::Closed);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A socket path that fails validation (or binding) marks the Unix
+    /// listener Failed.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn a_bind_failure_marks_the_unix_listener_failed() {
+        let board = crate::status::test_board(1, 1);
+        let mut cfg = default_config(PathBuf::from("relative/weir.sock"));
+        cfg.board = Some(std::sync::Arc::clone(&board));
+        let (_shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (queue_tx, _queue_rx) = queue::new::<WorkUnit>(1);
+        let sem = std::sync::Arc::new(Semaphore::new(1));
+        assert!(
+            run(cfg, queue_tx, shutdown_rx, test_metrics(), sem)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            board.listeners.unix.get(),
+            weir_status::ListenerState::Failed
+        );
     }
 
     /// On Linux the bound socket inode is pinned with an `O_PATH` fd for the

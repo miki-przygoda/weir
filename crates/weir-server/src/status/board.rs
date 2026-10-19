@@ -885,7 +885,6 @@ impl StatusBoard {
 
     /// Moves the lifecycle phase and publishes `weir_startup_phase`.
     /// Refused (false) once shutting down, exactly as `LifecycleCell::enter`.
-    #[cfg_attr(not(test), allow(dead_code))] // Task 1.23 / PR 3 / PR 4 call this
     pub(crate) fn enter_phase(&self, phase: Phase, metrics: &crate::metrics::Metrics) -> bool {
         let moved = self.life.enter(phase, unix_ms_now());
         if moved {
@@ -897,7 +896,6 @@ impl StatusBoard {
     /// T0 (spec §7 a-b): the shared flag, the phase, and its gauge. True for
     /// the first caller only. PR 4's Lifecycle calls this; PR 1's signal task
     /// does.
-    #[cfg_attr(not(test), allow(dead_code))] // Task 1.23 / PR 4 call this
     pub(crate) fn begin_shutdown(&self, metrics: &crate::metrics::Metrics) -> bool {
         let first = self.life.begin_shutdown(unix_ms_now());
         if first {

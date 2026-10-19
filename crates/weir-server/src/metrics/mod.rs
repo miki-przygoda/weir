@@ -718,39 +718,28 @@ pub(crate) struct Metrics {
     pub build_info: Family<BuildInfoLabel, Gauge<f64, AtomicU64>>,
     pub start_time_seconds: Gauge<f64, AtomicU64>,
     pub startup_phase: Family<StartupPhaseLabel, Gauge<f64, AtomicU64>>,
-    #[allow(dead_code)] // written from the 5 s poll task (Task 1.22)
     pub ready: Gauge<f64, AtomicU64>,
-    #[allow(dead_code)] // written from the 5 s poll task (Task 1.22)
     pub live: Gauge<f64, AtomicU64>,
     pub condition_active: Family<ConditionLabel, Gauge<f64, AtomicU64>>,
     pub wab_shard_up: Family<ShardLabel, Gauge<f64, AtomicU64>>,
     pub wab_handoff_blocked_seconds: Family<ShardLabel, Gauge<f64, AtomicU64>>,
     pub worker_up: Family<WorkerLabel, Gauge<f64, AtomicU64>>,
-    #[allow(dead_code)] // written from the 5 s poll task (Task 1.22)
     pub wab_cap_rejecting: Gauge<f64, AtomicU64>,
-    #[allow(dead_code)] // written from the lag scan (Task 1.21)
     pub wab_undelivered_segments: Gauge<f64, AtomicU64>,
-    #[allow(dead_code)] // written from the lag scan (Task 1.21)
     pub wab_undelivered_records: Gauge<f64, AtomicU64>,
-    #[allow(dead_code)] // written from the lag scan (Task 1.21)
     pub wab_oldest_undelivered_age_seconds: Gauge<f64, AtomicU64>,
     pub wab_active_segment_age_seconds: Family<ShardLabel, Gauge<f64, AtomicU64>>,
     pub drain_pending_segments: Family<DrainQueueLabel, Gauge<f64, AtomicU64>>,
     #[allow(dead_code)] // written from PR 2 (the drain)
     pub drain_replay_remaining_segments: Gauge<f64, AtomicU64>,
-    #[allow(dead_code)] // written from the 5 s poll task (Task 1.22)
     pub drain_heartbeat_age_seconds: Gauge<f64, AtomicU64>,
-    #[allow(dead_code)] // written from PR 2 (the drain)
     pub drain_commit_in_flight_seconds: Gauge<f64, AtomicU64>,
     #[allow(dead_code)] // written from PR 2 (the drain)
     pub drain_paused: Gauge<f64, AtomicU64>,
     #[allow(dead_code)] // written from PR 2 (the drain)
     pub drain_generation: Gauge<f64, AtomicU64>,
-    #[allow(dead_code)] // written from PR 2 (the drain)
     pub sink_last_success_timestamp_seconds: Gauge<f64, AtomicU64>,
-    #[allow(dead_code)] // written from PR 2 (the drain)
     pub sink_last_failure_timestamp_seconds: Family<SinkFailureLabel, Gauge<f64, AtomicU64>>,
-    #[allow(dead_code)] // written from PR 2 (the drain)
     pub sink_consecutive_failures: Gauge<f64, AtomicU64>,
     pub config_wab_max_bytes: Gauge<f64, AtomicU64>,
     pub config_dead_letter_max_bytes: Gauge<f64, AtomicU64>,
@@ -1637,7 +1626,6 @@ impl Metrics {
 impl Metrics {
     /// Pre-creates the per-shard and per-worker series (spec §9.2 rule 6:
     /// after startup, `get_or_create` only ever takes the read lock).
-    #[cfg_attr(not(test), allow(dead_code))] // Task 1.23 calls this from main
     pub(crate) fn init_topology(&self, shard_count: usize, worker_count: usize) {
         for s in 0..shard_count {
             let l = ShardLabel::of(s);
@@ -1667,7 +1655,6 @@ impl Metrics {
     }
 
     /// `weir_build_info` and `weir_start_time_seconds`, once at startup.
-    #[cfg_attr(not(test), allow(dead_code))] // Task 1.23 calls this from main
     pub(crate) fn publish_build_info(&self, version: &str, wire_version: u8) {
         self.build_info
             .get_or_create(&BuildInfoLabel {
@@ -1683,7 +1670,6 @@ impl Metrics {
 
     /// The `weir_config_*` gauges: the effective values of the keys an
     /// operator most often needs next to a dashboard panel.
-    #[cfg_attr(not(test), allow(dead_code))] // Task 1.23 calls this from main
     pub(crate) fn publish_config(&self, c: &crate::config::Config) {
         self.config_wab_max_bytes.set(c.wab_max_bytes as f64);
         self.config_dead_letter_max_bytes

@@ -306,6 +306,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // needs them; nothing is served until the runtime binds the endpoint.
 
     let (metrics_struct, registry) = metrics::Metrics::new();
+    metrics_struct.init_topology(config.shard_count, config.worker_count);
+    metrics_struct.publish_build_info(env!("CARGO_PKG_VERSION"), weir_core::WIRE_VERSION);
+    metrics_struct.publish_config(&config);
     let metrics = Arc::new(metrics_struct);
     let registry = Arc::new(registry);
     metrics.wab_dir_lock_held.set(match lock_outcome {
@@ -317,7 +320,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //
     // Set once another instance provably owns the wab_dir (spec §3.1, D4b).
     // Created ONCE and cloned into every listener, like `wab_cap_rejecting`
-    // below; the integrity thread is the only writer. The thread starts now,
+    // (created with the status board below); the integrity thread is the only
+    // writer. The thread starts now,
     // so the check covers preflight, recovery and the startup replay as well
     // as the runtime: a deletion during those phases is caught within a tick,
     // and proven loss exits 3 before anything is served.
@@ -329,6 +333,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Arc::clone(&wab_ownership_lost),
         )?;
     }
+
+    // ── Status board (spec §6 step 3) ─────────────────────────────────────────
+    //
+    // Created before the WAB so the flushers' supervisors and the workers'
+    // drop guards publish into the same registry the poll task and (from PR 5)
+    // the probes read. `wab_bytes_now` / `wab_cap_rejecting` move up from inside
+    // the runtime: the startup cap gate below writes them before any listener
+    // exists, and every listener clones these same Arcs.
+    #[cfg(all(unix, feature = "tls"))]
+    let tcp_configured = config.tcp_bind.is_some();
+    #[cfg(not(all(unix, feature = "tls")))]
+    let tcp_configured = false;
+    // Most recent WAB byte count, refreshed by the startup cap gate and then
+    // every 5 s by the poll task. Shared with the connection handlers so the
+    // ingest path can consult the WAB size without doing any I/O of its own.
+    let wab_bytes_now = Arc::new(AtomicU64::new(0));
+    // Whether the WAB cap is currently rejecting pushes. Created ONCE here and
+    // cloned into every listener so the hysteresis low-water mark is
+    // daemon-wide: a per-listener flag would let the Unix and TCP sides
+    // disagree about whether ingest has resumed.
+    let wab_cap_rejecting = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let config_view = Arc::new(status::config_view::ConfigView::from(&config));
+    let board = status::StatusBoard::new(
+        status::board::StaticInfo::capture(&config, Arc::clone(&config_view)),
+        config.shard_count,
+        config.worker_count,
+        tcp_configured,
+        Arc::clone(&wab_cap_rejecting),
+        Arc::clone(&wab_bytes_now),
+    );
+    board.enter_phase(weir_status::Phase::Initializing, &metrics);
 
     // ── Preflight ─────────────────────────────────────────────────────────────
     //
@@ -411,22 +446,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         compression_level: config.wab_compression_level,
     };
-    // The shard registry: flusher supervisors and worker drop guards record
-    // each shard's and worker's state on it (spec §5.3). Declared before
-    // `wab::spawn`, which takes a clone. Task 1.23 replaces it with the
-    // status board's registry.
-    let worker_registry = Arc::new(status::ShardRegistry::new(
-        config.shard_count,
-        config.worker_count,
-        Arc::new(std::sync::atomic::AtomicBool::new(false)),
-    ));
+    // The status board's shard registry: flusher supervisors and worker drop
+    // guards record each shard's and worker's state on it (spec §5.3).
+    // Recovery runs inside `wab::spawn` (until PR 3 splits it out).
+    board.enter_phase(weir_status::Phase::Recovering, &metrics);
     let wab_handle = wab::spawn(
         config.wab_dir.clone(),
         wab_config,
         drain_tx,
         Arc::clone(&metrics),
         Arc::clone(&coalesce_hint),
-        Arc::clone(&worker_registry),
+        Arc::clone(&board.shards),
     )?;
 
     // ── Workers (queue → per-shard Batch channels → flusher directly) ────────
@@ -435,6 +465,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // returned by `wab::spawn`. No bridge thread: the hop is
     // worker → Batch-channel → flusher.
 
+    // The 5 s poll task reports the EWMA as evidence; the workers take the
+    // original.
+    let coalesce_hint_for_poll = Arc::clone(&coalesce_hint);
     let worker_handles = worker::spawn_workers_with(
         &queue_rx,
         wab_handle.shard_txs,
@@ -443,7 +476,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.batch_size,
         Duration::from_millis(config.batch_deadline_ms),
         coalesce_hint,
-        Some(Arc::clone(&worker_registry)),
+        Some(Arc::clone(&board.shards)),
     );
 
     // ── Drain ─────────────────────────────────────────────────────────────────
@@ -760,6 +793,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // larger than the channel capacity would otherwise dead-lock startup (B3).
     // Runs before the socket binds, so the recovery backlog is queued ahead of
     // any newly-accepted traffic.
+    board.enter_phase(weir_status::Phase::Handoff, &metrics);
     wab::replay_unconfirmed(
         &config.wab_dir,
         config.shard_count,
@@ -768,6 +802,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         orphan_cleanup,
     )?;
     drop(replay_tx); // release the startup sender so shutdown can close the drain channel
+
+    // Spec §6 step 9: the first size scan and cap evaluation run here,
+    // synchronously, before any producer listener exists (fail-closed).
+    status::poll::startup_cap_gate(&config.wab_dir, config.wab_max_bytes, &board, &metrics);
 
     // ── Tokio runtime: socket accept loop + metrics server ────────────────────
 
@@ -780,11 +818,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // handler replaces the SIG_IGN set at the top of main, and from here a
         // HUP is a counted reload request instead of a no-op drop. The TLS
         // branch below registers its config once it has loaded it.
-        #[cfg(all(unix, feature = "tls"))]
-        let tls_configured = config.tcp_bind.is_some();
-        #[cfg(not(all(unix, feature = "tls")))]
-        let tls_configured = false;
-        let reloader = reload::Reloader::new(Arc::clone(&metrics), tls_configured);
+        let reloader = reload::Reloader::new(Arc::clone(&metrics), tcp_configured);
         let reload_tx = reload::spawn_reload_loop(Arc::clone(&reloader));
         #[cfg(unix)]
         reload::spawn_sighup_task(reload_tx, Arc::clone(&metrics));
@@ -811,34 +845,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "metrics endpoint listening"
         );
 
-        // Background: poll queue depth every 500 ms.
-        let queue_tx_bg = queue_tx.clone();
-        let metrics_q = Arc::clone(&metrics);
-        tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(tokio::time::Duration::from_millis(500));
-            loop {
-                interval.tick().await;
-                metrics_q.queue_depth.set(queue_tx_bg.len() as f64);
-            }
-        });
+        // Background: queue depth and the drain channel's high-water stamp
+        // every 500 ms (spec §5.11).
+        let _queue_depth_task = status::poll::spawn_queue_depth_task(
+            queue_tx.clone(),
+            Arc::clone(&metrics),
+            Arc::clone(&board),
+        );
 
         // Background: scan WAB shard dirs for on-disk byte usage every 5 s.
         // The scan is synchronous I/O (read_dir + metadata per entry) so it
         // runs inside spawn_blocking — putting it directly on a tokio worker
         // would stall the runtime in proportion to the number of segments.
-        //
-        // Shared with the connection handlers so the ingest path can consult the
-        // WAB size without doing any I/O of its own — this task already walks
-        // the directory for the gauge, so the value is free.
-        let wab_bytes_now = Arc::new(std::sync::atomic::AtomicU64::new(0));
-
-        // Whether the WAB cap is currently rejecting pushes. Created ONCE here
-        // and cloned into every listener so the hysteresis low-water mark is
-        // daemon-wide: a per-listener flag would let the Unix and TCP sides
-        // disagree about whether ingest has resumed.
-        let wab_cap_rejecting = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
+        // It also evaluates the conditions, latches them and publishes the
+        // status gauges (spec §5.11), on every tick.
         let wab_dir_bg = config.wab_dir.clone();
         let metrics_w = Arc::clone(&metrics);
         let wab_bytes_bg = Arc::clone(&wab_bytes_now);
@@ -865,7 +885,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 health_poll_interval_for_stall,
                 commit_timeout_for_stall,
             ),
-        );
+        )
+        .with_status(status::poll::PollStatus::new(
+            Arc::clone(&board),
+            config.wab_dir.clone(),
+            coalesce_hint_for_poll,
+        ));
         tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(tokio::time::Duration::from_secs(5));
@@ -895,6 +920,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         //
         // `tcp_shutdown_tx` is fired by the same signal handler as the Unix
         // loop's `shutdown_tx` so SIGTERM/Ctrl-C drains both listeners.
+        board.enter_phase(weir_status::Phase::Binding, &metrics);
         #[cfg(all(unix, feature = "tls"))]
         let (tcp_shutdown_tx, tcp_join) = {
             use socket::tcp::{self, TcpConfig};
@@ -918,6 +944,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .map_err(|e| preflight::tcp_bind_error(bind_addr, &e))?;
                     let actual_addr = listener.local_addr()?;
                     info!(addr = %actual_addr, "TCP+mTLS listener bound");
+                    board.listeners.tcp.set(weir_status::ListenerState::Bound);
 
                     let tcp_config = TcpConfig {
                         max_connections: config.max_connections,
@@ -946,6 +973,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Pass a clone of the shared semaphore so Unix + TCP draw
                     // from the same permit pool — true global cap.
                     let tcp_sem = Arc::clone(&conn_sem);
+                    let tcp_board = Arc::clone(&board);
                     let tcp_join = tokio::spawn(async move {
                         // tcp::run owns the handler-shutdown watch internally and
                         // signals handlers BEFORE draining — no extra plumbing needed here.
@@ -959,8 +987,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             tcp_metrics,
                         )
                         .await;
-                        if let Err(e) = res {
-                            tracing::error!(error = %e, "TCP+mTLS listener exited with error");
+                        match res {
+                            Ok(()) => tcp_board.listeners.tcp.set(weir_status::ListenerState::Closed),
+                            Err(e) => {
+                                tcp_board.listeners.tcp.set(weir_status::ListenerState::Failed);
+                                tracing::error!(error = %e, "TCP+mTLS listener exited with error");
+                            }
                         }
                     });
 
@@ -970,6 +1002,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
+        let board_sig = Arc::clone(&board);
+        let metrics_sig = Arc::clone(&metrics);
         tokio::spawn(async move {
             #[cfg(unix)]
             {
@@ -989,6 +1023,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .expect("failed to install Ctrl-C handler");
                 info!("received Ctrl-C, initiating shutdown");
             }
+            // T0 (spec §7 a-b): the board says shutting_down before any listener
+            // closes, so a flusher whose input closes from here on reads as a clean
+            // `Stopped`, not `Offline(FlusherExited)`. PR 4's Lifecycle takes this over.
+            board_sig.begin_shutdown(&metrics_sig);
             #[cfg(all(unix, feature = "tls"))]
             if let Some(tx) = tcp_shutdown_tx {
                 let _ = tx.send(());
@@ -1013,12 +1051,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 wab_bytes_now: Arc::clone(&wab_bytes_now),
                 wab_cap_rejecting: Arc::clone(&wab_cap_rejecting),
                 wab_ownership_lost: Arc::clone(&wab_ownership_lost),
+                board: Some(Arc::clone(&board)),
             };
             socket::run(socket_config, queue_tx, shutdown_rx, Arc::clone(&metrics), conn_sem).await?;
         }
         #[cfg(not(unix))]
         {
             // On non-Unix builds weir-server is not supported; just wait for shutdown.
+            board.enter_phase(weir_status::Phase::Serving, &metrics);
             let _ = shutdown_rx.await;
         }
 
