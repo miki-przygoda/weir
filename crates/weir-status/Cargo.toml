@@ -15,7 +15,6 @@ categories = ["development-tools::debugging"]
 # (de)serialise identically. serde is already in the lock tree (weir-server's
 # config parsing). No I/O, no clock, no tokio: `now` is always passed in.
 serde = { version = "1", features = ["derive"] }
-
-[dev-dependencies]
-# Golden documents and round-trip tests only. Already in the lock tree.
+# The admin protocol envelope (`admin.rs`) carries `id`, `args` and `result`
+# as `serde_json::Value`. Already in the lock tree.
 serde_json = "1"
