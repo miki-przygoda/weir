@@ -34,6 +34,13 @@ FINAL = "final"
 #: really does leave that many segments behind.
 MAX_SURVIVORS_SHOWN = 20
 
+#: The phase-2 corpus's duplicate rate, which the Foundations gate reports
+#: against (spec §16). Exactly 1.000 across the 5,311 episodes of the 24 h
+#: Durable power-loss run (`powerloss-durable.toml`, run 1729848005600002).
+PHASE2_DUPLICATE_RATE = 1.000
+PHASE2_DUPLICATE_RATE_SOURCE = (
+    "docs/benchmarks/chaos-phase2/2026-08-28-first-power-loss-measurement.md")
+
 
 def _dash(value):
     """Renders a missing value as an em dash rather than as a zero.
@@ -42,6 +49,55 @@ def _dash(value):
     that renders them identically is the kind that gets believed.
     """
     return "—" if value is None else value
+
+
+#: Mirrors run.CRASH_POSTMORTEM_FILE (report.py must not import run.py, which
+#: imports report). test_run.py pins the two together.
+CRASH_POSTMORTEM_FILE = "crash-postmortem.json"
+
+
+def render_crash_postmortem(crash):
+    """The WAB as `stack.teardown()` was about to unmount it, for a run that
+    ended on an exception before its final pass."""
+    lines = ["## Crash post-mortem\n"]
+    lines.append(
+        "The run ended on an exception before its final pass. This is what weir "
+        "left on disk at that moment: the only record of it, because teardown "
+        "unmounts the device next.\n"
+    )
+    lines.append(f"- **Reason:** {crash.get('reason')}")
+    lines.append(f"- **WAB dir:** `{crash.get('wab_dir')}`")
+    if crash.get("image_kept"):
+        lines.append(
+            f"- **Image kept for forensics:** `{crash['image_kept']}` "
+            "(loop-mount it read-only to inspect)")
+    if crash.get("wab_scan_error"):
+        lines.append(f"- **Scan error:** {crash['wab_scan_error']}")
+    residue = crash.get("wab_residue") or {}
+    for key in ("unconfirmed_sealed", "nonempty_active", "quarantined", "dead_letter"):
+        lines.append(f"- {key}: {_dash(residue.get(key))}")
+    survivors = crash.get("wab_survivors") or []
+    if survivors:
+        lines.append("")
+        lines.append("| Kind | Path | Size (bytes) |")
+        lines.append("|---|---|---|")
+        for s in survivors[:MAX_SURVIVORS_SHOWN]:
+            lines.append(f"| {s.get('kind')} | `{s.get('path')}` | {s.get('size')} |")
+        hidden = crash.get("wab_survivor_count", len(survivors)) - min(
+            len(survivors), MAX_SURVIVORS_SHOWN)
+        if hidden > 0:
+            lines.append(f"\n…and {hidden} more (see {CRASH_POSTMORTEM_FILE}).")
+    lines.append("")
+    return lines
+
+
+def load_crash_postmortem(run_dir):
+    """Reads run_dir/crash-postmortem.json, or None when the run did not crash."""
+    path = os.path.join(run_dir, CRASH_POSTMORTEM_FILE)
+    if not os.path.exists(path):
+        return None
+    with open(path) as f:
+        return json.load(f)
 
 
 def render_final_pass(final):
@@ -54,8 +110,10 @@ def render_final_pass(final):
     lines = ["## Final pass\n"]
     lines.append(
         "One verification pass after the last episode, with the producer "
-        "stopped and weir's SIGTERM drain — a **full** drain, not a "
-        "seal-and-exit — given a real chance to finish.\n"
+        "stopped and weir's SIGTERM drain given a real chance to finish: a "
+        "full drain (budget pinned at 3600 s), or, for a schedule with a "
+        "bounded `drain_shutdown_budget_secs`, the bounded stop followed by a "
+        "drain-out restart that delivers whatever it left.\n"
     )
 
     advisory = final.get("advisory")
@@ -96,6 +154,15 @@ def render_final_pass(final):
         f"| Shutdown drain completed without a kill | "
         f"{_yes_no(final.get('daemon_clean_stop'))} |"
     )
+    # Table rows, not bullets: a bullet here would end the table and every
+    # row after it would render as plain text.
+    do = final.get("drain_out")
+    if do:
+        lines.append(
+            f"| Drain-out restart quiesced | {_yes_no(do.get('quiesced'))}"
+            f"{' (' + do['reason'] + ')' if do.get('reason') else ''} |")
+        lines.append(
+            f"| Drain-out stop completed without a kill | {_yes_no(do.get('clean_stop'))} |")
     lines.append(
         f"| Recorder still answering | {_yes_no(final.get('recorder_alive'))} |"
     )
@@ -273,8 +340,66 @@ def _fault_kinds(records):
     }
 
 
-def render(episodes, meta):
-    """Renders episodes (list of dicts) into markdown."""
+def render_triggers(episodes):
+    """Foundations lifecycle triggers: where each cut landed, whether the
+    trigger bit, and the duplicate cost against the phase-2 baseline.
+
+    Returns [] for a run with no trigger records, so every Phase 1/2 report
+    renders byte-identically. An aborted episode never reached its trigger,
+    so it is not counted here (it is still an anomaly in the episode table).
+    """
+    trig = [e for e in episodes
+            if e.get("trigger") and isinstance(e.get("episode"), int)
+            and not e.get("abort_reason")]
+    if not trig:
+        return []
+    lines = ["## Lifecycle triggers\n"]
+    lines.append(
+        "Each episode provoked a lifecycle path, then cut power at a seeded point "
+        "inside or after it. `Canary bit` is I6 for that cut.\n")
+    lines.append("| Trigger | Episodes | Cut during shutdown | Cut after exit | "
+                 "Sink stalled | Forced observed | Pause observed | Canary bit | "
+                 "Trigger anomalies |")
+    lines.append("|---|---|---|---|---|---|---|---|---|")
+    by_kind = {}
+    for e in trig:
+        by_kind.setdefault(e["trigger"], []).append(e)
+    for kind in sorted(by_kind):
+        es = by_kind[kind]
+        tr = [e.get("trigger_result") or {} for e in es]
+        cells = (
+            len(es),
+            sum(1 for t in tr if t.get("cut_phase") == "during_shutdown"),
+            sum(1 for t in tr if t.get("cut_phase") == "after_exit"),
+            sum(1 for t in tr if t.get("stall_sink")),
+            sum(1 for t in tr if t.get("forced_observed")),
+            sum(1 for t in tr if t.get("paused") or t.get("held")),
+        )
+        bit = sum(1 for e in es if e.get("canary") == "bit")
+        anomalous = sum(1 for e in es if e.get("anomaly_reasons"))
+        lines.append(f"| {kind} | " + " | ".join(str(c) for c in cells)
+                     + f" | {bit}/{len(es)} | {anomalous} |")
+    # The accumulator's rate is cumulative, so the LAST record carrying one
+    # (the final pass, when the run reached it) is the run's rate.
+    rated = [e for e in episodes if "duplicate_rate" in e]
+    if rated:
+        rate = rated[-1]["duplicate_rate"]
+        lines.append(
+            f"\nDuplicate rate {rate:.4f} against the phase-2 baseline "
+            f"{PHASE2_DUPLICATE_RATE:.3f} (Δ {rate - PHASE2_DUPLICATE_RATE:+.4f}; "
+            f"source `{PHASE2_DUPLICATE_RATE_SOURCE}`). Bounded shutdown adds at "
+            "most one abandoned segment's committed prefix per shutdown (spec §7), "
+            "so a rise here is expected and stated, not a failure.")
+    lines.append("")
+    return lines
+
+
+def render(episodes, meta, crash=None):
+    """Renders episodes (list of dicts) into markdown.
+
+    `crash` is the crash-path post-mortem (`load_crash_postmortem`), or None
+    for a run that reached its final pass.
+    """
     fault_kinds = _fault_kinds(episodes)
     fault_episodes = [e for e in episodes if e.get("episode") != FINAL]
     final = next((e for e in episodes if e.get("episode") == FINAL), None)
@@ -535,8 +660,13 @@ def render(episodes, meta):
                 "episodes fail — but it is a harness finding, not a weir one.\n"
             )
 
+    if crash is not None:
+        lines.extend(render_crash_postmortem(crash))
+
     if final is not None:
         lines.extend(render_final_pass(final))
+
+    lines.extend(render_triggers(episodes))
 
     lines.append("## Episodes\n")
     lines.append(
@@ -750,7 +880,7 @@ def write_report(run_dir):
     meta = gather_meta(episodes)
     out_path = os.path.join(run_dir, "report.md")
     with open(out_path, "w") as f:
-        f.write(render(episodes, meta))
+        f.write(render(episodes, meta, crash=load_crash_postmortem(run_dir)))
     return out_path
 
 

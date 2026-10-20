@@ -1,0 +1,50 @@
+# Foundations pre-release gate (spec §16): BOUNDED SHUTDOWN under a power cut.
+#
+# Each episode: steady Durable load, then SIGTERM while the producer is still
+# pushing. Half the episodes also SIGSTOP the recorder at the signal (a
+# blackholed sink, spec §16 system test 4), so the 2 s drain budget really
+# binds and in-flight segments are ABANDONED; the other half let the budget
+# complete naturally. The power cut lands at a seeded 0-12 s after the
+# signal: mid-lame-duck, mid-hand-off, mid-absorb, mid-commit, after the
+# abandon, or after the exit. Durable: zero loss is the pass condition.
+#
+# The bound under test: shutdown_timeout 2 + budget 2 + 5 = 9 s. Cuts after
+# 9 s (about a quarter of them) find the daemon gone, or record
+# shutdown_overran_bound.
+#
+# shutdown_timeout_secs is 2, not weir's 30: the producer keeps its
+# connections open and busy, so the connection drain would otherwise take the
+# whole 30 s every episode.
+
+seed = 0xF0D51
+episodes = 300
+max_duration_secs = 21600  # 6h ceiling; ~30-40 s per episode
+steady_lo_secs = 4.0
+steady_hi_secs = 8.0
+quiescence_timeout_secs = 180.0
+
+[load]
+threads = 8
+record_size = 256
+tier = "D"
+min_acked_per_episode = 100
+min_delivered_per_episode = 100
+
+[weir]
+shard_count = 4
+batch_size = 64
+batch_deadline_ms = 2
+wab_segment_max_bytes = 8388608
+drain_shutdown_budget_secs = 2
+shutdown_timeout_secs = 2
+
+[storage]
+size_mb = 2048
+dm_target = "flakey"
+
+[faults]
+kind = "sigterm_at"
+cut = "power_loss"
+cut_lo_ms = 0
+cut_hi_ms = 12000
+stall_sink_probability = 0.5

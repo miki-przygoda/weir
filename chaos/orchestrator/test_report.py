@@ -355,6 +355,22 @@ class TestFinalPassSection(unittest.TestCase):
         self.assertIn("Shutdown drain completed without a kill | **NO**", out)
         self.assertIn("1 anomaly", out)
 
+    def test_a_drain_out_renders_as_two_rows_inside_the_teardown_table(self):
+        final = final_record(
+            drain_out={"ran": True, "quiesced": False,
+                       "reason": "timeout after 600s", "clean_stop": True},
+            advisory=True, frontier_slack=2048,
+            anomaly_reasons=["drain_out_not_quiesced"])
+        out = report.render([final], {})
+        table = out.split("| Teardown step | Result |")[1].split("\n\n")[0]
+        self.assertIn(
+            "| Drain-out restart quiesced | **NO** (timeout after 600s) |", table)
+        self.assertIn("| Drain-out stop completed without a kill | yes |", table)
+
+    def test_no_drain_out_rows_without_a_drain_out(self):
+        out = report.render([final_record(drain_out=None)], {})
+        self.assertNotIn("Drain-out", out)
+
     def test_a_run_with_no_final_pass_says_so(self):
         out = report.render(EPISODES, {})
         self.assertIn("No final verification pass is recorded", out)
@@ -725,3 +741,83 @@ class TestCommitLabel(unittest.TestCase):
     def test_a_missing_commit_is_left_alone_rather_than_labelled_dirty(self):
         # git absent or not a repo: say nothing rather than invent "-dirty".
         self.assertEqual(report.commit_label("", " M x.rs\n"), "")
+
+
+CRASH = {
+    "reason": "RuntimeError: boom", "wab_dir": "/mnt/weir-wab/wab",
+    "image_kept": "/chaos/runs/7/wab.img",
+    "wab_residue": {"unconfirmed_sealed": 1, "nonempty_active": 0,
+                    "quarantined": 0, "dead_letter": 0},
+    "wab_survivor_count": 1,
+    "wab_survivors": [{"kind": "unconfirmed_sealed",
+                       "path": "/mnt/weir-wab/wab/shard_0/seg_00000003.wab.sealed",
+                       "size": 4096}],
+}
+
+
+class TestCrashPostmortemSection(unittest.TestCase):
+    def test_no_crash_renders_no_section(self):
+        self.assertNotIn("## Crash post-mortem", report.render(EPISODES, {}))
+
+    def test_the_section_names_the_reason_the_image_and_every_survivor(self):
+        out = report.render(EPISODES, {}, crash=CRASH)
+        self.assertIn("## Crash post-mortem", out)
+        self.assertIn("RuntimeError: boom", out)
+        self.assertIn("/chaos/runs/7/wab.img", out)
+        self.assertIn("seg_00000003.wab.sealed", out)
+        self.assertIn("4096", out)
+
+    def test_a_scan_error_is_shown_rather_than_an_empty_table(self):
+        out = report.render(EPISODES, {}, crash={
+            "reason": "x", "wab_dir": None,
+            "wab_scan_error": "no WAB directory was created before the run failed"})
+        self.assertIn("no WAB directory", out)
+
+    def test_write_report_picks_up_the_crash_file(self):
+        import json, os, tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "episodes.jsonl"), "w") as f:
+                f.write(json.dumps(EPISODES[0]) + "\n")
+            with open(os.path.join(tmp, report.CRASH_POSTMORTEM_FILE), "w") as f:
+                json.dump(CRASH, f)
+            with open(report.write_report(tmp)) as f:
+                self.assertIn("## Crash post-mortem", f.read())
+
+
+def trig_ep(i, kind, canary="bit", anomalies=(), **tr):
+    return {"episode": i, "fault": "power_loss", "trigger": kind, "cut": "power_loss",
+            "ok": True, "quiesced": True, "canary": canary, "duplicate_rate": 1.002,
+            "trigger_result": tr, "anomaly_reasons": list(anomalies), "seed": 1}
+
+
+class TestTriggerSection(unittest.TestCase):
+    """The Foundations lifecycle triggers (spec §16): where each cut landed,
+    whether it bit, and the duplicate cost against the phase-2 baseline."""
+
+    def test_a_run_without_triggers_has_no_section(self):
+        self.assertNotIn("## Lifecycle triggers", report.render(EPISODES, {}))
+
+    def test_one_row_per_trigger_with_where_the_cuts_landed(self):
+        eps = [trig_ep(0, "sigterm_at", cut_phase="during_shutdown", stall_sink=True),
+               trig_ep(1, "sigterm_at", cut_phase="during_shutdown"),
+               trig_ep(2, "sigterm_at", cut_phase="after_exit")]
+        out = report.render(eps, {})
+        self.assertIn("## Lifecycle triggers", out)
+        self.assertIn("| sigterm_at | 3 | 2 | 1 | 1 | 0 | 0 | 3/3 | 0 |", out)
+
+    def test_a_missed_canary_is_counted_against_the_trigger(self):
+        out = report.render([trig_ep(0, "admin_pause_resume", canary="did_not_bite",
+                                     paused=True)], {})
+        self.assertIn("| admin_pause_resume | 1 | 0 | 0 | 0 | 0 | 1 | 0/1 | 0 |", out)
+
+    def test_the_duplicate_rate_is_stated_against_the_phase_2_baseline(self):
+        out = report.render([trig_ep(0, "sigterm_at")], {})
+        self.assertIn("phase-2 baseline 1.000", out)
+        self.assertIn("+0.0020", out)
+        self.assertIn(report.PHASE2_DUPLICATE_RATE_SOURCE, out)
+
+    def test_a_trigger_anomaly_reaches_the_episode_notes(self):
+        out = report.render([trig_ep(0, "sigterm_at",
+                                     anomalies=["shutdown_overran_bound(alive_at=12.0s,bound=9.0s)"])], {})
+        self.assertIn("shutdown_overran_bound", out)
+        self.assertIn("| sigterm_at | 1 | 0 | 0 | 0 | 0 | 0 | 1/1 | 1 |", out)

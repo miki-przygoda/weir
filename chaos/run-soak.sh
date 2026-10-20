@@ -32,9 +32,10 @@ DEADLINE=$(python3 -c "import tomllib; print(tomllib.load(open('$SCHEDULE','rb')
 # Backgrounded because it polls for that directory.
 ./capture-setup.sh "$SCHEDULE" "$LABEL" &
 
-# -s INT, not the default TERM: run.py tears down the loop device, the mount
-# and its children in a `finally` that a KeyboardInterrupt unwinds. SIGTERM
-# would skip it and strand the devices.
+# -s INT: run.py tears down the loop device, the mount and its children in a
+# `finally` that a KeyboardInterrupt unwinds. SIGTERM and SIGHUP now unwind it
+# too (run.install_interrupt_handlers); INT is kept because it unwinds with or
+# without that handler.
 # taskset 0-15: nproc reports 4 here because of isolcpus, so without this weir
 # sees 4 cores and warns shard_count=4 is over-provisioned.
 sudo -A timeout -s INT "$BACKSTOP" \

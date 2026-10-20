@@ -21,6 +21,11 @@ Design: [`docs/superpowers/specs/2026-07-25-chaos-fault-injection-design.md`](..
   deferred, not landed, and "the observers are unprivileged" should be read
   as a design goal the code does not yet enforce.
 - **Python 3** (stdlib only) and `losetup` / `dmsetup` / `mkfs.ext4`.
+- **weir-server 4.1 or later** under test. The orchestrator always passes
+  `--drain-shutdown-budget-secs` (3600 unless a schedule sets it, so the final
+  pass still drains), and an older daemon refuses unknown flags at startup.
+  Re-running a phase-1 or phase-2 schedule against a 4.0.x binary therefore
+  fails at once; use the harness from that release instead.
 
 ## Running
 
@@ -181,6 +186,58 @@ argue the injector fired because something went missing. A Durable run cannot �
 under a correct implementation nothing goes missing, so "zero loss" and "the
 fault never fired" produce identical numbers.
 
+## Foundations lifecycle schedules (pre-release gate)
+
+Four schedules gate the Foundations release. Each one provokes a lifecycle
+path weir only has since Foundations, then ends the episode in the same
+dm-flakey power cut the Phase 2 corpus was measured with, at a seeded point
+inside or after that path.
+
+| Schedule | Trigger | Lands the cut on | Anomaly reasons |
+|---|---|---|---|
+| `shutdown-bounded.toml` | `sigterm_at` | mid-lame-duck to after-exit, half with a stalled sink | `shutdown_overran_bound`, `daemon_exit_code=N`, `daemon_dead_before_signal` |
+| `shutdown-forced.toml` | `double_sigterm` | after the second signal | `forced_shutdown_overran_bound`, `shutdown_overran_bound`, `daemon_exit_code=N`, `daemon_dead_before_signal` |
+| `startup-signal.toml` | `sigterm_in_recovery` | mid-recovery or after the pre-serving exit | `recovery_phase_not_observed`, `served_after_pre_serving_signal`, `producer_socket_left_after_pre_serving_exit`, `daemon_exit_code=N`, `daemon_dead_before_signal` |
+| `pause-resume-cut.toml` | `admin_pause_resume` | while paused or 0-5 s after resume | `pause_not_observed`, `paused_gauge_not_set`, `delivered_while_paused`, `resume_did_not_see_pause`, `admin_error`, `admin_pause_refused`, `admin_resume_refused` |
+
+Build weir-server with the test hooks, from the weir repo root:
+
+```bash
+cargo build --release -p weir-server --features test-hooks
+```
+
+`startup-signal.toml` needs them: the harness sets `WEIR_TEST_HOOKS=1` and
+`WEIR_TEST_STARTUP_DELAY_MS` on the triggered start only, which holds the
+daemon in `recovering` long enough to signal it there. The hooks are inert
+without `WEIR_TEST_HOOKS=1`, and the daemon logs a loud WARN when they are
+compiled in.
+
+Since Foundations, weir bounds its SIGTERM drain at
+`drain_shutdown_budget_secs`, so run.py passes
+`--drain-shutdown-budget-secs 3600` to every daemon unless the schedule sets
+a budget, and a schedule that sets a smaller one gets a drain-out restart
+before the final pass's zero-slack verify (see "The final pass" below).
+
+In these runs' records, `fault = power_loss` is the fault the oracle judges
+(so the tier exemption, the power-loss verdict and the quarantine exemption
+all apply unchanged), and `trigger = <kind>` names the lifecycle path.
+
+run.py now unwinds on SIGTERM as well as SIGINT. A run that ends on an
+exception or a signal before its final pass keeps `wab.img` for forensics and
+writes `crash-postmortem.json` beside `episodes.jsonl`, which `report.md`
+renders as "Crash post-mortem".
+
+When all four runs are done, the gate reads their run directories:
+
+```bash
+python3 orchestrator/gate.py runs/<id> runs/<id> runs/<id> runs/<id> [--allow-anomalies]
+```
+
+It passes only with ≥1,000 power cuts in total and ≥200 per schedule, 0
+oracle violations, the canary bit on every cut, 0 anomalies unless
+`--allow-anomalies` (each allowed one explained in the write-up), and a final
+pass in every run.
+
 ## Phase 1 exit gate
 
 Phase 1 is complete when a 30-minute smoke run produces **zero violations and
@@ -212,9 +269,15 @@ last row of the report:
 1. the load generator is stopped and **reaped** (it catches SIGTERM and
    flushes its ledger, so its exit status says whether the ledger is complete);
 2. `/metrics` is scraped once more **while the daemon is still alive**;
-3. the daemon is asked to shut down — weir's SIGTERM path is a *full drain*,
-   not a seal-and-exit, so this is where the last tens of thousands of records
-   are actually delivered;
+3. the daemon is asked to shut down. Since Foundations, weir bounds its
+   SIGTERM drain at `drain_shutdown_budget_secs` (default 10 s), so run.py
+   passes `--drain-shutdown-budget-secs 3600` unless the schedule sets a
+   budget, which restores the full drain this check needs. A schedule with
+   a smaller budget gets a **drain-out restart** after this stop: the
+   daemon is restarted with the budget at 3600, run.py waits for
+   quiescence (including `weir_wab_undelivered_segments == 0`), then stops
+   it again. A drain-out that does not quiesce makes step 4 advisory
+   (`drain_out_not_quiesced`);
 4. verification runs at **`frontier_slack=0`**. This is the only moment in a
    run where zero slack is a true statement rather than a stricter-than-reality
    one: the producer is stopped and both logs are complete. If any precondition

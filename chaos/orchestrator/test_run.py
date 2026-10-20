@@ -14,6 +14,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+import faults
 import quiescence
 import report
 import run
@@ -59,12 +60,21 @@ class FakeProc:
 class FakeDaemon:
     """A `run.Daemon` stand-in whose shutdown is scripted."""
 
-    def __init__(self, alive=True, clean_stop=True, log=None):
+    def __init__(self, alive=True, clean_stop=True, log=None,
+                 drain_budget_secs=None):
         self.proc = FakeProc(returncode=None if alive else 0)
         self.metrics_url = "http://127.0.0.1:19185/metrics"
         self.wab_dir = "/unused/wab"
         self._clean_stop = clean_stop
         self.log = log if log is not None else []
+        self.drain_budget_secs = (run.FINAL_DRAIN_BUDGET_SECS
+                                  if drain_budget_secs is None else drain_budget_secs)
+        self.starts = []
+
+    def start(self, sink_url, budget_override=None):
+        self.log.append("daemon.start")
+        self.starts.append(budget_override)
+        self.proc.returncode = None
 
     def stop(self):
         self.log.append("daemon.stop")
@@ -93,7 +103,7 @@ class FakeTailer:
 def final_pass_fixture(
     log=None, loadgen=None, daemon=None, recorder_alive=True, ledger=(),
     delivered=(), ledger_raises=None, residue=None, scrape_raises=None,
-    frontier_slack=2048, run_id=7,
+    frontier_slack=2048, run_id=7, drain_out=None,
 ):
     """Builds the collaborators `run.final_pass` needs, all fake but for the
     accumulator — the real oracle, so these tests exercise the real I1."""
@@ -113,6 +123,13 @@ def final_pass_fixture(
             raise residue
         return residue
 
+    def drain_out_fn(daemon):
+        log.append("drain_out")
+        if isinstance(drain_out, Exception):
+            raise drain_out
+        return drain_out or {"ran": True, "quiesced": True, "reason": "",
+                             "clean_stop": True}
+
     return dict(
         loadgen=FakeProc(log=log) if loadgen is None else loadgen,
         daemon=FakeDaemon(log=log) if daemon is None else daemon,
@@ -126,6 +143,7 @@ def final_pass_fixture(
         scrape_fn=scrape_fn,
         residue_fn=residue_fn,
         sleep_fn=lambda _s: None,
+        drain_out_fn=drain_out_fn,
     ), log
 
 
@@ -562,6 +580,103 @@ class TestDaemonCliContract(unittest.TestCase):
                 f"weir-server's CLI parser ({cli_rs_path}) — the Rust<->Python "
                 "CLI contract has drifted",
             )
+
+
+    def test_the_foundations_flags_are_real_weir_server_flags(self):
+        """Needs PR 4 (--drain-shutdown-budget-secs) and PR 6
+        (--admin-socket-path) merged; red until then by design."""
+        cfg = {"shard_count": 4, "batch_size": 64, "batch_deadline_ms": 2,
+               "wab_segment_max_bytes": 8388608,
+               "drain_shutdown_budget_secs": 2, "shutdown_timeout_secs": 2}
+        daemon = run.Daemon("/fake/weir-server", "/fake/wab", "/fake/weir.sock",
+                            19185, cfg, None,
+                            admin_socket_path="/run/weir-chaos/weir.admin.sock")
+        flags = [t for t in daemon.argv(run.SINK_URL) if t.startswith("--")]
+        cli_rs_path = os.path.join(
+            run.WEIR_ROOT, "crates", "weir-server", "src", "config", "cli.rs")
+        with open(cli_rs_path) as f:
+            cli_source = f.read()
+        for flag in ("--drain-shutdown-budget-secs", "--shutdown-timeout-secs",
+                     "--admin-socket-path"):
+            self.assertIn(flag, flags)
+            self.assertIn(flag, cli_source, f"{flag} is not a weir-server flag")
+
+
+def load_schedule_text(text):
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "sched.toml")
+        with open(path, "w") as f:
+            f.write(text)
+        return run.load_schedule(path)
+
+
+class TestDrainBudgetPin(unittest.TestCase):
+    """Oracle fix (spec §16 chaos item 1). final_pass verifies at
+    frontier_slack=0 on the premise that SIGTERM runs a FULL drain. From
+    Foundations on, weir bounds that drain at drain_shutdown_budget_secs
+    (default 10 s), so every historical schedule would report records left
+    sealed-and-intact on disk as I1 violations: a false P0. Pinning 3600 s
+    restores the stop those schedules were written against."""
+
+    CFG = {"shard_count": 4, "batch_size": 64, "batch_deadline_ms": 2,
+           "wab_segment_max_bytes": 8388608}
+
+    def _daemon(self, **over):
+        return run.Daemon("/fake/weir-server", "/fake/wab", "/fake/weir.sock",
+                          19185, dict(self.CFG, **over), None)
+
+    @staticmethod
+    def _flag(argv, flag):
+        return argv[argv.index(flag) + 1]
+
+    def test_a_schedule_without_a_budget_pins_the_full_drain(self):
+        argv = self._daemon().argv(run.SINK_URL)
+        self.assertEqual(self._flag(argv, "--drain-shutdown-budget-secs"), "3600")
+        self.assertNotIn("--shutdown-timeout-secs", argv)
+        self.assertNotIn("--admin-socket-path", argv)
+
+    def test_the_schedule_budget_reaches_the_daemon(self):
+        argv = self._daemon(drain_shutdown_budget_secs=2).argv(run.SINK_URL)
+        self.assertEqual(self._flag(argv, "--drain-shutdown-budget-secs"), "2")
+
+    def test_an_override_wins_for_the_drain_out_restart(self):
+        argv = self._daemon(drain_shutdown_budget_secs=2).argv(
+            run.SINK_URL, budget_override=run.FINAL_DRAIN_BUDGET_SECS)
+        self.assertEqual(self._flag(argv, "--drain-shutdown-budget-secs"), "3600")
+
+    def test_shutdown_timeout_is_passed_only_when_the_schedule_sets_it(self):
+        argv = self._daemon(shutdown_timeout_secs=2).argv(run.SINK_URL)
+        self.assertEqual(self._flag(argv, "--shutdown-timeout-secs"), "2")
+
+    def test_stop_timeout_keeps_the_legacy_300s_for_a_full_drain(self):
+        self.assertEqual(run.stop_timeout_for(3600, 30), 300)
+        self.assertEqual(self._daemon().stop_timeout_secs, 300)
+
+    def test_stop_timeout_covers_the_documented_grace_for_a_bounded_budget(self):
+        # spec §7: grace >= shutdown_timeout + budget + 5; plus 10 s slack.
+        self.assertEqual(run.stop_timeout_for(10, 30), 55)
+        d = self._daemon(drain_shutdown_budget_secs=2, shutdown_timeout_secs=2)
+        self.assertEqual(d.stop_timeout_secs, 19)
+
+    def _valid(self, weir_extra):
+        return TestUnknownScheduleKeysRefused.VALID.replace(
+            "wab_segment_max_bytes = 1048576\n",
+            "wab_segment_max_bytes = 1048576\n" + weir_extra)
+
+    def test_the_two_new_weir_keys_load(self):
+        s = load_schedule_text(self._valid(
+            "drain_shutdown_budget_secs = 2\nshutdown_timeout_secs = 2\n"))
+        self.assertEqual(s["weir"]["drain_shutdown_budget_secs"], 2)
+
+    def test_a_budget_outside_weirs_range_is_refused_here_not_at_daemon_start(self):
+        with self.assertRaises(ValueError):
+            load_schedule_text(self._valid("drain_shutdown_budget_secs = 3601\n"))
+        with self.assertRaises(ValueError):
+            load_schedule_text(self._valid("drain_shutdown_budget_secs = -1\n"))
+
+    def test_a_zero_shutdown_timeout_is_refused(self):
+        with self.assertRaises(ValueError):
+            load_schedule_text(self._valid("shutdown_timeout_secs = 0\n"))
 
 
 class TestLoadgenCliContract(unittest.TestCase):
@@ -1082,6 +1197,98 @@ class TestFinalPass(unittest.TestCase):
         self.assertEqual((violations, anomalies), (0, 1))
 
 
+class TestFinalPassDrainOut(unittest.TestCase):
+    """Oracle fix, part 2 (spec §16 chaos item 1). A schedule with a bounded
+    drain_shutdown_budget_secs exits on its final SIGTERM with sealed,
+    unconfirmed segments BY DESIGN, so the zero-slack check must wait for a
+    restart that delivers them."""
+
+    def test_a_bounded_budget_gets_a_drain_out_before_the_zero_slack_check(self):
+        kwargs, log = final_pass_fixture(daemon=FakeDaemon(drain_budget_secs=2))
+        kwargs["daemon"].log = log
+        record, v, a = run.final_pass(**kwargs)
+        self.assertEqual(
+            log, ["loadgen.wait", "scrape", "daemon.stop", "drain_out",
+                  "ledger.read_new", "delivered.read_new", "residue_scan"])
+        self.assertTrue(record["drain_out"]["quiesced"])
+        self.assertEqual(record["frontier_slack"], 0)
+        self.assertEqual((v, a), (0, 0))
+
+    def test_a_full_drain_budget_needs_no_drain_out(self):
+        kwargs, log = final_pass_fixture()
+        record, _, _ = run.final_pass(**kwargs)
+        self.assertNotIn("drain_out", log)
+        self.assertIsNone(record["drain_out"])
+
+    def test_a_drain_out_that_never_quiesced_makes_the_check_advisory(self):
+        kwargs, _ = final_pass_fixture(
+            daemon=FakeDaemon(drain_budget_secs=2),
+            drain_out={"ran": True, "quiesced": False,
+                       "reason": "timeout after 600s", "clean_stop": True},
+            ledger=["1 S 10 20 ACK", "2 S 11 21 ACK"], delivered=["7 1"])
+        record, v, a = run.final_pass(**kwargs)
+        self.assertTrue(record["advisory"])
+        self.assertIn("drain_out_not_quiesced", record["anomaly_reasons"])
+        self.assertEqual((v, a), (0, 1),
+                         "segments left on disk must not read as lost records")
+
+    def test_a_drain_out_stop_that_needed_a_kill_is_an_anomaly(self):
+        kwargs, _ = final_pass_fixture(
+            daemon=FakeDaemon(drain_budget_secs=2),
+            drain_out={"ran": True, "quiesced": True, "reason": "", "clean_stop": False})
+        record, v, a = run.final_pass(**kwargs)
+        self.assertIn("drain_out_kill_at_stop", record["anomaly_reasons"])
+        self.assertEqual((v, a), (0, 1))
+
+    def test_a_drain_out_that_raises_is_recorded_and_the_post_mortem_still_runs(self):
+        kwargs, log = final_pass_fixture(
+            daemon=FakeDaemon(drain_budget_secs=2),
+            drain_out=RuntimeError("weir-server exited during startup"))
+        kwargs["daemon"].log = log
+        record, _, a = run.final_pass(**kwargs)
+        self.assertIn("RuntimeError", record["drain_out"]["reason"])
+        self.assertEqual(log[-1], "residue_scan")
+        self.assertEqual(a, 1)
+
+    def test_no_drain_out_into_a_dead_recorder(self):
+        kwargs, log = final_pass_fixture(
+            daemon=FakeDaemon(drain_budget_secs=2), recorder_alive=False)
+        run.final_pass(**kwargs)
+        self.assertNotIn("drain_out", log)
+
+    def test_drain_out_restarts_with_the_full_budget_waits_then_stops(self):
+        d = FakeDaemon(drain_budget_secs=2)
+        seen = []
+
+        def quiesce(url, timeout, wab_dir=None):
+            seen.append((url, timeout, wab_dir))
+            return True, ""
+
+        out = run.drain_out(d, quiesce_fn=quiesce, timeout_secs=42)
+        self.assertEqual(d.starts, [run.FINAL_DRAIN_BUDGET_SECS])
+        self.assertEqual(d.log, ["daemon.start", "daemon.stop"])
+        self.assertEqual(seen, [(d.metrics_url, 42, d.wab_dir)])
+        self.assertEqual(out, {"ran": True, "quiesced": True, "reason": "",
+                               "clean_stop": True})
+
+    def test_a_drain_out_whose_restart_fails_still_stops_the_daemon(self):
+        # Daemon.start can raise with the process still alive ("did not
+        # create its socket within 10s"). final_pass's step 5 then scans the
+        # WAB, and the caller unmounts it, so the restarted daemon must not be
+        # left running underneath either.
+        d = FakeDaemon(drain_budget_secs=2)
+
+        def failing_start(sink_url, budget_override=None):
+            d.log.append("daemon.start")
+            d.proc.returncode = None
+            raise RuntimeError("weir-server did not create its socket within 10s")
+
+        d.start = failing_start
+        with self.assertRaises(RuntimeError):
+            run.drain_out(d, quiesce_fn=lambda *a, **k: (True, ""))
+        self.assertEqual(d.log, ["daemon.start", "daemon.stop"])
+
+
 class TestCanaryVerdict(unittest.TestCase):
     """I6: a canary block written before the fault and overwritten while it
     is engaged turns "did the injector bite" from an inference into a
@@ -1136,6 +1343,419 @@ class TestExitCodeForVerdict(unittest.TestCase):
 
     def test_inconclusive_does_not_mask_a_real_violation(self):
         self.assertEqual(run.exit_code_for(1, 0, "inconclusive"), 1)
+
+
+class TestCrashPostmortem(unittest.TestCase):
+    """The prerequisite (spec §16 chaos item 3): an exception escaping the
+    episode loop went straight to stack.teardown(), which unmounted the WAB
+    and deleted wab.img with no post-mortem. The one piece of evidence that
+    explains a crash was destroyed unread."""
+
+    SURVIVORS = (
+        {"kind": "unconfirmed_sealed",
+         "path": "/w/shard_0/seg_00000003.wab.sealed", "size": 4096},
+        {"kind": "nonempty_active",
+         "path": "/w/shard_1/seg_00000007.wab", "size": 900},
+    )
+
+    def test_survivors_are_recorded_with_the_reason(self):
+        residue = quiescence.Residue(1, 1, 0, 0, self.SURVIVORS)
+        rec = run.crash_postmortem(
+            "/w", "RuntimeError: boom", residue_fn=lambda _d: residue)
+        self.assertEqual(rec["reason"], "RuntimeError: boom")
+        self.assertEqual(rec["wab_dir"], "/w")
+        self.assertEqual(rec["wab_residue"], {
+            "unconfirmed_sealed": 1, "nonempty_active": 1,
+            "quarantined": 0, "dead_letter": 0,
+        })
+        self.assertEqual(rec["wab_survivor_count"], 2)
+        self.assertEqual(
+            rec["wab_survivors"][0]["path"], "/w/shard_0/seg_00000003.wab.sealed")
+
+    def test_a_failing_scan_is_recorded_not_raised(self):
+        def boom(_d):
+            raise OSError("EIO")
+        rec = run.crash_postmortem("/w", "x", residue_fn=boom)
+        self.assertEqual(rec["wab_scan_error"], "OSError: EIO")
+        self.assertNotIn("wab_residue", rec)
+
+    def test_a_run_that_died_before_the_wab_existed_says_so(self):
+        rec = run.crash_postmortem(None, "x", residue_fn=lambda _d: 1 / 0)
+        self.assertIn("no WAB directory", rec["wab_scan_error"])
+
+    def test_the_survivor_list_is_capped_at_fifty_but_counted_in_full(self):
+        many = tuple(
+            {"kind": "unconfirmed_sealed", "path": f"/w/s/{n}", "size": 1}
+            for n in range(80)
+        )
+        rec = run.crash_postmortem(
+            "/w", "x", residue_fn=lambda _d: quiescence.Residue(80, 0, 0, 0, many))
+        self.assertEqual(rec["wab_survivor_count"], 80)
+        self.assertEqual(len(rec["wab_survivors"]), 50)
+
+    def test_it_is_written_beside_the_episode_log(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = run.write_crash_postmortem(tmp, {"reason": "x", "wab_dir": None})
+            self.assertEqual(path, os.path.join(tmp, run.CRASH_POSTMORTEM_FILE))
+            with open(path) as f:
+                self.assertEqual(json.load(f)["reason"], "x")
+
+    def test_report_s_copy_of_the_file_name_matches(self):
+        # report.py cannot import run.py, so it carries its own copy of the
+        # name; a drift would make every crash post-mortem invisible.
+        self.assertEqual(report.CRASH_POSTMORTEM_FILE, run.CRASH_POSTMORTEM_FILE)
+
+    def _main_source(self):
+        run_py = os.path.join(os.path.dirname(os.path.abspath(run.__file__)), "run.py")
+        with open(run_py) as f:
+            source = f.read()
+        return source[source.index("def main("):]
+
+    def test_main_runs_it_before_teardown_and_only_when_the_final_pass_did_not(self):
+        body = self._main_source()
+        fin = body[body.index("\n    finally:\n"):]
+        self.assertIn("crash_postmortem(", fin)
+        # Anchored on the 12-space-indented CALL line: the finally block's own
+        # comments mention `stack.teardown()` before the call does.
+        self.assertLess(
+            fin.index("crash_postmortem("), fin.index("\n            stack.teardown("),
+            "the post-mortem must read the WAB before teardown unmounts it",
+        )
+        self.assertIn("if not final_pass_ran", fin)
+        self.assertIn("final_pass_ran = True", body)
+
+    def test_teardown_keeps_the_image_on_the_crash_path(self):
+        fin = self._main_source()
+        fin = fin[fin.index("\n    finally:\n"):]
+        # The call line, not the comment at the top of `finally` that names it.
+        call = fin[fin.index("\n            stack.teardown("):][:80]
+        self.assertIn("keep_image=not final_pass_ran", call)
+
+    def test_a_leftover_crash_file_blocks_a_rerun_of_the_seed(self):
+        body = self._main_source()
+        self.assertIn(
+            "(ledger_path, delivered_path, episodes_path, crash_path)", body,
+            "a stale crash-postmortem.json would be rendered into the NEXT "
+            "run's report as though that run had crashed",
+        )
+
+
+class TestInterruptHandlers(unittest.TestCase):
+    def _install(self, current):
+        installed = {}
+
+        def signal_fn(sig, handler):
+            installed[sig] = handler
+
+        def getsignal_fn(sig):
+            return current.get(sig, signal.SIG_DFL)
+
+        sigs = run.install_interrupt_handlers(
+            signal_fn=signal_fn, getsignal_fn=getsignal_fn)
+        return sigs, installed
+
+    def test_sigterm_raises_so_the_finally_block_runs(self):
+        sigs, installed = self._install({})
+        self.assertIn(signal.SIGTERM, sigs)
+        with self.assertRaises(run.HarnessInterrupted):
+            installed[signal.SIGTERM](signal.SIGTERM, None)
+
+    def test_it_is_a_BaseException_so_no_except_Exception_swallows_it(self):
+        # final_pass wraps acc.check in `except Exception`; a SIGTERM landing
+        # there must not be recorded as "final_check_failed" and carry on.
+        self.assertFalse(issubclass(run.HarnessInterrupted, Exception))
+
+    def test_a_second_signal_during_cleanup_is_ignored(self):
+        _, installed = self._install({})
+        with self.assertRaises(run.HarnessInterrupted):
+            installed[signal.SIGTERM](signal.SIGTERM, None)
+        self.assertIsNone(installed[signal.SIGTERM](signal.SIGTERM, None))
+        self.assertIsNone(installed[signal.SIGHUP](signal.SIGHUP, None))
+
+    def test_a_nohup_ignored_hangup_stays_ignored(self):
+        sigs, installed = self._install({signal.SIGHUP: signal.SIG_IGN})
+        self.assertNotIn(signal.SIGHUP, installed)
+        self.assertNotIn(signal.SIGHUP, sigs)
+
+    def test_main_installs_them_first(self):
+        run_py = os.path.join(os.path.dirname(os.path.abspath(run.__file__)), "run.py")
+        with open(run_py) as f:
+            body = f.read()
+        body = body[body.index("def main("):]
+        self.assertLess(
+            body.index("install_interrupt_handlers()"), body.index("stack.setup()"))
+
+
+
+TRIGGER_FAULTS = (
+    '[faults]\nkind = "sigterm_at"\ncut = "power_loss"\n'
+    "cut_lo_ms = 0\ncut_hi_ms = 12000\nstall_sink_probability = 0.5\n"
+)
+
+
+class TestTriggerFaultKinds(unittest.TestCase):
+    """The four Foundations lifecycle triggers (spec §16 chaos item 2) are
+    fault kinds the schedule loader knows, and each one's [faults] table is
+    validated per kind: a key the trigger does not read is refused, exactly
+    as reject_unknown_schedule_keys refuses one at table level."""
+
+    def _sched(self, faults_toml, dm_target='"flakey"'):
+        base = TestUnknownScheduleKeysRefused.VALID
+        base = base[: base.index("[faults]")] + faults_toml
+        return base.replace('dm_target = "flakey"', f"dm_target = {dm_target}")
+
+    def test_each_trigger_kind_is_a_fault_kind(self):
+        for kind in faults.TRIGGER_KINDS:
+            self.assertEqual(run.fault_kind({"faults": {"kind": kind}}), kind)
+
+    def test_a_valid_trigger_schedule_loads(self):
+        s = load_schedule_text(self._sched(TRIGGER_FAULTS))
+        self.assertEqual(faults.cut_mode(s), "power_loss")
+
+    def test_a_power_cut_without_a_real_flakey_layer_is_refused(self):
+        with self.assertRaises(ValueError) as cm:
+            load_schedule_text(self._sched(TRIGGER_FAULTS, dm_target='"linear"'))
+        self.assertIn("flakey", str(cm.exception))
+
+    def test_a_kill_cut_needs_no_dm_layer(self):
+        text = self._sched(TRIGGER_FAULTS.replace('"power_loss"', '"kill"'))
+        text = text.replace('dm_target = "flakey"\n', "")
+        self.assertEqual(faults.cut_mode(load_schedule_text(text)), "kill")
+
+    def test_a_key_that_belongs_to_another_trigger_is_refused(self):
+        # Nothing reads recovery_delay_ms under sigterm_at: silently ignoring
+        # it would report a run as having measured something it did not.
+        with self.assertRaises(ValueError) as cm:
+            load_schedule_text(self._sched(TRIGGER_FAULTS + "recovery_delay_ms = 3000\n"))
+        self.assertIn("recovery_delay_ms", str(cm.exception))
+
+    def test_a_missing_required_key_is_refused(self):
+        with self.assertRaises(ValueError) as cm:
+            load_schedule_text(self._sched(TRIGGER_FAULTS.replace("cut_hi_ms = 12000\n", "")))
+        self.assertIn("cut_hi_ms", str(cm.exception))
+
+    def test_an_inverted_range_is_refused(self):
+        with self.assertRaises(ValueError):
+            load_schedule_text(self._sched(TRIGGER_FAULTS.replace("cut_lo_ms = 0", "cut_lo_ms = 20000")))
+
+    def test_a_probability_outside_0_1_is_refused(self):
+        with self.assertRaises(ValueError):
+            load_schedule_text(self._sched(TRIGGER_FAULTS.replace("= 0.5", "= 1.5")))
+
+    def test_an_unknown_cut_mode_is_refused(self):
+        with self.assertRaises(ValueError):
+            load_schedule_text(self._sched(TRIGGER_FAULTS.replace('"power_loss"', '"powerloss"')))
+
+    def test_a_legacy_kind_refuses_trigger_keys(self):
+        with self.assertRaises(ValueError):
+            faults.validate_faults({"kind": "power_loss", "cut": "kill"})
+
+    def test_the_oracle_sees_a_power_cut_as_power_loss(self):
+        # Keeps verify's tier exemption, report.powerloss_verdict and the
+        # quarantine exemption working for trigger episodes, unchanged.
+        self.assertEqual(faults.oracle_fault("sigterm_at", "power_loss"), "power_loss")
+        self.assertEqual(faults.oracle_fault("sigterm_at", "kill"), "kill_random")
+        self.assertEqual(faults.oracle_fault("power_loss", "power_loss"), "power_loss")
+        self.assertEqual(faults.oracle_fault("kill_random", "kill"), "kill_random")
+
+
+class TestDaemonLifecycle(unittest.TestCase):
+    """spawn / wait_serving / signal / exit_code / log_since_spawn /
+    bound_secs: the primitives the lifecycle triggers drive a daemon with,
+    split out of the old start() so a trigger can signal a process that has
+    not finished starting (sigterm_in_recovery)."""
+
+    CFG = {"shard_count": 1, "batch_size": 8, "batch_deadline_ms": 2,
+           "wab_segment_max_bytes": 1048576,
+           "drain_shutdown_budget_secs": 2, "shutdown_timeout_secs": 2}
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.log_path = os.path.join(self.tmp, "weir-server.log")
+        with open(self.log_path, "wb") as f:
+            f.write(b"previous process\n")
+        self.d = run.Daemon("/fake/weir-server", "/fake/wab",
+                            os.path.join(self.tmp, "weir.sock"), 19185,
+                            dict(self.CFG), None, log_path=self.log_path)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _spawn(self, **kw):
+        captured = {}
+
+        def fake_popen(cmd, **kwargs):
+            captured.update(cmd=cmd, **kwargs)
+            proc = mock.Mock()
+            proc.poll.return_value = None
+            return proc
+
+        with mock.patch.object(run.subprocess, "Popen", fake_popen):
+            self.d.spawn(run.SINK_URL, **kw)
+        return captured
+
+    def test_spawn_returns_without_waiting_and_merges_extra_env(self):
+        c = self._spawn(extra_env={"WEIR_TEST_HOOKS": "1"})
+        self.assertEqual(c["env"]["WEIR_TEST_HOOKS"], "1")
+        self.assertEqual(c["env"]["NO_COLOR"], "1")
+
+    def test_log_since_spawn_is_only_this_processs_output(self):
+        self._spawn()
+        with open(self.log_path, "ab") as f:
+            f.write(b"weir serving\n")
+        self.assertEqual(self.d.log_since_spawn(), b"weir serving\n")
+
+    def test_signal_is_not_sent_to_a_dead_process(self):
+        self.d.proc = FakeProc(returncode=0)
+        self.assertFalse(self.d.signal(signal.SIGTERM))
+        self.assertEqual(self.d.proc.signals, [])
+
+    def test_signal_reaches_a_live_process(self):
+        self.d.proc = FakeProc()
+        self.assertTrue(self.d.signal(signal.SIGTERM))
+        self.assertEqual(self.d.proc.signals, [signal.SIGTERM])
+        self.assertIsNone(self.d.exit_code())
+
+    def test_bound_secs_is_the_documented_grace(self):
+        self.assertEqual(self.d.bound_secs(), 2 + 2 + 5)
+
+    def test_bound_secs_follows_a_budget_override(self):
+        self._spawn(budget_override=run.FINAL_DRAIN_BUDGET_SECS)
+        self.assertEqual(self.d.bound_secs(), 2 + 3600 + 5)
+        self.assertEqual(self.d.stop_timeout_secs, 300)
+
+    def test_wait_serving_reports_a_crash_on_startup(self):
+        self.d.proc = FakeProc(returncode=1)
+        with self.assertRaises(RuntimeError) as cm:
+            self.d.wait_serving(timeout_secs=1)
+        self.assertIn("exited during startup", str(cm.exception))
+
+    def test_wait_serving_returns_once_the_socket_exists(self):
+        self.d.proc = FakeProc()
+        open(self.d.socket_path, "w").close()
+        self.d.wait_serving(timeout_secs=1)
+
+
+class TestTriggerRecordFields(unittest.TestCase):
+    def test_legacy_kinds_add_nothing_so_records_stay_byte_identical(self):
+        self.assertEqual(run.trigger_record_fields("power_loss", "power_loss", None), {})
+        self.assertEqual(run.trigger_record_fields("kill_random", "kill", None), {})
+
+    def test_a_trigger_records_its_kind_its_cut_and_its_findings_separately(self):
+        tr = {"trigger": "sigterm_at", "cut_phase": "during_shutdown",
+              "canary": "bit", "anomaly_reasons": ["daemon_exit_code=3"]}
+        f = run.trigger_record_fields("sigterm_at", "power_loss", tr)
+        self.assertEqual(f["trigger"], "sigterm_at")
+        self.assertEqual(f["cut"], "power_loss")
+        self.assertEqual(f["anomaly_reasons"], ["daemon_exit_code=3"])
+        self.assertEqual(f["trigger_result"], {"trigger": "sigterm_at",
+                                               "cut_phase": "during_shutdown"})
+        json.dumps(f)
+
+    def test_the_record_renders(self):
+        tr = {"trigger": "sigterm_at", "canary": "bit", "anomaly_reasons": ["x_y"]}
+        rec = {"episode": 0, "fault": "power_loss", "ok": True, "quiesced": True,
+               "canary": "bit", "seed": 1,
+               **run.trigger_record_fields("sigterm_at", "power_loss", tr)}
+        out = report.render([rec], {})
+        self.assertIn("x_y", out)
+
+
+class TestEpisodeCounts(unittest.TestCase):
+    def test_a_clean_episode_counts_nothing(self):
+        self.assertEqual(run.episode_counts(True, False, True, False, []), (0, 0))
+
+    def test_a_trigger_anomaly_is_an_anomaly_not_a_violation(self):
+        self.assertEqual(run.episode_counts(True, False, True, False, ["x"]), (0, 1))
+
+    def test_the_pre_existing_rules_are_unchanged(self):
+        self.assertEqual(run.episode_counts(False, False, True, False, []), (1, 0))
+        self.assertEqual(run.episode_counts(False, True, True, False, []), (0, 1))
+        self.assertEqual(run.episode_counts(True, False, False, False, []), (0, 1))
+        self.assertEqual(run.episode_counts(True, False, True, True, []), (0, 1))
+
+
+class TestTriggerWiring(unittest.TestCase):
+    def _main(self):
+        with open(os.path.join(os.path.dirname(os.path.abspath(run.__file__)), "run.py")) as f:
+            src = f.read()
+        return src[src.index("def main("):]
+
+    def test_the_loop_dispatches_triggers_and_judges_by_the_oracle_fault(self):
+        body = self._main()
+        for needle in ("faults.run_trigger(kind, plan[i], ops)",
+                       "fault=oracle",
+                       "episode_counts(",
+                       "trigger_record_fields(kind, cut, trigger_result)",
+                       '"fault": oracle'):
+            self.assertIn(needle, body)
+        self.assertNotIn('"fault": kind', body,
+                         "a trigger record must carry the ORACLE fault")
+
+    def test_only_the_admin_trigger_gets_an_admin_socket_path(self):
+        body = self._main()
+        self.assertIn(
+            'admin_socket_path=ADMIN_SOCKET_PATH if kind == "admin_pause_resume" else None',
+            body)
+
+    def test_the_admin_socket_lives_off_the_device_under_test(self):
+        self.assertTrue(run.ADMIN_SOCKET_PATH.startswith("/run/weir-chaos/"))
+
+
+class TestFoundationsSchedules(unittest.TestCase):
+    """The four schedules that gate the Foundations release (spec §16). Each
+    must end every episode in a real dm-flakey power cut on the Durable tier,
+    carry enough episodes for the gate's per-schedule floor, and set its own
+    drain budget (omitting it pins 3600, i.e. tests the 4.0 shutdown)."""
+
+    SCHEDULES = {"shutdown-bounded.toml": "sigterm_at",
+                 "shutdown-forced.toml": "double_sigterm",
+                 "startup-signal.toml": "sigterm_in_recovery",
+                 "pause-resume-cut.toml": "admin_pause_resume"}
+
+    def _path(self, name):
+        return os.path.join(os.path.dirname(os.path.abspath(run.__file__)),
+                            "..", "schedules", name)
+
+    def _load(self, name):
+        return run.load_schedule(self._path(name))
+
+    def test_each_ends_every_episode_in_a_real_power_cut_on_durable(self):
+        for name, kind in self.SCHEDULES.items():
+            with self.subTest(name):
+                s = self._load(name)
+                self.assertEqual(run.fault_kind(s), kind)
+                self.assertEqual(s["faults"]["cut"], "power_loss")
+                self.assertEqual(s["storage"]["dm_target"], "flakey")
+                self.assertEqual(s["load"]["tier"], "D")
+                self.assertGreaterEqual(s["episodes"], 250,
+                                        "the gate needs >= 200 cuts per schedule")
+                self.assertIn("drain_shutdown_budget_secs", s["weir"],
+                              "omitting it pins 3600 and tests the 4.0 shutdown")
+
+    def test_seeds_are_distinct_so_run_dirs_never_collide(self):
+        seeds = [self._load(n)["seed"] for n in self.SCHEDULES]
+        self.assertEqual(len(set(seeds)), len(seeds))
+
+    def test_the_bounded_schedule_cuts_past_its_own_bound_sometimes(self):
+        s = self._load("shutdown-bounded.toml")
+        bound = (s["weir"]["shutdown_timeout_secs"]
+                 + s["weir"]["drain_shutdown_budget_secs"] + run.SHUTDOWN_GRACE_EXTRA_SECS)
+        self.assertGreater(s["faults"]["cut_hi_ms"] / 1000.0, bound)
+        self.assertGreater(s["faults"]["stall_sink_probability"], 0.0)
+
+    def test_the_forced_schedule_cuts_past_the_forced_bound_sometimes(self):
+        s = self._load("shutdown-forced.toml")
+        self.assertGreater(s["faults"]["cut_hi_ms"] / 1000.0, faults.FORCED_BOUND_SECS)
+
+    def test_the_readme_documents_each_and_the_test_hooks_build(self):
+        with open(os.path.join(os.path.dirname(self._path("x")), "..", "README.md")) as f:
+            readme = f.read()
+        for name in self.SCHEDULES:
+            self.assertIn(name, readme)
+        self.assertIn("--features test-hooks", readme)
+        self.assertIn("orchestrator/gate.py", readme)
 
 
 if __name__ == "__main__":

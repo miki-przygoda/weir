@@ -728,5 +728,36 @@ class TestParse2(unittest.TestCase):
         self.assertEqual(m, {"weir_queue_depth": 0.0})
 
 
+class TestFoundationsGauges(unittest.TestCase):
+    """weir_wab_undelivered_segments is the spec's own drain-out condition
+    (§16 chaos item 1); weir_drain_paused must block quiescence because a
+    paused drain delivers nothing. Both are ABSENT on a pre-Foundations daemon,
+    and absence must not block, or every historical schedule would hang."""
+
+    def _wait(self, reading):
+        return quiescence.wait_for_quiescence(
+            "unused", timeout_s=0.5, wab_dir=UNUSED_WAB_DIR,
+            scrape_fn=lambda _: reading, residue_fn=healthy_residue_fn,
+            poll_interval_s=0, stable_polls=2)
+
+    def test_undelivered_segments_block(self):
+        ok, reason = self._wait(healthy_reading(**{quiescence.UNDELIVERED: 3.0}))
+        self.assertFalse(ok)
+        self.assertIn("undelivered_segments=3", reason)
+
+    def test_zero_undelivered_quiesces(self):
+        ok, reason = self._wait(healthy_reading(**{quiescence.UNDELIVERED: 0.0}))
+        self.assertTrue(ok, reason)
+
+    def test_absent_gauges_do_not_block_a_pre_foundations_daemon(self):
+        ok, reason = self._wait(healthy_reading())
+        self.assertTrue(ok, reason)
+
+    def test_a_paused_drain_blocks(self):
+        ok, reason = self._wait(healthy_reading(**{quiescence.PAUSED: 1.0}))
+        self.assertFalse(ok)
+        self.assertIn("drain is paused", reason)
+
+
 if __name__ == "__main__":
     unittest.main()

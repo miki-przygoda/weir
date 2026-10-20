@@ -33,6 +33,7 @@ import time
 import tomllib
 
 import dm_stack
+import faults
 import quiescence
 import report
 import verify
@@ -57,17 +58,65 @@ LEDGER_FLUSH_THRESHOLD = 256
 LOADGEN_STOP_TIMEOUT_SECS = 60
 
 
+class HarnessInterrupted(BaseException):
+    """A termination signal reached run.py.
+
+    Raised FROM the signal handler so `main()`'s `finally` runs: the WAB
+    post-mortem, the teardown of the loop device, dm mapping and mount, and
+    the report. With Python's default SIGTERM disposition none of that ran.
+    A BaseException, like KeyboardInterrupt, so that the `except Exception`
+    guards inside the episode loop and `final_pass` cannot swallow it.
+    """
+
+
+def install_interrupt_handlers(signal_fn=signal.signal, getsignal_fn=signal.getsignal):
+    """Maps SIGTERM and SIGHUP onto HarnessInterrupted. Returns the signals it took.
+
+    One-shot: a second signal while `finally` is cleaning up is logged and
+    ignored, because raising again mid-teardown would strand exactly the
+    devices the first one is releasing. A SIGHUP that is already SIG_IGN
+    (run under nohup) is left ignored, so a dropped SSH session does not stop a
+    run the operator deliberately detached.
+    """
+    fired = []
+
+    def _raise(signum, _frame):
+        name = signal.Signals(signum).name
+        if fired:
+            print(f"run.py: {name} again during cleanup; ignored so teardown "
+                  "can finish", file=sys.stderr)
+            return None
+        fired.append(signum)
+        raise HarnessInterrupted(f"received {name}")
+
+    taken = []
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        if getsignal_fn(sig) == signal.SIG_IGN:
+            continue
+        signal_fn(sig, _raise)
+        taken.append(sig)
+    return taken
+
+
 def fault_kind(sched):
     """Which fault this schedule injects. Defaults to Phase 1's `kill_random`.
+
+    Besides Phase 1's `kill_random` and Phase 2's `power_loss` this returns the
+    four Foundations lifecycle triggers (`faults.TRIGGER_KINDS`). A trigger's
+    episodes still END in a cut (`faults.cut_mode`), and the oracle judges
+    them under `faults.oracle_fault`, not under this name.
 
     An unknown kind raises rather than falling back: silently running a Phase 1
     episode under a Phase 2 schedule and reporting it as power loss is exactly
     the class of harness lie this project exists to avoid.
     """
     kind = (sched.get("faults") or {}).get("kind", "kill_random")
-    if kind not in ("kill_random", "power_loss"):
+    known = faults.LEGACY_KINDS + faults.TRIGGER_KINDS
+    if kind not in known:
         raise ValueError(
-            f"unknown fault kind {kind!r}; expected 'kill_random' or 'power_loss'")
+            f"unknown fault kind {kind!r}; expected one of the legacy kinds "
+            f"{list(faults.LEGACY_KINDS)} or the lifecycle triggers "
+            f"{list(faults.TRIGGER_KINDS)}")
     return kind
 
 
@@ -84,6 +133,59 @@ DEFAULT_MIN_FREE_BYTES = 5 * 2**30
 #: typically 2 GiB) and is the thing under test, not the thing recording the
 #: test. Override per schedule with `min_free_device_bytes`; 0 disables it.
 DEFAULT_MIN_FREE_DEVICE_BYTES = 128 * 2**20
+
+
+#: The drain budget the harness pins on every daemon unless the schedule sets
+#: one. weir's own default since Foundations is 10 s (spec §13); every schedule
+#: written before that was written against a SIGTERM that drained EVERYTHING,
+#: and its final pass verifies at frontier_slack=0 on that premise. 3600 is the
+#: top of weir's accepted range (0..=3600), and it puts the old behaviour back.
+FINAL_DRAIN_BUDGET_SECS = 3600
+#: weir's `shutdown_timeout_secs` default (config/mod.rs).
+WEIR_DEFAULT_SHUTDOWN_TIMEOUT_SECS = 30
+#: spec §7: the documented grace is shutdown_timeout + budget + 5.
+SHUTDOWN_GRACE_EXTRA_SECS = 5
+#: Daemon.stop's wait before SIGKILL for a full-drain stop. Unchanged from 4.0.
+LEGACY_STOP_TIMEOUT_SECS = 300
+STOP_SLACK_SECS = 10
+#: The recorder's ingest endpoint, the daemon's HTTP sink.
+SINK_URL = "http://127.0.0.1:9900/ingest"
+#: Socket-appearance wait. 10 s before Foundations; Foundations adds a settle
+#: wait of up to 10 s before the producer bind (spec §6 step 10), so a healthy
+#: restart can legitimately take longer. A crash on startup is still caught
+#: on the next 50 ms poll, not at this timeout.
+DAEMON_STARTUP_TIMEOUT_SECS = 30
+
+
+def stop_timeout_for(budget_secs, shutdown_timeout_secs):
+    """How long Daemon.stop waits before SIGKILL. A full-drain budget keeps the
+    4.0-era 300 s, so every historical schedule's stop is unchanged. A bounded
+    budget gets weir's documented grace plus slack, because overrunning THAT is
+    itself a finding (spec §7's bound)."""
+    if budget_secs >= FINAL_DRAIN_BUDGET_SECS:
+        return LEGACY_STOP_TIMEOUT_SECS
+    return shutdown_timeout_secs + budget_secs + SHUTDOWN_GRACE_EXTRA_SECS + STOP_SLACK_SECS
+
+
+def _is_int(value):
+    # TOML booleans are Python bools, which are ints; neither is a duration.
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def validate_weir_table(weir):
+    """Refuses `[weir]` values weir itself would refuse at startup, so the
+    error comes at schedule load and not minutes into a run."""
+    budget = weir.get("drain_shutdown_budget_secs")
+    if budget is not None and not (
+            _is_int(budget) and 0 <= budget <= FINAL_DRAIN_BUDGET_SECS):
+        raise ValueError(
+            f"[weir].drain_shutdown_budget_secs={budget!r} is outside weir's "
+            f"accepted range 0..={FINAL_DRAIN_BUDGET_SECS}")
+    timeout = weir.get("shutdown_timeout_secs")
+    if timeout is not None and not (_is_int(timeout) and timeout >= 1):
+        raise ValueError(
+            f"[weir].shutdown_timeout_secs={timeout!r} must be an integer >= 1 "
+            "(weir refuses 0)")
 
 
 def _gib(n):
@@ -132,11 +234,11 @@ def disk_stop_reason(free, floor):
 #: schedule says. That is the same class of harness lie `fault_kind` refuses an
 #: unknown fault *value* for, applied to the key names.
 #:
-#: The `weir` list is exactly what `Daemon.start` passes through to the daemon —
+#: The `weir` list is exactly what `Daemon.argv` passes through to the daemon —
 #: NOT weir's whole config surface. The harness never writes a weir config file,
 #: so weir's own unknown-key advisory never sees a schedule typo and cannot
 #: catch it. When a run needs a weir knob that is not here, plumb it through
-#: `Daemon.start` and add it here in the same change; the two lists are meant to
+#: `Daemon.argv` and add it here in the same change; the two lists are meant to
 #: be read together.
 SCHEDULE_KEYS = {
     None: {
@@ -151,9 +253,12 @@ SCHEDULE_KEYS = {
     "weir": {
         "shard_count", "batch_size", "batch_deadline_ms",
         "wab_segment_max_bytes", "wab_compression", "wab_compression_level",
+        "drain_shutdown_budget_secs", "shutdown_timeout_secs",
     },
     "storage": {"size_mb", "dm_target"},
-    "faults": {"kind"},
+    # A superset: every key SOME fault kind reads. faults.validate_faults
+    # narrows it to the keys the schedule's own kind reads.
+    "faults": faults.ALL_FAULT_KEYS,
 }
 
 
@@ -262,16 +367,24 @@ def load_schedule(path):
     call instead of failing here before steady-state load even starts). The
     absent-target case used to be considered "caught elsewhere" and let
     through — the same justification as the linear guard applies to it
-    identically, so it is refused here too now.
+    identically, so it is refused here too now. The same guard covers a
+    lifecycle trigger whose episodes end in a power cut (`cut = "power_loss"`),
+    after `faults.validate_faults` has refused any [faults] key the
+    schedule's own kind does not read.
     """
     with open(path, "rb") as f:
         sched = tomllib.load(f)
     reject_unknown_schedule_keys(sched)
-    if fault_kind(sched) == "power_loss":
+    validate_weir_table(sched.get("weir") or {})
+    faults.validate_faults(sched.get("faults") or {})
+    kind = fault_kind(sched)
+    if kind == "power_loss" or faults.cut_mode(sched) == "power_loss":
         dm_target = sched.get("storage", {}).get("dm_target")
         if dm_target != "flakey":
+            pairs = ("fault.kind='power_loss'" if kind == "power_loss"
+                     else f"fault.kind={kind!r} (cut='power_loss')")
             raise ValueError(
-                f"schedule pairs fault.kind='power_loss' with "
+                f"schedule pairs {pairs} with "
                 f"storage.dm_target={dm_target!r}: power_loss needs a REAL "
                 f"dm-flakey layer to inject into. 'linear' is dm-flakey's "
                 f"pass-through stand-in and injects nothing; an absent "
@@ -383,6 +496,38 @@ def exit_code_for(violations, anomalies, verdict):
     return 0
 
 
+#: Off the device under test for the admin trigger, so its control-plane
+#: socket is not on the filesystem being cut. Other schedules pass no path,
+#: and weir binds its default `<parent(wab_dir)>/wab.admin.sock` on the
+#: device. That is harmless: every cut SIGKILLs first, and `bind_hardened`
+#: removes the stale file on restart. /run/weir-chaos is 0700 (main), which
+#: the admin bind requires (spec §11).
+ADMIN_SOCKET_PATH = "/run/weir-chaos/weir.admin.sock"
+
+
+def trigger_record_fields(kind, cut, trigger_result):
+    """Record fields a lifecycle trigger adds. {} for the legacy kinds, so every
+    Phase 1/2 record stays byte-identical."""
+    if trigger_result is None:
+        return {}
+    return {
+        "trigger": kind,
+        "cut": cut,
+        "trigger_result": {k: v for k, v in trigger_result.items()
+                           if k not in ("canary", "anomaly_reasons")},
+        "anomaly_reasons": list(trigger_result.get("anomaly_reasons", [])),
+    }
+
+
+def episode_counts(result_ok, advisory, quiesced, no_progress, trigger_anomaly_reasons):
+    """(violations, anomalies) one episode adds. Same split as I5: a trigger
+    that did not land, or a shutdown that broke its bound, is an anomaly, never
+    a durability violation."""
+    violation = 1 if (not result_ok and not advisory) else 0
+    anomaly = 1 if (not quiesced or no_progress or advisory or trigger_anomaly_reasons) else 0
+    return violation, anomaly
+
+
 def cumulative_deltas(result, prev):
     """Per-episode deltas from the accumulator's CUMULATIVE totals.
 
@@ -401,10 +546,99 @@ def cumulative_deltas(result, prev):
     return {k: v - prev.get(k, 0) for k, v in totals.items()}, totals
 
 
+#: Where the crash-path post-mortem lands, beside episodes.jsonl. A separate
+#: file and NOT an episodes.jsonl row: report.py and main()'s closing count
+#: treat every non-"final" row as an episode, and this is not one.
+CRASH_POSTMORTEM_FILE = "crash-postmortem.json"
+
+
+def crash_postmortem(wab_dir, reason, residue_fn=None):
+    """The WAB post-mortem for a run that ended on an exception.
+
+    `final_pass` step 5 is the only other place the WAB is scanned before
+    `stack.teardown()` unmounts the device and deletes `wab.img`. A run that
+    raised out of the episode loop never reaches it, so the evidence of what
+    weir left on disk was destroyed unread, on exactly the runs where it is
+    most needed. Same scanner and the same 50-row cap as the final pass, so
+    the two records read alike. Never raises: a failed scan is recorded.
+    """
+    residue_fn = residue_fn or quiescence.scan_wab_residue
+    record = {"reason": reason, "wab_dir": wab_dir}
+    if wab_dir is None:
+        record["wab_scan_error"] = (
+            "no WAB directory was created before the run failed"
+        )
+        return record
+    try:
+        residue = residue_fn(wab_dir)
+    except Exception as exc:
+        record["wab_scan_error"] = f"{type(exc).__name__}: {exc}"
+        return record
+    record["wab_residue"] = {
+        "unconfirmed_sealed": residue.unconfirmed_sealed,
+        "nonempty_active": residue.nonempty_active,
+        "quarantined": residue.quarantined,
+        "dead_letter": residue.dead_letter,
+    }
+    survivors = list(residue.survivors)
+    record["wab_survivor_count"] = len(survivors)
+    record["wab_survivors"] = survivors[:50]
+    return record
+
+
+def write_crash_postmortem(run_dir, record):
+    """Writes `record` to `run_dir/crash-postmortem.json`; returns the path."""
+    path = os.path.join(run_dir, CRASH_POSTMORTEM_FILE)
+    with open(path, "w") as f:
+        json.dump(record, f, indent=2)
+    return path
+
+
+#: How long the drain-out restart may take to deliver what a bounded shutdown
+#: left behind. The quiescence timeout of a soak schedule is 180 s for ONE
+#: episode's backlog; the final drain-out may hold several abandoned segments.
+DRAIN_OUT_TIMEOUT_SECS = 600
+
+
+def needs_drain_out(daemon):
+    """True when the daemon's shutdown drain was bounded below a full drain,
+    so its SIGTERM may legitimately leave sealed, unconfirmed segments."""
+    return getattr(daemon, "drain_budget_secs", FINAL_DRAIN_BUDGET_SECS) < FINAL_DRAIN_BUDGET_SECS
+
+
+def drain_out(daemon, sink_url=SINK_URL, timeout_secs=DRAIN_OUT_TIMEOUT_SECS,
+              quiesce_fn=None):
+    """Restart, deliver everything on disk, stop. Spec §16 chaos item 1:
+    "restart and wait for weir_wab_undelivered_segments == 0 before the
+    frontier_slack=0 verify". The restart replays every sealed, unconfirmed
+    segment the bounded shutdown left. The budget is pinned so this stop is
+    itself a full drain.
+
+    Returns `{"ran", "quiesced", "reason", "clean_stop"}`. If the restart or
+    the wait raises, the daemon is stopped before the exception propagates:
+    `Daemon.start` can raise with the process still alive, and the caller
+    goes on to scan, then unmount, the WAB it would be running on.
+    """
+    quiesce_fn = quiesce_fn or quiescence.wait_for_quiescence
+    try:
+        daemon.start(sink_url, budget_override=FINAL_DRAIN_BUDGET_SECS)
+        ok, reason = quiesce_fn(daemon.metrics_url, timeout_secs, wab_dir=daemon.wab_dir)
+    except BaseException:
+        try:
+            daemon.stop()
+        except Exception as exc:
+            print(f"drain-out: stop after a failed restart failed: {exc}",
+                  file=sys.stderr)
+        raise
+    clean = daemon.stop()
+    return {"ran": True, "quiesced": ok, "reason": reason, "clean_stop": clean}
+
+
 def final_pass(
     loadgen, daemon, recorder, acc, ledger_tail, delivered_tail, wab_dir,
     frontier_slack, seed, prev_totals=None, scrape_fn=None, residue_fn=None,
     sleep_fn=None, stop_loadgen_fn=None, settle_secs=1.0, tier=None, fault=None,
+    drain_out_fn=None,
 ):
     """The verification pass that runs AFTER the last episode. D1.
 
@@ -415,7 +649,8 @@ def final_pass(
     run simply stopped, which threw away the cheapest, highest-signal evidence
     in the whole harness:
 
-    - weir's SIGTERM path runs a FULL drain, not a seal-and-exit, so it
+    - the final stop runs a full drain (budget pinned at 3600 s, or a bounded
+      stop plus the drain-out restart of step 3b), so it
       delivers the final tens of thousands of records — and nothing read them
       before `stack.teardown()` unmounted and deleted the backing image.
     - The last episode's frontier-exempt records were never re-judged.
@@ -430,8 +665,12 @@ def final_pass(
        nothing left to scrape, and stranded/resumed and queue depth at the
        moment of shutdown are exactly the numbers a stranded-segment finding
        would need.
-    3. `daemon.stop()` — the real graceful drain. Having to `kill9` is an
-       anomaly, recorded.
+    3. `daemon.stop()`: the SIGTERM stop, bounded by the daemon's
+       `drain_shutdown_budget_secs`. Having to `kill9` is an anomaly.
+    3b. When `needs_drain_out(daemon)` holds (a bounded budget), restart with
+       the budget at 3600, wait for quiescence, stop again (`drain_out`), so
+       step 4's zero slack is not judged against segments the bounded stop
+       left on disk. A drain-out that does not quiesce makes step 4 advisory.
     4. Verify with `frontier_slack=0`. Zero slack is legitimate HERE AND ONLY
        HERE: the producer is stopped and both logs are complete, so "no
        exemption" is a true statement rather than a stricter-than-reality one.
@@ -453,6 +692,7 @@ def final_pass(
     residue_fn = residue_fn or quiescence.scan_wab_residue
     sleep_fn = sleep_fn or time.sleep
     stop_loadgen_fn = stop_loadgen_fn or stop_loadgen
+    drain_out_fn = drain_out_fn or drain_out
     prev_totals = prev_totals or {}
 
     # I1 (final review): the REAL fault, not a hardcoded "none" — a Buffered
@@ -539,6 +779,29 @@ def final_pass(
             "the shutdown drain overran its budget and the daemon was killed, "
             "so undrained segments are expected"
         )
+
+    # 3b. Drain-out. A bounded shutdown (Foundations, spec §7) leaves sealed,
+    # unconfirmed segments ON PURPOSE; verifying at zero slack on top of that
+    # would report records sitting intact on disk as lost — a false P0.
+    # Not into a dead recorder: the restart would strand everything it
+    # replays, and step 4 is already advisory for that reason.
+    record["drain_out"] = None
+    if daemon is not None and needs_drain_out(daemon) and recorder_alive:
+        try:
+            out = drain_out_fn(daemon)
+        except Exception as exc:
+            out = {"ran": True, "quiesced": False,
+                   "reason": f"{type(exc).__name__}: {exc}", "clean_stop": False}
+        record["drain_out"] = out
+        if not out["quiesced"]:
+            anomaly_reasons.append("drain_out_not_quiesced")
+            advisory_reasons.append(
+                f"the drain-out restart did not quiesce ({out['reason']}), so "
+                "acked records may still be on disk, undelivered")
+        elif not out["clean_stop"]:
+            # Quiesced, but its own full-budget stop overran and was SIGKILLed:
+            # the same finding as a killed shutdown drain at step 3.
+            anomaly_reasons.append("drain_out_kill_at_stop")
 
     # 4. Final verification.
     advisory = bool(advisory_reasons)
@@ -693,7 +956,8 @@ def stop_loadgen(proc, timeout_secs=LOADGEN_STOP_TIMEOUT_SECS):
 class Daemon:
     """A weir-server process under test."""
 
-    def __init__(self, binary, wab_dir, socket_path, metrics_port, cfg, log_file):
+    def __init__(self, binary, wab_dir, socket_path, metrics_port, cfg, log_file,
+                 log_path=None, admin_socket_path=None):
         self.binary = binary
         self.wab_dir = wab_dir
         self.socket_path = socket_path
@@ -704,19 +968,27 @@ class Daemon:
         # timeout blamed on weir. A file also keeps the logs for diagnosis.
         self.log_file = log_file
         self.proc = None
-        #: Generous: the shutdown drain is real now. See stop().
-        self.stop_timeout_secs = 300
+        #: The daemon log's path, for readers that scan it (the file object
+        #: above is only ever written to).
+        self.log_path = log_path
+        #: Passed as `--admin-socket-path` when set; absent, weir derives its
+        #: default from `wab_dir`.
+        self.admin_socket_path = admin_socket_path
+        #: The schedule's shutdown drain budget, or the full-drain pin.
+        self.drain_budget_secs = cfg.get(
+            "drain_shutdown_budget_secs", FINAL_DRAIN_BUDGET_SECS)
+        self.shutdown_timeout_secs = cfg.get(
+            "shutdown_timeout_secs", WEIR_DEFAULT_SHUTDOWN_TIMEOUT_SECS)
+        #: The budget the RUNNING process was started with: the drain-out
+        #: restart overrides the schedule's for one start.
+        self.active_budget_secs = self.drain_budget_secs
+        #: How long stop() waits before SIGKILL. See stop_timeout_for().
+        self.stop_timeout_secs = stop_timeout_for(
+            self.drain_budget_secs, self.shutdown_timeout_secs)
 
-    def start(self, sink_url):
-        # Remove any stale socket BEFORE spawning. `kill -9` leaves the file on
-        # disk, so the readiness poll below would be satisfied instantly by the
-        # dead process's socket — defeating the check on every restart after
-        # episode 0, and misreporting a genuine crash-on-restart as a
-        # quiescence timeout rather than the finding it is.
-        try:
-            os.unlink(self.socket_path)
-        except FileNotFoundError:
-            pass
+    def argv(self, sink_url, budget_override=None):
+        """The daemon's command line. Pure: TestDaemonCliContract pins every
+        flag it emits against weir-server's CLI parser."""
         cmd = [
             self.binary,
             "--wab-dir", self.wab_dir,
@@ -744,6 +1016,15 @@ class Daemon:
             # producer pause was written to cure.
             "--wab-segment-max-age-secs", "2",
         ]
+        # Always passed: weir's default (10 s) would bound the final pass's
+        # SIGTERM drain, and that pass verifies at zero slack. See
+        # FINAL_DRAIN_BUDGET_SECS.
+        budget = self.drain_budget_secs if budget_override is None else budget_override
+        cmd += ["--drain-shutdown-budget-secs", str(budget)]
+        if "shutdown_timeout_secs" in self.cfg:
+            cmd += ["--shutdown-timeout-secs", str(self.cfg["shutdown_timeout_secs"])]
+        if self.admin_socket_path:
+            cmd += ["--admin-socket-path", self.admin_socket_path]
         # On-disk format. OMITTED ENTIRELY unless the schedule asks for it, so
         # every schedule written before this knob existed keeps writing format
         # v1 — byte-identical to weir 1.x — exactly as it did on the runs those
@@ -760,16 +1041,48 @@ class Daemon:
             level = self.cfg.get("wab_compression_level")
             if level is not None:
                 cmd += ["--wab-compression-level", str(level)]
+        return cmd
+
+    def spawn(self, sink_url, budget_override=None, extra_env=None):
+        """Starts weir-server and returns at once, without waiting for its
+        socket: a lifecycle trigger may need to signal a process that is
+        still recovering. `start()` is spawn + wait_serving. `extra_env` is
+        merged over the inherited environment (the test-hook variables)."""
+        # Remove any stale socket BEFORE spawning. `kill -9` leaves the file on
+        # disk, so the readiness poll in wait_serving would be satisfied
+        # instantly by the dead process's socket — defeating the check on every
+        # restart after episode 0, and misreporting a genuine crash-on-restart
+        # as a quiescence timeout rather than the finding it is.
+        try:
+            os.unlink(self.socket_path)
+        except FileNotFoundError:
+            pass
+        self.active_budget_secs = (
+            self.drain_budget_secs if budget_override is None else budget_override)
+        self.stop_timeout_secs = stop_timeout_for(
+            self.active_budget_secs, self.shutdown_timeout_secs)
+        # Where THIS process's output starts in the shared log, so the
+        # triggers judge it by its own lines and never a predecessor's.
+        self.log_offset = (os.path.getsize(self.log_path)
+                           if self.log_path and os.path.exists(self.log_path) else 0)
         # NO_COLOR: tracing-subscriber emits ANSI escapes unconditionally, even
         # when its output is a plain FILE rather than a terminal. Measured at
         # 28% of the daemon log here, and the escapes break naive greps when
         # reconstructing what the daemon did around a violation.
+        env = dict(os.environ, NO_COLOR="1")
+        if extra_env:
+            env.update(extra_env)
         self.proc = subprocess.Popen(
-            cmd, stdout=self.log_file, stderr=self.log_file,
-            env=dict(os.environ, NO_COLOR="1"),
+            self.argv(sink_url, budget_override),
+            stdout=self.log_file, stderr=self.log_file, env=env,
         )
-        # Wait for the socket to appear rather than sleeping a fixed interval.
-        for _ in range(200):
+
+    def wait_serving(self, timeout_secs=DAEMON_STARTUP_TIMEOUT_SECS):
+        """Waits for the producer socket to appear rather than sleeping a fixed
+        interval. Raises RuntimeError if the process exits first or the socket
+        does not appear within `timeout_secs`."""
+        deadline = time.monotonic() + timeout_secs
+        while True:
             if os.path.exists(self.socket_path):
                 return
             if self.proc.poll() is not None:
@@ -777,8 +1090,44 @@ class Daemon:
                     f"weir-server exited during startup (code {self.proc.returncode}); "
                     f"see the daemon log in the run directory"
                 )
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"weir-server did not create its socket within {timeout_secs:g}s")
             time.sleep(0.05)
-        raise RuntimeError("weir-server did not create its socket within 10s")
+
+    def start(self, sink_url, budget_override=None):
+        self.spawn(sink_url, budget_override)
+        self.wait_serving()
+
+    def signal(self, sig):
+        """Sends `sig` to a live process. False, and nothing sent, if there is
+        no process or it has already exited (a reaped pid may be reused)."""
+        if self.proc is None or self.proc.poll() is not None:
+            return False
+        self.proc.send_signal(sig)
+        return True
+
+    def exit_code(self):
+        """The exit status, or None while running (or before any spawn)."""
+        return None if self.proc is None else self.proc.poll()
+
+    def log_since_spawn(self):
+        """The daemon log from this process's spawn onward (b"" without a
+        log path)."""
+        if not self.log_path:
+            return b""
+        try:
+            with open(self.log_path, "rb") as f:
+                f.seek(getattr(self, "log_offset", 0))
+                return f.read()
+        except FileNotFoundError:
+            return b""
+
+    def bound_secs(self):
+        """spec §7's documented grace for THIS process's budget:
+        shutdown_timeout_secs + active budget + 5."""
+        return (self.shutdown_timeout_secs + self.active_budget_secs
+                + SHUTDOWN_GRACE_EXTRA_SECS)
 
     def kill9(self):
         if self.proc and self.proc.poll() is None:
@@ -788,9 +1137,11 @@ class Daemon:
     def stop(self):
         """Graceful shutdown. Returns True if it exited cleanly, False if killed.
 
-        weir's SIGTERM path runs a FULL drain of every sealed segment, not just
-        a seal-and-exit, and `shutdown_timeout_secs` does not bound it — that
-        setting covers only the socket layer's connection drain. The old 30 s
+        Since Foundations weir's SIGTERM drain is bounded by
+        `drain_shutdown_budget_secs`; the harness pins 3600 unless a schedule
+        sets a budget, and `final_pass` runs a drain-out restart when it does.
+        `shutdown_timeout_secs` covers only the socket layer's connection
+        drain, and the wait here is `stop_timeout_for` of both. The old 30 s
         budget was never binding because the recorder was killed first, so every
         sink call failed instantly and shutdown took 24.6 ms. Now that the
         recorder outlives the daemon, the drain is real and needs a real budget.
@@ -815,6 +1166,10 @@ class Daemon:
 def main():
     if os.geteuid() != 0:
         sys.exit("run.py must run as root (it owns loopback devices and mounts)")
+    # Before anything that needs undoing: from here on a SIGTERM or SIGHUP
+    # unwinds through the `finally` below (post-mortem, teardown, report)
+    # instead of killing the process with the loop device still attached.
+    install_interrupt_handlers()
 
     schedule_path = sys.argv[1] if len(sys.argv) > 1 else "../schedules/smoke.toml"
     sched = load_schedule(schedule_path)
@@ -847,12 +1202,16 @@ def main():
     ledger_path = os.path.join(run_dir, "ledger.log")
     delivered_path = os.path.join(run_dir, "delivered.log")
     episodes_path = os.path.join(run_dir, "episodes.jsonl")
+    # Written only when a run ends on an exception before its final pass.
+    crash_path = os.path.join(run_dir, CRASH_POSTMORTEM_FILE)
 
     # Refuse to start on top of a previous run's leftovers rather than silently
     # stacking a mount or mixing two runs' logs. Re-running the same seed reuses
     # this directory, and mixed logs would produce spurious ledger conflicts on
     # exactly the reproduction run meant to confirm a finding.
-    for path in (ledger_path, delivered_path, episodes_path):
+    # The crash post-mortem too: a stale one would be rendered into the next
+    # run's report as though that run had crashed.
+    for path in (ledger_path, delivered_path, episodes_path, crash_path):
         if os.path.exists(path) and os.path.getsize(path) > 0:
             sys.exit(
                 f"{path} already exists and is non-empty. Move or delete "
@@ -894,6 +1253,12 @@ def main():
     loadgen_log = None
     violations = 0
     anomalies = 0
+    # Crash-path state for the post-mortem in `finally`. `wab_dir` stays None
+    # if the run fails before it creates the WAB directory; `final_pass_ran`
+    # says whether final_pass step 5 already scanned the WAB.
+    wab_dir = None
+    final_pass_ran = False
+    crash_reason = None
 
     try:
         stack.setup()
@@ -933,12 +1298,25 @@ def main():
             # NOT 9185: that is weir-server's compiled-in default, so a real
             # instance on this host would collide with the harness.
             19185, sched["weir"], daemon_log,
+            log_path=os.path.join(run_dir, "weir-server.log"),
+            # Only the admin trigger drives the control plane; see
+            # ADMIN_SOCKET_PATH for why the others keep weir's default.
+            admin_socket_path=ADMIN_SOCKET_PATH if kind == "admin_pause_resume" else None,
         )
-        daemon.start("http://127.0.0.1:9900/ingest")
+        daemon.start(SINK_URL)
 
         delays = kill_delays(
             seed, sched["episodes"], sched["steady_lo_secs"], sched["steady_hi_secs"]
         )
+        # How each episode ends, and the fault the ORACLE judges it under. For
+        # the legacy kinds `oracle == kind`, so their records are unchanged. A
+        # lifecycle trigger is judged as the cut it ends in; the trigger itself
+        # is recorded separately under `trigger`. The plan draws from its own
+        # salted stream, so `delays` above is the same sequence as before.
+        cut = faults.cut_mode(sched)
+        oracle = faults.oracle_fault(kind, cut)
+        plan = (faults.fault_plan(seed, sched["episodes"], kind, sched.get("faults") or {})
+                if kind in faults.TRIGGER_KINDS else None)
         run_started = time.monotonic()
         deadline = run_started + max_duration_secs if max_duration_secs else None
         # The load must outlast the episodes. Steady-state sleeps are only part
@@ -1056,73 +1434,33 @@ def main():
                     # `abort_reason` is what makes this count as an anomaly.
                     anomalies += 1
                     ep_log.write(json.dumps({
-                        "episode": i, "fault": kind, "ok": True,
+                        "episode": i, "fault": oracle,
+                        **({"trigger": kind} if plan else {}), "ok": True,
                         "quiesced": False, "abort_reason": reason,
                         "exit_code": code, "seed": seed,
                     }) + "\n")
                     ep_log.flush()
                     break
 
+                trigger_result = None
                 if kind == "power_loss":
-                    # PROTOCOL: kill first, then drop and remount. Superseded
-                    # from the original "engage, then kill" — see the spec's
-                    # "Protocol: kill first, then drop and remount" section
-                    # for the full kernel-layering argument; summary:
-                    #
-                    # drop_writes sits BELOW the page cache. A dropped write
-                    # still leaves a correct, resident page behind, and
-                    # kill -9 does not evict it — so the only way to actually
-                    # lose a byte is drop_and_remount's umount/mount cycle,
-                    # which forces the dirty page out (discarded by the lying
-                    # disk while engaged) and then rebuilds the filesystem
-                    # from whatever actually reached the platter.
-                    #
-                    # KILLING FIRST makes the lying window EXACTLY ZERO BY
-                    # CONSTRUCTION — weir is already dead and cannot ack into
-                    # it — rather than merely narrow. The superseded ordering
-                    # left two subprocess round trips (dmsetup resume plus a
-                    # table read-back) between engage and kill: 5-10ms at
-                    # full rate, hundreds of acks, each one a false
-                    # Durable-tier I1 violation once C2 made the injector
-                    # actually bite.
-                    #
-                    # I6: a canary block, written before the fault and
-                    # overwritten while it's engaged, converts the negative
-                    # control from an INFERENCE (zero Buffered loss is merely
-                    # "suspicious") into a MEASUREMENT — if the overwrite
-                    # survives the umount/remount cycle, the injector did not
-                    # bite THIS episode, independent of anything weir did.
-                    canary_before = f"weir-chaos-canary ep={i} phase=pre-fault\n".encode()
-                    canary_during = f"weir-chaos-canary ep={i} phase=engaged\n".encode()
-                    stack.write_canary(canary_before)
-
-                    daemon.kill9()
-                    stack.engage_fault()
-                    try:
-                        # Overwritten HERE: inside the engaged window and
-                        # still mounted, the same conditions weir's own WAB
-                        # writes are under.
-                        stack.write_canary(canary_during)
-                        stack.drop_and_remount(wab_dir=daemon.wab_dir)
-                    finally:
-                        # Disengage even if drop_and_remount raised partway
-                        # through (e.g. its umount step failed while the
-                        # fault was still live). A device left engaged means
-                        # the NEXT episode's steady-state load runs against a
-                        # lying disk, silently corrupting the run from that
-                        # point on. Unlike the superseded protocol, weir is
-                        # already dead here, so there is no timing pressure
-                        # left on this cleanup — a redundant disengage on the
-                        # success path (drop_and_remount already disengaged)
-                        # costs one harmless extra round trip, not a false ack.
-                        stack.disengage_fault()
-                    canary_result = canary_verdict(
-                        canary_before, canary_during, stack.read_canary()
-                    )
+                    # The Phase 2 kill-first protocol and the I6 canary: see
+                    # faults.power_cut, which the lifecycle triggers share.
+                    canary_result = faults.power_cut(stack, daemon, i)
+                elif kind in faults.TRIGGER_KINDS:
+                    # Provoke the lifecycle path, then end in the schedule's
+                    # cut (faults.cut). The trigger owns the canary when it
+                    # ends in a power cut, and reports what it saw as
+                    # anomaly_reasons (never violations: see episode_counts).
+                    ops = faults.LiveOps(daemon, recorder, stack, cut, i, SINK_URL,
+                                         admin_path=daemon.admin_socket_path,
+                                         delivered_path=delivered_path)
+                    trigger_result = faults.run_trigger(kind, plan[i], ops)
+                    canary_result = trigger_result.get("canary")
                 else:
                     daemon.kill9()
                     canary_result = None
-                daemon.start("http://127.0.0.1:9900/ingest")
+                daemon.start(SINK_URL)
 
                 # PAUSE THE PRODUCER before waiting for the drain.
                 #
@@ -1153,7 +1491,7 @@ def main():
                     acc.ingest(ledger_tail.read_new(), delivered_tail.read_new())
                     result = acc.check(
                         frontier_slack=frontier_slack,
-                        tier=sched["load"]["tier"], fault=kind,
+                        tier=sched["load"]["tier"], fault=oracle,
                     )
                 finally:
                     # Always resume, even if the wait or the check raised —
@@ -1188,14 +1526,17 @@ def main():
                 # A quiescence timeout or a no-progress episode is not
                 # evidence weir lost or leaked anything; it means this
                 # episode proved nothing, which is a different kind of bad.
-                if not result.ok and not advisory:
-                    violations += 1
-                if not ok or no_progress or advisory:
-                    anomalies += 1
+                # A trigger's own findings (it did not land, a shutdown broke
+                # its bound) are anomalies on the same footing.
+                tf = trigger_record_fields(kind, cut, trigger_result)
+                v, a = episode_counts(result.ok, advisory, ok, no_progress,
+                                      tf.get("anomaly_reasons", []))
+                violations += v
+                anomalies += a
 
                 record = {
                     "episode": i,
-                    "fault": kind,
+                    "fault": oracle,
                     "tier": sched["load"]["tier"],
                     "steady_secs": round(delay, 2),
                     "quiesced": ok,
@@ -1258,6 +1599,9 @@ def main():
                     "canary": canary_result,
                     "seed": seed,
                 }
+                # {} for the legacy kinds. The trigger's `anomaly_reasons` stay
+                # separate from the recorder's `advisory_reasons` below.
+                record.update(tf)
                 if advisory:
                     record["advisory_reasons"] = ["recorder_exited"]
                 ep_log.write(json.dumps(record) + "\n")
@@ -1291,8 +1635,9 @@ def main():
             final_record, v, a = final_pass(
                 loadgen, daemon, recorder, acc, ledger_tail, delivered_tail,
                 daemon.wab_dir, frontier_slack, seed, prev_totals=prev_totals,
-                tier=sched["load"]["tier"], fault=kind,
+                tier=sched["load"]["tier"], fault=oracle,
             )
+            final_pass_ran = True
             violations += v
             anomalies += a
             ep_log.write(json.dumps(final_record) + "\n")
@@ -1305,6 +1650,11 @@ def main():
                 f"anomalies={final_record['anomaly_reasons'] or 'none'}",
                 flush=True,
             )
+    except BaseException as exc:
+        # Recorded for the crash post-mortem in `finally`, then re-raised
+        # unchanged: this is evidence capture, not error handling.
+        crash_reason = f"{type(exc).__name__}: {exc}"
+        raise
     finally:
         # Each step isolated. A process can exit between `poll()` and
         # `terminate()`, and an unguarded ProcessLookupError there would skip
@@ -1348,8 +1698,27 @@ def main():
                     recorder.wait(timeout=10)
         except Exception as exc:
             print(f"cleanup: recorder terminate failed: {exc}", file=sys.stderr)
+        # The crash-path WAB post-mortem: what weir left on disk, read BEFORE
+        # teardown unmounts the device. Only when final_pass did not already
+        # scan it (step 5), i.e. the run raised before or inside the final pass.
+        if not final_pass_ran:
+            try:
+                pm = crash_postmortem(
+                    wab_dir, crash_reason or "the run ended before its final pass")
+                # Only if it exists: an exception before or inside
+                # stack.setup() never created it, and report.md must not point
+                # the operator at an image that is not there.
+                pm["image_kept"] = (
+                    stack.backing_file if os.path.exists(stack.backing_file) else None)
+                pm_path = write_crash_postmortem(run_dir, pm)
+                print(f"crash path: WAB post-mortem written to {pm_path}",
+                      file=sys.stderr)
+            except Exception as exc:
+                print(f"cleanup: crash post-mortem failed: {exc}", file=sys.stderr)
         try:
-            stack.teardown()
+            # The crash path keeps wab.img: the post-mortem above is a summary,
+            # the image is the WAB itself, readable after a read-only mount.
+            stack.teardown(keep_image=not final_pass_ran)
         except Exception as exc:
             print(f"cleanup: storage teardown failed: {exc}", file=sys.stderr)
         if daemon_log:

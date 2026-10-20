@@ -199,12 +199,16 @@ class StorageStack:
         # point. Set it here.
         os.chmod(self.mount_point, 0o700)
 
-    def teardown(self):
+    def teardown(self, keep_image=False):
         """Unmounts, tears down the dm layer (if any), detaches the loop
         device, and removes the image.
 
         Every step tolerates already-undone state so teardown is idempotent
         and safe to call from a finally block after a partial setup.
+
+        `keep_image=True` (the crash path) unmounts and detaches but leaves
+        the backing file, so the WAB a crashed run left behind can be
+        loop-mounted and read afterwards.
         """
         _run(["umount", self.mount_point], check=False)
         if self.dm_name:
@@ -248,6 +252,13 @@ class StorageStack:
                 )
                 return
             self.loop_device = None
+        if keep_image:
+            print(
+                f"teardown: kept {self.backing_file} for forensics "
+                f"(`losetup -fP --show -r {self.backing_file}` then mount it read-only)",
+                file=sys.stderr,
+            )
+            return
         if os.path.exists(self.backing_file):
             os.remove(self.backing_file)
 
