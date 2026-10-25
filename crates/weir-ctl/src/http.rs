@@ -6,7 +6,7 @@ use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
-use crate::deadline::{DeadlineReader, is_timeout};
+use crate::deadline::{DeadlineReader, is_timeout, tolerate_closed_peer};
 
 /// The connect (per resolved address) and write timeout, and one deadline
 /// for the whole response: a listener that dribbles bytes cannot hold
@@ -51,8 +51,9 @@ fn http_get_within(addr: &str, path: &str, timeout: Duration) -> Result<HttpResp
         Some(e) => format!("connect {addr}: {e}"),
         None => format!("connect {addr}: no address"),
     })?;
-    stream
-        .set_write_timeout(Some(timeout))
+    // A peer that already reset the connection fails this on macOS; the
+    // write and read below then fail or finish at once.
+    tolerate_closed_peer(&stream, stream.set_write_timeout(Some(timeout)))
         .map_err(|e| format!("set timeout: {e}"))?;
     stream
         .write_all(format!("GET {path} HTTP/1.0\r\nHost: localhost\r\n\r\n").as_bytes())

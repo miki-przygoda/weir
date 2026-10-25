@@ -286,12 +286,13 @@ fn exchange(
     reply_timeout: Duration,
     expected: Option<(u64, u64)>,
 ) -> Result<AdminReply, CallError> {
-    use crate::deadline::{DeadlineReader, is_timeout};
+    use crate::deadline::{DeadlineReader, is_timeout, tolerate_closed_peer};
     use std::io::{BufRead, BufReader, Read, Write};
 
-    // 5. One request line.
-    stream
-        .set_write_timeout(Some(WRITE_TIMEOUT))
+    // 5. One request line. On macOS a daemon that has already answered
+    // `busy` and closed fails the timeout call itself; the reply it queued
+    // is still read below.
+    tolerate_closed_peer(stream, stream.set_write_timeout(Some(WRITE_TIMEOUT)))
         .map_err(|e| CallError::Unreachable(format!("set timeout: {e}")))?;
     let req = serde_json::json!({"v": 1, "id": 1, "verb": verb, "args": args});
     let mut line = req.to_string();
