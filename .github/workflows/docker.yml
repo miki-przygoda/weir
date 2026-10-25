@@ -124,6 +124,22 @@ jobs:
             fi
           done
 
+          # The image's own HEALTHCHECK (GET /livez) must report healthy: this is
+          # the only place the shipped command runs inside the shipped image.
+          echo "Waiting for the HEALTHCHECK to report healthy…"
+          for i in $(seq 1 40); do
+            status=$(docker inspect -f '{{.State.Health.Status}}' weir-smoke)
+            [ "$status" = healthy ] && break
+            if [ "$i" -eq 40 ]; then
+              echo "ERROR: container health is '$status' after 40 s"
+              docker inspect -f '{{json .State.Health}}' weir-smoke
+              docker logs weir-smoke
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "Container healthy."
+
           # Confirm WAB segments were written.  Use docker exec so the find
           # runs as root inside the container (shard dirs are owned by weir).
           WAB_COUNT=$(docker exec weir-smoke \

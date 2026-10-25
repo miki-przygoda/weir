@@ -41,6 +41,14 @@ const CONTAINER_MD: &str = include_str!("../../../docs/security/container.md");
 /// rounded up.
 const GRACE_FORMULA: &str = "shutdown_timeout_secs + drain_shutdown_budget_secs + 5";
 
+const MONITORING_COMPOSE: &str = include_str!("../../../deploy/monitoring/docker-compose.yml");
+// CI_YML is PR 4 Task 4.2's const; reused, not redeclared.
+
+/// The container liveness check, spec §12: one HTTP/1.0 request to /livez
+/// over bash's /dev/tcp (the image ships no curl or wget), healthy only on a
+/// 200 status line.
+const LIVEZ_HEALTHCHECK: &str = "exec 3<>/dev/tcp/127.0.0.1/9185 && printf 'GET /livez HTTP/1.0\\r\\n\\r\\n' >&3 && read -r l <&3 && [[ $l == *' 200 '* ]]";
+
 /// `Version: 2.1.0  ` → `2.1.0`.
 fn latest_md_version() -> &'static str {
     LATEST
@@ -1165,4 +1173,103 @@ fn the_shutdown_grace_formula_holds_in_every_deploy_file() {
          budget and the active segments wait for recovery.",
         problems.join("\n  ")
     );
+}
+
+/// The bash command of the first `["CMD", "/bin/bash", "-c", "<cmd>"]` after
+/// `anchor`, with JSON/YAML `\\` escapes undone. For a compose file, `$$` is
+/// compose's escape for a literal `$`; a lone `$` would be interpolated by
+/// compose as an (empty) variable, so it is rejected here rather than undone.
+fn healthcheck_command(src: &str, anchor: &str, compose: bool) -> String {
+    let from = src
+        .find(anchor)
+        .unwrap_or_else(|| panic!("no {anchor:?} in this file"));
+    let marker = "\"/bin/bash\", \"-c\", \"";
+    let start = src[from..]
+        .find(marker)
+        .expect("the healthcheck is not the exec form [\"CMD\", \"/bin/bash\", \"-c\", ...]")
+        + from
+        + marker.len();
+    let end = src[start..].find("\"]").expect("unterminated healthcheck") + start;
+    let cmd = src[start..end].replace("\\\\", "\\");
+    if compose {
+        assert!(
+            !cmd.replace("$$", "").contains('$'),
+            "a compose healthcheck uses a bare `$` ({cmd:?}); compose interpolates \n\
+             it as an empty variable, so `[[ $l == ... ]]` becomes `[[  == ... ]]` \n\
+             and the container is never healthy. Write `$$`."
+        );
+        cmd.replace("$$", "$")
+    } else {
+        cmd
+    }
+}
+
+/// The image, the compose file and the monitoring stack probe liveness with
+/// the same command, and it is the /livez one.
+///
+/// The three copies drifted once already in the other direction: the compose
+/// file's comment explains a `wget` probe that failed with "not found" in a
+/// curl-less image and restart-looped a healthy container. A copy that still
+/// opens a bare TCP connection reports healthy for anything listening on 9185.
+#[test]
+fn every_container_healthcheck_probes_livez_the_same_way() {
+    for (file, cmd) in [
+        (
+            "deploy/docker/Dockerfile",
+            healthcheck_command(DOCKER_IMAGE, "\nHEALTHCHECK ", false),
+        ),
+        (
+            "deploy/docker/docker-compose.yml",
+            healthcheck_command(COMPOSE, "healthcheck:", true),
+        ),
+        (
+            "deploy/monitoring/docker-compose.yml",
+            healthcheck_command(MONITORING_COMPOSE, "healthcheck:", true),
+        ),
+    ] {
+        assert_eq!(
+            cmd, LIVEZ_HEALTHCHECK,
+            "{file}: the healthcheck command differs from the canonical /livez probe"
+        );
+    }
+    assert!(
+        DOCKER_IMAGE.contains("--start-period=10s"),
+        "deploy/docker/Dockerfile: the HEALTHCHECK needs --start-period=10s (spec §12)"
+    );
+    for (file, src) in [
+        ("deploy/docker/docker-compose.yml", COMPOSE),
+        ("deploy/monitoring/docker-compose.yml", MONITORING_COMPOSE),
+    ] {
+        assert!(
+            src.contains("start_period: 10s"),
+            "{file}: needs `start_period: 10s`"
+        );
+    }
+}
+
+/// `tests/deploy.rs` runs on both `cargo test -p weir-server` lines in CI.
+///
+/// ci.yml names its test targets one by one, so a new target that is not
+/// added there compiles locally and never runs in CI: "a drift guard is
+/// theatre until wired".
+#[test]
+fn the_deploy_tests_run_in_ci() {
+    let lines: Vec<&str> = CI_YML
+        .lines()
+        .filter(|l| l.contains("cargo test -p weir-server --lib --test system"))
+        .collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "expected the default-features and --all-features weir-server test lines \n\
+         in ci.yml, found {}",
+        lines.len()
+    );
+    for line in lines {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        assert!(
+            words.windows(2).any(|w| w == ["--test", "deploy"]),
+            "ci.yml line does not run --test deploy:\n  {line}"
+        );
+    }
 }

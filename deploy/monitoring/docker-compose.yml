@@ -30,11 +30,12 @@ x-weir-base: &weir-base
   image: weir-server:local
   restart: unless-stopped
   healthcheck:
-    test: ["CMD", "/bin/bash", "-c", "exec 3</dev/tcp/127.0.0.1/9185 || exit 1"]
+    # GET /livez, as the Dockerfile's HEALTHCHECK (`$$l` escapes compose).
+    test: ["CMD", "/bin/bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9185 && printf 'GET /livez HTTP/1.0\\r\\n\\r\\n' >&3 && read -r l <&3 && [[ $$l == *' 200 '* ]]"]
     interval: 5s
     timeout: 3s
     retries: 5
-    start_period: 5s
+    start_period: 10s
 
 x-loadgen-base: &loadgen-base
   build:

@@ -214,22 +214,25 @@ whose directory is writable only by uid 10001.
 
 ### Healthcheck
 
-`HEALTHCHECK` opens a TCP connection to the metrics port (9185) using
-bash's `/dev/tcp` virtual file — no extra packages installed, no curl
-or wget needed. The check succeeds iff:
+`HEALTHCHECK` sends `GET /livez` to the metrics port (9185) over bash's
+`/dev/tcp` virtual file (no curl or wget in the image) and is healthy only on
+a `200` status line. `/livez` answers 200 whenever the daemon's runtime is
+serving HTTP: a few milliseconds after start, all through WAB recovery, and
+while shutting down. It fails only on the checks you select with
+`livez_checks` (default: none), each a state a restart fixes
+(`no_live_shard`, `listener_down`, `worker_exited`, and the opt-ins
+`drain_stopped`, `drain_wedged`). It never fails because the sink is down or
+the drain is paused, retrying or blocked, so Docker never restarts weir for a
+slow downstream.
 
-1. The daemon process is alive.
-2. The metrics HTTP server has bound the port.
+It is a liveness check, not readiness. "Can this daemon take ingest now?" is
+`GET /readyz`; see [Health and status endpoints](../monitoring.md#health-and-status-endpoints).
 
-It does not exercise the wire protocol (Unix socket) end-to-end. For a
-deeper liveness check, an operator can override `HEALTHCHECK CMD` at
-runtime with one that connects to the Unix socket and sends a
-`HealthCheck` frame.
-
-The defaults (10s interval, 3s timeout, 5s start period, 3 retries) are
-suited to development. Orchestrators (Kubernetes, ECS) usually replace
-the Dockerfile `HEALTHCHECK` with their own probes; the in-image version
-is a fallback for plain `docker run`.
+The defaults (10 s interval, 3 s timeout, 10 s start period, 3 retries) suit
+`docker run` and compose. The command hard-codes port 9185: if you change
+`metrics_port`, override `HEALTHCHECK` (or compose's `healthcheck.test`) with
+the new port. Kubernetes ignores the image's `HEALTHCHECK`; use the probe
+recipe in monitoring.md instead.
 
 ## What the image does NOT do
 

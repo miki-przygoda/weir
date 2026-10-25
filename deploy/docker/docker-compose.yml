@@ -50,21 +50,18 @@ services:
     user: weir
 
     healthcheck:
-      # The metrics endpoint doubles as a liveness probe. It binds before WAB
-      # recovery, so it answers during a long recovery too.
-      #
-      # The runtime image (debian:bookworm-slim) ships ONLY ca-certificates —
-      # there is NO wget or curl — so an HTTP-client probe would always fail with
-      # "wget: not found", marking a healthy container unhealthy and (under
-      # restart: unless-stopped) triggering a restart loop. Mirror the
-      # Dockerfile's HEALTHCHECK instead: bash's /dev/tcp opens a TCP connection
-      # to the metrics port (9185) with no extra packages. Succeeds iff the
-      # daemon is alive and the metrics server has bound.
-      test: ["CMD", "/bin/bash", "-c", "exec 3</dev/tcp/127.0.0.1/9185 || exit 1"]
+      # Liveness: GET /livez, the same command as the Dockerfile's HEALTHCHECK.
+      # The image ships ONLY ca-certificates (no curl or wget), so the request is
+      # written by hand over bash's /dev/tcp. `$$l` is compose's escape for the
+      # shell's `$l`; a bare `$l` would be interpolated by compose as an empty
+      # variable and the container would never become healthy. /livez fails
+      # only on the `livez_checks` you select (default none), never on sink
+      # health or a slow recovery.
+      test: ["CMD", "/bin/bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9185 && printf 'GET /livez HTTP/1.0\\r\\n\\r\\n' >&3 && read -r l <&3 && [[ $$l == *' 200 '* ]]"]
       interval: 10s
       timeout: 3s
       retries: 3
-      start_period: 5s
+      start_period: 10s
 
 volumes:
   wab_data:
