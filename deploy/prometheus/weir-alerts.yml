@@ -294,6 +294,31 @@ groups:
           description: "The sink permanently rejected records (e.g. a 4xx). They are written to the dead-letter directory for manual handling, not retried. Inspect the dead-letter files + the sink's rejection reason."
           runbook: "docs/monitoring.md#weirdeadlettered"
 
+      # A pause is in-memory and deliberate, so its first hour is not an
+      # incident. Past that it is usually a forgotten `weir-ctl drain pause`,
+      # and with wab_max_bytes = 0 the WAB grows without bound meanwhile.
+      - alert: WeirDrainPausedLong
+        expr: weir_drain_paused{job=~"weir"} == 1
+        for: 1h
+        labels: { severity: warning }
+        annotations:
+          summary: "weir delivery on {{ $labels.instance }} has been paused for over an hour"
+          description: "An operator paused the drain (`weir-ctl drain pause`) and it is still paused. Ingest keeps buffering into the WAB, which grows until wab_max_bytes makes pushes nack, or without bound if wab_max_bytes is 0. Resume with `weir-ctl drain resume`; a restart also resumes delivery."
+          runbook: "docs/monitoring.md#weirdrainpausedlong"
+
+      # [TUNE] to your delivery SLO. The gauge is an UPPER bound: it is the age
+      # of the oldest unconfirmed sealed segment, from its header's creation
+      # time, not of its newest record. The delivery_lagging condition fires
+      # at 900 s; this pages at four times that.
+      - alert: WeirOldestUndeliveredAge
+        expr: weir_wab_oldest_undelivered_age_seconds{job=~"weir"} > 3600
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "weir on {{ $labels.instance }} holds undelivered data older than an hour"
+          description: "The oldest sealed segment the sink has not confirmed was created over an hour ago (an upper bound on the oldest record's age). Delivery is behind or stuck: `weir-ctl status` shows which (delivery_stalled, sink_down, sink_failing, drain_paused, segments_stranded, or delivery_lagging with commits succeeding)."
+          runbook: "docs/monitoring.md#weiroldestundeliveredage"
+
   # ── Ingest / backpressure ───────────────────────────────────────────────────
   - name: weir-ingest
     rules:
@@ -316,6 +341,22 @@ groups:
           description: "The work queue is backing up — the WAB flushers can't keep pace with ingest (usually storage pressure). Correlate with fsync latency. Producers see backpressure (slower acks)."
           runbook: "docs/monitoring.md#weirqueuesaturation"
 
+      # weir_wab_handoff_blocked_seconds{shard} is how long that shard's flusher
+      # has been waiting to hand a sealed segment to the drain (0 when it is
+      # not). The acks of the batch behind it wait too, so producers see
+      # ACK_TIMEOUT nacks for records that are already durable. max_over_time
+      # bridges the gaps between hand-offs: under steady backpressure each
+      # wait ends when the drain takes one segment, and the next begins at the
+      # next rotation. A single short block (< 2 m of scrapes) never fires.
+      - alert: WeirDrainBackpressure
+        expr: max by (job, instance) (max_over_time(weir_wab_handoff_blocked_seconds{job=~"weir"}[2m])) > 5
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "weir on {{ $labels.instance }}: delivery is stalling ingest (drain hand-off blocked)"
+          description: "WAB flushers keep waiting to hand sealed segments to the drain because its channel is full. Acks wait behind the hand-off, so producers see ACK_TIMEOUT nacks of records that ARE durable. This is a delivery problem, not a storage one: check sink commit latency and the sink and drain conditions in `weir-ctl status`."
+          runbook: "docs/monitoring.md#weirdrainbackpressure"
+
   # ── Security / connection ───────────────────────────────────────────────────
   - name: weir-security
     rules:
@@ -337,6 +378,18 @@ groups:
           summary: "weir TLS handshake failures on {{ $labels.instance }}"
           description: "(tls feature) Repeated mutual-TLS handshake failures — client-cert expiry/rotation, a CA mismatch, or a probe hitting the TCP port. Check the client certificates and the CA bundle."
           runbook: "docs/monitoring.md#weirtlshandshakefailures"
+
+      # Fires only when the admin socket is ENABLED and could not be bound: the
+      # admin_unavailable condition. weir_admin_socket_up alone is also 0 when
+      # admin_socket_enabled = false, which is a choice, not an incident.
+      - alert: WeirAdminUnavailable
+        expr: max by (job, instance) (weir_condition_active{job=~"weir", code="admin_unavailable"}) == 1
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "weir admin socket is unavailable on {{ $labels.instance }}"
+          description: "admin_socket_enabled is on but the daemon could not bind the admin socket (most often a parent directory that is group- or world-writable, or owned by another user). weir-ctl drain and weir-ctl reload do not work until it is fixed; kill -HUP still reloads TLS, and weir-ctl status falls back to HTTP and disk. The reason code is on /status under admin.reason_code."
+          runbook: "docs/monitoring.md#weiradminunavailable"
 
   # ── Integrity / tamper evidence ─────────────────────────────────────────────
   - name: weir-integrity

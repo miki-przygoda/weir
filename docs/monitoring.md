@@ -375,6 +375,25 @@ writes the record into a new WAB entry with a different key. `weir-ctl dl`
 also offers `list` (inspect) and `drop` (discard) for when the records aren't
 worth reprocessing.
 
+#### WeirDrainPausedLong
+An operator paused delivery with `weir-ctl drain pause` over an hour ago, and
+it is still paused. Ingest keeps buffering, so the WAB grows until
+`wab_max_bytes` starts nacking pushes, or without bound when the cap is 0.
+**Respond:** if the pause is still wanted, silence the alert for the planned
+window. Otherwise `weir-ctl drain resume`. A restart also resumes delivery:
+a pause lives in memory only.
+
+#### WeirOldestUndeliveredAge
+The oldest sealed segment the sink has not confirmed was created over an hour
+ago. That is an upper bound on the oldest record's age: it is the segment's
+creation time.
+**Respond:** `weir-ctl status` tells stuck from slow. Stuck:
+`delivery_stalled`, `sink_down`, `sink_failing`, `drain_paused` or
+`segments_stranded`; follow that condition's runbook. Slow: only
+`delivery_lagging`, with commits succeeding, means ingest outruns the sink;
+compare `rate(weir_sink_commit_records_total[5m])` with the ingest rate and add
+sink capacity. `[TUNE]` the hour to your delivery objective.
+
 ### Ingest / backpressure
 
 #### WeirHighNackRate
@@ -392,6 +411,17 @@ the storage durability ceiling — faster disk, more shards (one flusher/disk), 
 shift latency-tolerant traffic to the `Buffered` tier. `[TUNE]` the
 threshold to your `batch_size × shard_count` and burst profile.
 
+#### WeirDrainBackpressure
+WAB flushers have spent the last ten minutes repeatedly waiting to hand sealed
+segments to the drain, whose 256-slot channel is full. The acks of the batch
+behind each wait cannot resolve until it ends, so producers see `ACK_TIMEOUT`
+nacks for records that are already durable: a delivery problem that looks
+like a storage one.
+**Respond:** check sink commit latency (`weir_sink_commit_duration_seconds`)
+and the sink and drain conditions in `weir-ctl status`. A paused drain
+(`drain_paused`) produces exactly this. Producers' retries of the nacked
+records will be delivered twice, which at-least-once allows.
+
 ### Security / connection
 
 #### WeirUnauthorizedConnections
@@ -408,6 +438,21 @@ expiry/rotation, a CA mismatch, or a probe hitting the TCP port.
 after a cert rotation suggests the new certs aren't trusted;
 `weir_tls_config_reloads_total{outcome="ok"}` confirms whether a SIGHUP
 reload landed (and `outcome="failed"` that it was rejected).
+
+#### WeirAdminUnavailable
+`admin_socket_enabled` is on, but the daemon could not bind the admin socket.
+The reason is on `/status` under `admin.reason_code`: `parent_insecure` (the
+parent directory is group- or world-writable, or owned by a uid other than the
+daemon's or root; the daemon refuses rather than let another user plant a
+fake control socket there), `path_too_long`, `in_use` (another live socket
+already answers at that path) or `bind_failed`.
+**Respond:** make the parent directory private (`chmod go-w <dir>`, and
+`chown <daemon user> <dir>` if another user owns it), or set
+`admin_socket_path` to a private directory, then restart. Until then
+`weir-ctl drain` and `weir-ctl reload` do not work; `kill -HUP` still reloads
+TLS, and `weir-ctl status` falls back to HTTP and disk. To run without the
+admin socket on purpose, set `admin_socket_enabled = false`; that does not
+fire this alert.
 
 ### Integrity / tamper evidence
 

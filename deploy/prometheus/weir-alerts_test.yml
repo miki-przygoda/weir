@@ -859,3 +859,127 @@ tests:
       - eval_time: 10m
         alertname: WeirConditionCritical
         exp_alerts: []
+
+  # ── Paused delivery, old undelivered data, hand-off backpressure, admin ─────
+
+  - interval: 1m
+    name: a pause held over an hour fires WeirDrainPausedLong
+    input_series:
+      - series: 'weir_drain_paused{job="weir",instance="w:9185"}'
+        values: "1x70"
+    alert_rule_test:
+      - eval_time: 65m
+        alertname: WeirDrainPausedLong
+        exp_alerts:
+          - exp_labels:
+              instance: "w:9185"
+              job: "weir"
+              severity: "warning"
+            exp_annotations:
+              summary: "weir delivery on w:9185 has been paused for over an hour"
+              description: "An operator paused the drain (`weir-ctl drain pause`) and it is still paused. Ingest keeps buffering into the WAB, which grows until wab_max_bytes makes pushes nack, or without bound if wab_max_bytes is 0. Resume with `weir-ctl drain resume`; a restart also resumes delivery."
+              runbook: "docs/monitoring.md#weirdrainpausedlong"
+
+  - interval: 1m
+    name: a pause under an hour, and no pause, do not fire
+    input_series:
+      - series: 'weir_drain_paused{job="weir",instance="p:9185"}'
+        values: "1x50"
+      - series: 'weir_drain_paused{job="weir",instance="w:9185"}'
+        values: "0x50"
+    alert_rule_test:
+      - eval_time: 50m
+        alertname: WeirDrainPausedLong
+        exp_alerts: []
+
+  - interval: 1m
+    name: undelivered data older than an hour fires WeirOldestUndeliveredAge
+    input_series:
+      - series: 'weir_wab_oldest_undelivered_age_seconds{job="weir",instance="w:9185"}'
+        values: "4000+60x30"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: WeirOldestUndeliveredAge
+        exp_alerts:
+          - exp_labels:
+              instance: "w:9185"
+              job: "weir"
+              severity: "warning"
+            exp_annotations:
+              summary: "weir on w:9185 holds undelivered data older than an hour"
+              description: "The oldest sealed segment the sink has not confirmed was created over an hour ago (an upper bound on the oldest record's age). Delivery is behind or stuck: `weir-ctl status` shows which (delivery_stalled, sink_down, sink_failing, drain_paused, segments_stranded, or delivery_lagging with commits succeeding)."
+              runbook: "docs/monitoring.md#weiroldestundeliveredage"
+
+  - interval: 1m
+    name: a young backlog, and a backlog that caught up, do not fire
+    input_series:
+      - series: 'weir_wab_oldest_undelivered_age_seconds{job="weir",instance="w:9185"}'
+        values: "100+0x30"
+      - series: 'weir_wab_oldest_undelivered_age_seconds{job="weir",instance="c:9185"}'
+        values: "4000x10 0x20"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: WeirOldestUndeliveredAge
+        exp_alerts: []
+
+  - interval: 1m
+    name: a hand-off blocked for minutes fires WeirDrainBackpressure
+    input_series:
+      - series: 'weir_wab_handoff_blocked_seconds{job="weir",instance="w:9185",shard="0"}'
+        values: "30x20"
+      - series: 'weir_wab_handoff_blocked_seconds{job="weir",instance="w:9185",shard="1"}'
+        values: "0x20"
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: WeirDrainBackpressure
+        exp_alerts:
+          - exp_labels:
+              instance: "w:9185"
+              job: "weir"
+              severity: "warning"
+            exp_annotations:
+              summary: "weir on w:9185: delivery is stalling ingest (drain hand-off blocked)"
+              description: "WAB flushers keep waiting to hand sealed segments to the drain because its channel is full. Acks wait behind the hand-off, so producers see ACK_TIMEOUT nacks of records that ARE durable. This is a delivery problem, not a storage one: check sink commit latency and the sink and drain conditions in `weir-ctl status`."
+              runbook: "docs/monitoring.md#weirdrainbackpressure"
+
+  - interval: 1m
+    name: no hand-off block, and one brief block, do not fire WeirDrainBackpressure
+    input_series:
+      - series: 'weir_wab_handoff_blocked_seconds{job="weir",instance="w:9185",shard="0"}'
+        values: "0x20"
+      - series: 'weir_wab_handoff_blocked_seconds{job="weir",instance="b:9185",shard="0"}'
+        values: "0 0 8 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: WeirDrainBackpressure
+        exp_alerts: []
+
+  - interval: 1m
+    name: an enabled admin socket that could not bind fires WeirAdminUnavailable
+    input_series:
+      - series: 'weir_condition_active{job="weir",instance="w:9185",code="admin_unavailable",severity="warning"}'
+        values: "1x10"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: WeirAdminUnavailable
+        exp_alerts:
+          - exp_labels:
+              instance: "w:9185"
+              job: "weir"
+              severity: "warning"
+            exp_annotations:
+              summary: "weir admin socket is unavailable on w:9185"
+              description: "admin_socket_enabled is on but the daemon could not bind the admin socket (most often a parent directory that is group- or world-writable, or owned by another user). weir-ctl drain and weir-ctl reload do not work until it is fixed; kill -HUP still reloads TLS, and weir-ctl status falls back to HTTP and disk. The reason code is on /status under admin.reason_code."
+              runbook: "docs/monitoring.md#weiradminunavailable"
+
+  - interval: 1m
+    name: a bound or deliberately disabled admin socket does not fire WeirAdminUnavailable
+    input_series:
+      - series: 'weir_condition_active{job="weir",instance="w:9185",code="admin_unavailable",severity="warning"}'
+        values: "0x10"
+      - series: 'weir_admin_socket_up{job="weir",instance="w:9185"}'
+        values: "0x10"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: WeirAdminUnavailable
+        exp_alerts: []
