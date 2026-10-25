@@ -62,13 +62,19 @@ ExecStartPre=/usr/bin/install -d -m0700 /var/lib/weir/wab
 # (this IS the default path, but spell it out for clarity).
 ExecStart=/usr/local/bin/weir-server --config /etc/weir/weir.toml
 
-# Graceful shutdown (bounded): on SIGTERM weir goes lame duck (unlinks its
-# socket), waits up to shutdown_timeout_secs (default 30s) for open connections,
-# seals every active WAB segment, then gives the drain drain_shutdown_budget_secs
-# (default 10s) before exiting; what is left replays at the next start. Keep
-# TimeoutStopSec >= shutdown_timeout_secs + drain_shutdown_budget_secs + 5 (45s
-# at the defaults) so systemd never SIGKILLs a shutdown that is still bounded.
-# Raise it with either knob.
+# Graceful shutdown is BOUNDED. After SIGTERM weir:
+#   closes its listeners at once; an idle connection is closed at once, and a
+#     connection in the middle of a frame finishes it and gets its ack, for
+#     at most shutdown_timeout_secs                        (30 s in weir.toml)
+#   joins workers and flushers: active segments sealed and fsynced, each
+#     flusher waiting at most 1 s to hand its last segment to the drain
+#   lets the drain deliver for at most drain_shutdown_budget_secs (10 s)
+#   gives the drain thread 2 s to exit
+# so systemd must wait at least
+#   shutdown_timeout_secs + drain_shutdown_budget_secs + 5   = 45 s
+# before it escalates to SIGKILL. Raise TimeoutStopSec whenever you raise either
+# key in weir.toml. What the drain has not delivered when its budget runs out
+# stays sealed in the WAB and is delivered after the next start.
 KillSignal=SIGTERM
 TimeoutStopSec=45
 

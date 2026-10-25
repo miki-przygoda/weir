@@ -27,6 +27,15 @@ output are unchanged, and downgrading to 4.0.x is safe: an old binary skips
 `.weir.lock` (not a directory) and `*.confirmed.tmp` (not `.wab.sealed`), and
 nothing new is persisted.
 
+Foundations: weir can be observed and steered while it runs, and it starts
+and stops within bounds. Health routes and a typed status document say *why*
+a daemon is not ready, an admin socket pauses and resumes delivery, startup
+no longer waits on the sink, and shutdown is bounded. The wire protocol, the
+WAB format, `HealthCheck`, every existing metric and every existing `--json`
+shape (including `weir-ctl attest`) are unchanged. Downgrading is safe:
+older releases warn about and ignore the new config keys, and never read
+`wab.admin.sock`.
+
 ### Fixed
 
 - **A second daemon on the same `wab_dir` turned the first one's `Durable`
@@ -301,6 +310,29 @@ nothing new is persisted.
   predated `load_batch.rs` and `research.rs`. Two version headings
   (`[2.0.1]`, `[0.4.0]`) had no compare link at the foot of this file.
 
+- **With `shard_count = 1`, a dead flusher left a zombie daemon**: the drain
+  exited as if shutting down, so nothing was ingested or delivered while the
+  process still ran. The drain's lifetime is now explicit; it keeps
+  delivering the on-disk backlog until told to stop.
+
+- **A large backlog behind a slow sink kept the producer socket and
+  `/metrics` down during startup**, so `WeirInstanceDown` fired through every
+  recovery.
+
+- **`weir-readiness.sh` stayed NOT READY until a restart** after one
+  recovered flusher panic or one fsync failure, because it gated on lifetime
+  counters.
+
+- **The Docker `HEALTHCHECK` passed for anything listening on 9185.**
+
+- **ACK_TIMEOUT nacks of durable records were read as a storage problem.**
+  They are usually the drain channel backing up into the flushers; the
+  `drain_backpressure` condition and `WeirDrainBackpressure` now say so.
+
+- **`/metrics` died at the start of shutdown instead of the end**, so the
+  last scrapes of a stopping daemon failed. The runtime now outlives the
+  worker and flusher joins.
+
 ### Added
 
 - **`wab_dir_lock = "required" | "best-effort"`** (env `WEIR_WAB_DIR_LOCK`,
@@ -379,6 +411,37 @@ nothing new is persisted.
 - `/livez`, `/readyz`, `/startupz` and `/status` on the metrics listener (exact paths, GET/HEAD;
   every other path still returns metrics byte for byte); the `livez_checks` key
   (`--livez-checks`, `WEIR_LIVEZ_CHECKS`); `weir_http_requests_dropped_total{reason}`.
+  They answer within milliseconds of start, through recovery and through
+  shutdown.
+- **Conditions everywhere.** The `weir-status` evaluator's condition codes
+  (30 the daemon evaluates, from `starting` to `admin_unavailable`, each with
+  a severity, what it affects and whether it gates readiness) are what
+  `/status`, `/readyz`, `/livez`, `weir_condition_active{code,severity}`,
+  `weir-readiness.sh` and `weir-ctl status` all read, so they agree.
+  Runbooks for every code are in `docs/monitoring.md#conditions`.
+- **An admin socket**, `<parent(wab_dir)>/<basename(wab_dir)>.admin.sock`
+  (`/var/lib/weir/wab.admin.sock` in the image and the systemd unit), mode
+  0600, daemon uid or root only. Verbs: `status`, `reload` (TLS, the same
+  path as SIGHUP), `drain.pause`, `drain.resume`, `drain.retry_stranded`.
+  A pause stops delivery before the next commit batch, keeps ingest
+  buffering, and is in memory only: a restart resumes.
+- **`weir-ctl status`** (admin socket, then `/status`, then metrics and disk;
+  exit 0 ready, 1 not ready, 2 unreachable, 3 ready with a critical
+  condition), **`weir-ctl reload`**, and **`weir-ctl drain pause`**,
+  `resume` and `retry-stranded`.
+- **Config keys** `admin_socket_enabled` (default true, env
+  `WEIR_ADMIN_SOCKET_ENABLED`) and `admin_socket_path` (`--admin-socket-path`,
+  `WEIR_ADMIN_SOCKET_PATH`), beside `drain_shutdown_budget_secs` (default 10,
+  under **Changed**) and `livez_checks` (default none, above).
+- **Metrics** for the admin socket and shutdown: `weir_admin_requests_total`,
+  `weir_admin_socket_up`, `weir_config_drain_shutdown_budget_seconds`,
+  `weir_drain_shutdown_deadline_seconds`, and the drain channel's
+  `weir_drain_channel_depth` and `weir_drain_channel_capacity`. All new
+  families; see the metric reference in `docs/monitoring.md`.
+- **Alert rules**, each with `promtool` tests in both directions and a
+  runbook: `WeirNotReady`, `WeirConditionCritical`, `WeirDrainPausedLong`,
+  `WeirOldestUndeliveredAge`, `WeirDrainBackpressure`,
+  `WeirAdminUnavailable`.
 
 ### Changed
 
@@ -437,29 +500,74 @@ Behaviour an operator can notice on upgrade:
   default 10, range 0-3600). Whatever is still undelivered stays sealed and
   unconfirmed on disk and is delivered by the next start; the exit status is
   0. The segment abandoned at the deadline re-delivers its committed prefix on
-  replay (at-least-once, the same window as a crash).
+  replay (at-least-once, the same window as a crash). A flusher blocked on a
+  full drain channel gives up its hand-off after 1 s, and that segment
+  replays too. At most one segment per shutdown is abandoned mid-delivery;
+  records it dead-lettered are dead-lettered again on replay.
 - **Lame duck at the first signal.** The producer socket is unlinked
   (inode-checked) and the TCP listener closed at once, so new connects fail
-  fast instead of queueing for `shutdown_timeout_secs`. Idle connections still
-  get EOF; a frame already read is still acked.
+  fast instead of queueing for `shutdown_timeout_secs`, and `/readyz` answers
+  503 at once. Idle connections still get EOF; a frame already read is still
+  acked.
 - **A second SIGTERM/SIGINT forces the exit.** Open connections are aborted and
   the drain deadline becomes "now"; the worker and flusher joins still run, so
   no acked record is lost. A third signal only logs. It used to be swallowed.
 - **Startup no longer waits on the sink.** `/metrics` answers before WAB
   recovery and reports `weir_startup_phase`; the replay backlog is handed to
   the drain in memory, so a slow or unreachable sink no longer delays the
-  producer socket.
+  producer socket, and the backlog interleaves with new traffic. A daemon
+  restarted over `wab_max_bytes` is not ready from its first probe.
 - **SIGHUP is served from before WAB recovery**, because the runtime and its
   handler now start right after the lock and preflight. It used to be ignored
   through recovery and the startup replay.
 - **The shipped grace periods are 45 s** (`shutdown_timeout_secs +
-  drain_shutdown_budget_secs + 5`): systemd `TimeoutStopSec=45`, compose
-  `stop_grace_period: 45s`.
+  drain_shutdown_budget_secs + 5`): systemd `TimeoutStopSec` 35 → 45, compose
+  `stop_grace_period: 45s`. Raise them with either key.
 - A metrics client must send its complete request head within 1 s or is
   closed; `metrics_max_connections` now counts concurrent scrapes after the
   head, and probes use their own pool of 4. A peer that connects and closes
   or errors without sending a byte is now closed without a response (it used
   to get the metrics body).
+- **New connections go only to live shards.** A connection is still pinned
+  to one shard for its life; a shard that is down is skipped at accept.
+- **`weir-readiness.sh`** decides on `/readyz` (or `weir-ctl status` when
+  installed). It no longer gates on sink health, drain state or lifetime
+  counters, which are now `WARN` lines. Exit 1 means exactly "`/readyz`
+  answers 503"; exit 3 needs `--fail-on-critical`. `--socket` is ignored.
+- **The image's `HEALTHCHECK`** sends `GET /livez` instead of opening a TCP
+  connection, with a 10 s start period. The systemd unit still has no
+  `ExecReload=`, on purpose.
+- **`WeirSegmentQuarantined`** now fires on `weir_quarantine_bytes_on_disk >
+  0`, so it keeps firing across a restart until the quarantine is dealt with.
+  `WeirAckTimeout` and `WeirQueueSaturation` now point at the drain hand-off
+  before storage.
+- Logging: the flusher's "drain channel closed" WARN is INFO while shutting
+  down.
+
+### Security
+
+- **Dependency advisories cleared** (lockfile only; no weir source changed,
+  and 4.0.1 carries the affected versions). `rustls` 0.23.45 -> 0.23.46 for
+  [RUSTSEC-2026-0346](https://rustsec.org/advisories/RUSTSEC-2026-0346),
+  [-0347](https://rustsec.org/advisories/RUSTSEC-2026-0347),
+  [-0348](https://rustsec.org/advisories/RUSTSEC-2026-0348) and
+  [-0349](https://rustsec.org/advisories/RUSTSEC-2026-0349): `Debug` impls on
+  client session values exposed TLS secrets, buffered application data went
+  to the outer server after an ECH rejection, Brotli certificate
+  decompression could allocate up to 1 GiB before authentication, and an
+  unauthenticated ServerHello could downgrade later connections to classical
+  key exchange. `tokio` 1.52.3 -> 1.54.1 for
+  [RUSTSEC-2026-0386](https://rustsec.org/advisories/RUSTSEC-2026-0386)
+  (unsound: `AsyncFd::new` and related constructors violated I/O safety; 1.52
+  has no fixed release). `rustls-webpki` 0.103.15 -> 0.103.16 for
+  [RUSTSEC-2026-0382](https://rustsec.org/advisories/RUSTSEC-2026-0382) and
+  `webpki-roots` 1.0.7 -> 1.0.11 for
+  [RUSTSEC-2026-0381](https://rustsec.org/advisories/RUSTSEC-2026-0381)
+  (certificate paths through the distrusted emSign intermediates).
+  `ctutils` 0.4.2 -> 0.4.5 for
+  [RUSTSEC-2026-0385](https://rustsec.org/advisories/RUSTSEC-2026-0385)
+  (const mask helpers and `u128` comparisons were not constant-time). Every
+  new version builds on the 1.88 MSRV.
 
 ### Upgrading from 4.0.x
 

@@ -31,6 +31,30 @@ const CONFIG_EXAMPLE: &str = include_str!("../../../deploy/docker/weir.toml.exam
 const CONFIG_ENV_SRC: &str = include_str!("../src/config/env.rs");
 const CONFIG_CLI_SRC: &str = include_str!("../src/config/cli.rs");
 const CI_YML: &str = include_str!("../../../.github/workflows/ci.yml");
+const CONFIG_MOD_SRC: &str = include_str!("../src/config/mod.rs");
+const SYSTEMD_TOML: &str = include_str!("../../../deploy/systemd/weir.toml");
+const DOCKER_IMAGE: &str = include_str!("../../../deploy/docker/Dockerfile");
+const CONTAINER_MD: &str = include_str!("../../../docs/security/container.md");
+const CONFIG_FILE_SRC: &str = include_str!("../src/config/file.rs");
+const THREAT_MODEL: &str = include_str!("../../../docs/security/threat-model.md");
+
+/// What a process manager must wait, after SIGTERM, before it SIGKILLs weir.
+/// Spec §7: connection drain + joins (~1 s) + drain budget + 2 s exit grace,
+/// rounded up.
+const GRACE_FORMULA: &str = "shutdown_timeout_secs + drain_shutdown_budget_secs + 5";
+
+const MONITORING_COMPOSE: &str = include_str!("../../../deploy/monitoring/docker-compose.yml");
+// CI_YML is PR 4 Task 4.2's const; reused, not redeclared.
+
+/// The container liveness check, spec §12: one HTTP/1.0 request to /livez
+/// over bash's /dev/tcp (the image ships no curl or wget), healthy only on a
+/// 200 status line.
+const LIVEZ_HEALTHCHECK: &str = "exec 3<>/dev/tcp/127.0.0.1/9185 && printf 'GET /livez HTTP/1.0\\r\\n\\r\\n' >&3 && read -r l <&3 && [[ $l == *' 200 '* ]]";
+
+const STATUS_GOLDEN_PUBLIC: &str =
+    include_str!("../../weir-status/tests/golden/status_v1_public.json");
+const STATUS_GOLDEN_ADMIN: &str =
+    include_str!("../../weir-status/tests/golden/status_v1_admin.json");
 
 /// `Version: 2.1.0  ` → `2.1.0`.
 fn latest_md_version() -> &'static str {
@@ -426,6 +450,25 @@ fn every_hostile_runner_row_in_the_trend_is_marked() {
     );
 }
 
+/// The anchor of every `#### ` heading in `doc`, as GitHub and mdBook build
+/// it: lowercased, punctuation dropped except `-` and `_`, spaces to `-`.
+///
+/// mdBook's `normalize_id` and GitHub both keep `_`. No alert anchor has one,
+/// so dropping it never mattered there; every `cond-<code>` anchor has one.
+fn heading_slugs(doc: &str) -> Vec<String> {
+    doc.lines()
+        .filter_map(|l| l.strip_prefix("#### "))
+        .map(|h| {
+            h.trim()
+                .to_ascii_lowercase()
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ' '))
+                .collect::<String>()
+                .replace(' ', "-")
+        })
+        .collect()
+}
+
 /// Every alert's `runbook` annotation must land on a heading that exists.
 ///
 /// The annotation is the operator's entry point: an alert fires at 3am, they
@@ -435,18 +478,7 @@ fn every_hostile_runner_row_in_the_trend_is_marked() {
 /// parse, not that their documentation exists.
 #[test]
 fn every_alert_runbook_anchor_resolves_to_a_heading() {
-    let headings: Vec<String> = MONITORING
-        .lines()
-        .filter_map(|l| l.strip_prefix("#### "))
-        .map(|h| {
-            h.trim()
-                .to_ascii_lowercase()
-                .chars()
-                .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == ' ')
-                .collect::<String>()
-                .replace(' ', "-")
-        })
-        .collect();
+    let headings = heading_slugs(MONITORING);
 
     let mut unresolved = Vec::new();
     let mut count = 0usize;
@@ -990,49 +1022,818 @@ const SYSTEMD_UNIT: &str = include_str!("../../../deploy/systemd/weir.service");
 const SYSTEMD_README: &str = include_str!("../../../deploy/systemd/README.md");
 const COMPOSE: &str = include_str!("../../../deploy/docker/docker-compose.yml");
 
-/// `[default: N]` from the CLI help line naming `flag`.
-fn help_default(flag: &str) -> u64 {
-    let line = CONFIG_CLI_SRC
+/// The default `Config::resolve` applies to `key`: the integer literal in the
+/// `.unwrap_or(<n>)` that follows `merge!(<key>)` in src/config/mod.rs.
+fn config_default(key: &str) -> u64 {
+    let call = format!("merge!({key})");
+    let at = CONFIG_MOD_SRC.find(&call).unwrap_or_else(|| {
+        panic!("src/config/mod.rs no longer resolves {key} with `{call}`; update this parser")
+    });
+    let rest = &CONFIG_MOD_SRC[at..];
+    let open = rest
+        .find(".unwrap_or(")
+        .unwrap_or_else(|| panic!("`{call}` has no `.unwrap_or(<default>)`"))
+        + ".unwrap_or(".len();
+    assert!(
+        open < call.len() + 80,
+        "the first `.unwrap_or(` after `{call}` is {open} bytes away, so it belongs to \n\
+         another statement; {key}'s default is no longer an inline literal"
+    );
+    let close = rest[open..].find(')').expect("unterminated unwrap_or") + open;
+    let lit = rest[open..close].trim().replace('_', "");
+    lit.parse().unwrap_or_else(|_| {
+        panic!(
+            "the default of {key} is {lit:?}, not an integer literal; if it is now a \n\
+             named constant, make this parser read the constant"
+        )
+    })
+}
+
+/// The `[default: N]` that `--help` prints for `flag` (src/config/cli.rs HELP;
+/// the default may sit on the flag's continuation line).
+fn help_default(flag: &str) -> Option<u64> {
+    let text = CONFIG_CLI_SRC
         .lines()
-        .skip_while(|l| !l.contains(flag))
+        .skip_while(|l| !l.trim_start().starts_with(flag))
         .take(3)
         .collect::<String>();
-    line.split("[default: ")
+    text.split("[default: ")
         .nth(1)
         .and_then(|s| s.split(']').next())
         .and_then(|n| n.trim().parse().ok())
-        .unwrap_or_else(|| panic!("no `[default: N]` for {flag} in src/config/cli.rs HELP"))
 }
 
-/// Foundations §7: the orchestrator grace must be at least
-/// shutdown_timeout_secs + drain_shutdown_budget_secs + 5, derived here from
-/// the defaults the binary actually ships, and stated identically in every
-/// deploy file and doc that states it.
+/// `key = <integer>` on an uncommented line of one of the flat `[server]`
+/// TOML files this repository ships.
+fn toml_int(toml: &str, key: &str) -> Option<u64> {
+    toml.lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#'))
+        .find_map(|l| {
+            let (k, v) = l.split_once('=')?;
+            if k.trim() != key {
+                return None;
+            }
+            v.split('#').next()?.trim().replace('_', "").parse().ok()
+        })
+}
+
+/// Every place an operator learns how long to give weir to stop says the same
+/// thing, and the shipped units actually give it that long.
+///
+/// Shutdown became bounded in two terms: the connection drain
+/// (`shutdown_timeout_secs`) and the drain's delivery budget
+/// (`drain_shutdown_budget_secs`). Before this, `weir.service` carried
+/// `TimeoutStopSec=35` sized for the first term only, the compose file had no
+/// `stop_grace_period` (Docker SIGKILLs after 10 s), and nothing tied either
+/// to the config they ship with. A grace shorter than the bound is
+/// crash-safe, but it turns every stop into a crash: the drain gets no budget
+/// and every active segment waits for recovery.
+///
+/// Each unit is checked against the config file it actually runs with, so
+/// raising `shutdown_timeout_secs` in `deploy/systemd/weir.toml` without
+/// raising `TimeoutStopSec` fails here.
 #[test]
-fn the_shutdown_grace_follows_the_shutdown_bound_everywhere() {
-    let grace =
-        help_default("--shutdown-timeout-secs") + help_default("--drain-shutdown-budget-secs") + 5;
-    assert!(
-        SYSTEMD_UNIT
-            .lines()
-            .any(|l| l.trim() == format!("TimeoutStopSec={grace}")),
-        "deploy/systemd/weir.service must set TimeoutStopSec={grace}"
-    );
-    assert!(
-        COMPOSE.contains(&format!("stop_grace_period: {grace}s")),
-        "deploy/docker/docker-compose.yml must set stop_grace_period: {grace}s"
-    );
-    for (name, doc) in [
-        ("configuration.md", CONFIGURATION),
+fn the_shutdown_grace_formula_holds_in_every_deploy_file() {
+    let shutdown = config_default("shutdown_timeout_secs");
+    let budget = config_default("drain_shutdown_budget_secs");
+    let default_grace = shutdown + budget + 5;
+    let grace_for = |toml: &str| {
+        toml_int(toml, "shutdown_timeout_secs").unwrap_or(shutdown)
+            + toml_int(toml, "drain_shutdown_budget_secs").unwrap_or(budget)
+            + 5
+    };
+
+    let mut problems = Vec::new();
+
+    // `weir-server --help` states the same defaults the resolver applies.
+    for (key, flag, default) in [
+        ("shutdown_timeout_secs", "--shutdown-timeout-secs", shutdown),
+        (
+            "drain_shutdown_budget_secs",
+            "--drain-shutdown-budget-secs",
+            budget,
+        ),
+    ] {
+        if help_default(flag) != Some(default) {
+            problems.push(format!(
+                "src/config/cli.rs HELP: {flag} needs `[default: {default}]` \
+                 (what Config::resolve applies to {key}), found {:?}",
+                help_default(flag)
+            ));
+        }
+    }
+
+    // weir.service runs with deploy/systemd/weir.toml.
+    let unit = grace_for(SYSTEMD_TOML);
+    if !SYSTEMD_UNIT
+        .lines()
+        .any(|l| l.trim() == format!("TimeoutStopSec={unit}"))
+    {
+        problems.push(format!(
+            "deploy/systemd/weir.service: needs `TimeoutStopSec={unit}` \
+             ({GRACE_FORMULA} with deploy/systemd/weir.toml's values)"
+        ));
+    }
+
+    // The compose file bind-mounts deploy/docker/weir.toml.example.
+    let compose = grace_for(CONFIG_EXAMPLE);
+    if !COMPOSE
+        .lines()
+        .any(|l| l.trim() == format!("stop_grace_period: {compose}s"))
+    {
+        problems.push(format!(
+            "deploy/docker/docker-compose.yml: needs `stop_grace_period: {compose}s` \
+             ({GRACE_FORMULA} with deploy/docker/weir.toml.example's values)"
+        ));
+    }
+
+    for (file, text) in [
+        ("deploy/systemd/weir.service", SYSTEMD_UNIT),
+        ("deploy/systemd/weir.toml", SYSTEMD_TOML),
+        ("deploy/systemd/README.md", SYSTEMD_README),
+        ("deploy/docker/docker-compose.yml", COMPOSE),
+        ("deploy/docker/Dockerfile", DOCKER_IMAGE),
+        ("deploy/docker/weir.toml.example", CONFIG_EXAMPLE),
+        ("docs/operations/configuration.md", CONFIGURATION),
+        ("docs/security/container.md", CONTAINER_MD),
+    ] {
+        if !text.contains(GRACE_FORMULA) {
+            problems.push(format!("{file}: does not state `{GRACE_FORMULA}`"));
+        }
+    }
+
+    for (file, text) in [
+        ("docs/operations/configuration.md", CONFIGURATION),
         ("deploy/systemd/README.md", SYSTEMD_README),
     ] {
+        if !text.contains(&format!("**{default_grace} s**")) {
+            problems.push(format!(
+                "{file}: does not state the default grace as `**{default_grace} s**`"
+            ));
+        }
+    }
+
+    // The figures this replaced. A paragraph left behind beside the new one
+    // contradicts it.
+    for (file, text, stale) in [
+        (
+            "deploy/systemd/weir.toml",
+            SYSTEMD_TOML,
+            "TimeoutStopSec (35s)",
+        ),
+        (
+            "deploy/systemd/README.md",
+            SYSTEMD_README,
+            "(in `weir.service`, **35**)",
+        ),
+        (
+            "deploy/systemd/weir.service",
+            SYSTEMD_UNIT,
+            "TimeoutStopSec=35",
+        ),
+    ] {
+        if text.contains(stale) {
+            problems.push(format!("{file}: still says {stale:?}"));
+        }
+    }
+
+    // PR 4 Task 4.14 already added one `stop_grace_period`; a second one is a
+    // duplicate mapping key, which compose refuses to load. Nothing in CI
+    // parses this compose file, and the `.any(..)` check above still passes
+    // with two, so count them.
+    let grace_keys = COMPOSE
+        .lines()
+        .filter(|l| l.trim_start().starts_with("stop_grace_period:"))
+        .count();
+    if grace_keys != 1 {
+        problems.push(format!(
+            "deploy/docker/docker-compose.yml: {grace_keys} `stop_grace_period:` keys \
+             (compose rejects a duplicate key)"
+        ));
+    }
+
+    assert!(
+        problems.is_empty(),
+        "the shutdown grace has drifted:\n  {}\n\n\
+         A grace below the bound turns a stop into a crash: the drain gets no \n\
+         budget and the active segments wait for recovery.",
+        problems.join("\n  ")
+    );
+}
+
+/// The bash command of the first `["CMD", "/bin/bash", "-c", "<cmd>"]` after
+/// `anchor`, with JSON/YAML `\\` escapes undone. For a compose file, `$$` is
+/// compose's escape for a literal `$`; a lone `$` would be interpolated by
+/// compose as an (empty) variable, so it is rejected here rather than undone.
+fn healthcheck_command(src: &str, anchor: &str, compose: bool) -> String {
+    let from = src
+        .find(anchor)
+        .unwrap_or_else(|| panic!("no {anchor:?} in this file"));
+    let marker = "\"/bin/bash\", \"-c\", \"";
+    let start = src[from..]
+        .find(marker)
+        .expect("the healthcheck is not the exec form [\"CMD\", \"/bin/bash\", \"-c\", ...]")
+        + from
+        + marker.len();
+    let end = src[start..].find("\"]").expect("unterminated healthcheck") + start;
+    let cmd = src[start..end].replace("\\\\", "\\");
+    if compose {
         assert!(
-            doc.contains("shutdown_timeout_secs + drain_shutdown_budget_secs + 5"),
-            "{name} must state the grace formula"
+            !cmd.replace("$$", "").contains('$'),
+            "a compose healthcheck uses a bare `$` ({cmd:?}); compose interpolates \n\
+             it as an empty variable, so `[[ $l == ... ]]` becomes `[[  == ... ]]` \n\
+             and the container is never healthy. Write `$$`."
         );
-        assert!(
-            doc.contains(&format!("{grace} s")) || doc.contains(&format!("**{grace}**")),
-            "{name} must state the resulting grace ({grace} s)"
+        cmd.replace("$$", "$")
+    } else {
+        cmd
+    }
+}
+
+/// The image, the compose file and the monitoring stack probe liveness with
+/// the same command, and it is the /livez one.
+///
+/// The three copies drifted once already in the other direction: the compose
+/// file's comment explains a `wget` probe that failed with "not found" in a
+/// curl-less image and restart-looped a healthy container. A copy that still
+/// opens a bare TCP connection reports healthy for anything listening on 9185.
+#[test]
+fn every_container_healthcheck_probes_livez_the_same_way() {
+    for (file, cmd) in [
+        (
+            "deploy/docker/Dockerfile",
+            healthcheck_command(DOCKER_IMAGE, "\nHEALTHCHECK ", false),
+        ),
+        (
+            "deploy/docker/docker-compose.yml",
+            healthcheck_command(COMPOSE, "healthcheck:", true),
+        ),
+        (
+            "deploy/monitoring/docker-compose.yml",
+            healthcheck_command(MONITORING_COMPOSE, "healthcheck:", true),
+        ),
+    ] {
+        assert_eq!(
+            cmd, LIVEZ_HEALTHCHECK,
+            "{file}: the healthcheck command differs from the canonical /livez probe"
         );
     }
+    assert!(
+        DOCKER_IMAGE.contains("--start-period=10s"),
+        "deploy/docker/Dockerfile: the HEALTHCHECK needs --start-period=10s (spec §12)"
+    );
+    for (file, src) in [
+        ("deploy/docker/docker-compose.yml", COMPOSE),
+        ("deploy/monitoring/docker-compose.yml", MONITORING_COMPOSE),
+    ] {
+        assert!(
+            src.contains("start_period: 10s"),
+            "{file}: needs `start_period: 10s`"
+        );
+    }
+}
+
+/// `tests/deploy.rs` runs on both `cargo test -p weir-server` lines in CI.
+///
+/// ci.yml names its test targets one by one, so a new target that is not
+/// added there compiles locally and never runs in CI: "a drift guard is
+/// theatre until wired".
+#[test]
+fn the_deploy_tests_run_in_ci() {
+    let lines: Vec<&str> = CI_YML
+        .lines()
+        .filter(|l| l.contains("cargo test -p weir-server --lib --test system"))
+        .collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "expected the default-features and --all-features weir-server test lines \n\
+         in ci.yml, found {}",
+        lines.len()
+    );
+    for line in lines {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        assert!(
+            words.windows(2).any(|w| w == ["--test", "deploy"]),
+            "ci.yml line does not run --test deploy:\n  {line}"
+        );
+    }
+}
+
+/// The wire name of a serde unit variant (`"shard_offline"`).
+fn wire_name(v: serde_json::Value) -> String {
+    v.as_str()
+        .unwrap_or_else(|| panic!("expected a unit variant serialized as a string, got {v}"))
+        .to_string()
+}
+
+/// Every condition code the daemon can emit, as the `code` label spells it.
+fn condition_code_names() -> Vec<String> {
+    let names: Vec<String> = weir_status::ALL
+        .iter()
+        .map(|c| wire_name(serde_json::to_value(c).expect("serialize a ConditionCode")))
+        .collect();
+    assert!(
+        names.len() >= 30,
+        "weir_status::ALL has {} codes; the catalogue has 30, so this is no longer \n\
+         reading it",
+        names.len()
+    );
+    names
+}
+
+/// Every `code` matcher on `weir_condition_active` in the alert rules names a
+/// code the daemon emits.
+///
+/// A rule selecting `code="sink_unreachable"` when the code is `sink_down`
+/// matches no series and never fires; `promtool test rules` cannot see that,
+/// because its tests feed the series the rule author believed in. Spec §9.3:
+/// "every weir_condition_active{code=...} reference in an alert names a real
+/// code".
+#[test]
+fn every_condition_code_an_alert_names_is_real() {
+    let known = condition_code_names();
+    let mut referenced = Vec::new();
+    for (i, _) in ALERTS.match_indices("weir_condition_active{") {
+        let body = &ALERTS[i + "weir_condition_active{".len()..];
+        let selector = &body[..body.find('}').expect("unterminated selector")];
+        for matcher in selector.split(',') {
+            let m = matcher.trim();
+            let Some(rest) = m.strip_prefix("code") else {
+                continue;
+            };
+            let value = rest
+                .trim_start_matches(['=', '!', '~'])
+                .trim()
+                .trim_matches('"');
+            referenced.extend(value.split('|').map(str::to_string));
+        }
+    }
+    assert!(
+        !referenced.is_empty(),
+        "no rule in weir-alerts.yml selects weir_condition_active by code; \n\
+         WeirConditionCritical and WeirAdminUnavailable both do"
+    );
+    let unknown: Vec<&String> = referenced.iter().filter(|c| !known.contains(c)).collect();
+    assert!(
+        unknown.is_empty(),
+        "weir-alerts.yml selects condition codes the daemon never emits: {unknown:?}\n\
+         known codes: {known:?}"
+    );
+}
+
+/// The body under `#### <heading>` in docs/monitoring.md, up to the next
+/// heading of any level.
+fn monitoring_section(heading: &str) -> &'static str {
+    let marker = format!("\n#### {heading}\n");
+    let start = MONITORING
+        .find(&marker)
+        .unwrap_or_else(|| panic!("docs/monitoring.md has no `#### {heading}`"))
+        + marker.len();
+    let rest = &MONITORING[start..];
+    let end = ["\n## ", "\n### ", "\n#### "]
+        .iter()
+        .filter_map(|m| rest.find(m))
+        .min()
+        .unwrap_or(rest.len());
+    &rest[..end]
+}
+
+/// The double-quoted value of `<key>:` in the rule named `rule`.
+fn alert_annotation(rule: &str, key: &str) -> &'static str {
+    let at = ALERTS
+        .find(&format!("- alert: {rule}\n"))
+        .unwrap_or_else(|| panic!("weir-alerts.yml has no rule {rule}"));
+    let rest = &ALERTS[at..];
+    let needle = format!("{key}: \"");
+    let start = rest
+        .find(&needle)
+        .unwrap_or_else(|| panic!("{rule} has no {key} annotation"))
+        + needle.len();
+    let end = rest[start..].find("\"\n").expect("unterminated annotation") + start;
+    &rest[start..end]
+}
+
+/// Both runbooks send the operator to the drain hand-off before storage.
+///
+/// When the drain channel is full, flushers block handing sealed segments to
+/// the drain before the acks of the batch behind resolve, so producers get
+/// ACK_TIMEOUT for records that are durable. The old text said "flusher may
+/// be wedged, check fsync latency", which sent every such incident to the
+/// disk. Order matters here, not just presence: a runbook that mentions the
+/// hand-off after three paragraphs of fsync triage still misdirects.
+#[test]
+fn ack_timeout_and_queue_saturation_runbooks_check_the_drain_hand_off_first() {
+    for rule in ["WeirAckTimeout", "WeirQueueSaturation"] {
+        for (place, text) in [
+            ("docs/monitoring.md", monitoring_section(rule)),
+            (
+                "weir-alerts.yml description",
+                alert_annotation(rule, "description"),
+            ),
+        ] {
+            let storage = text
+                .find("fsync")
+                .unwrap_or_else(|| panic!("{rule} ({place}) no longer mentions fsync at all"));
+            for signal in [
+                "weir_wab_handoff_blocked_seconds",
+                "weir_drain_channel_depth",
+            ] {
+                match text.find(signal) {
+                    Some(i) if i < storage => {}
+                    Some(_) => panic!("{rule} ({place}): {signal} comes after the fsync triage"),
+                    None => panic!("{rule} ({place}): does not mention {signal}"),
+                }
+            }
+        }
+    }
+}
+
+/// Codes only `weir-ctl status` emits, from offline evidence (spec §9.3).
+const OFFLINE_ONLY_CODES: [&str; 2] = ["daemon_unreachable", "recovery_pending"];
+
+/// `[code, severity, affects, gates]` as the catalogue table must show them.
+fn catalogue_row(c: &weir_status::ConditionCode) -> [String; 4] {
+    // PR 1's catalogue: `entry(code)` carries severity, affects and gates.
+    let e = weir_status::entry(*c).unwrap_or_else(|| panic!("{c:?} has no catalogue entry"));
+    let gates: Vec<String> = e
+        .gates
+        .iter()
+        .map(|g| wire_name(serde_json::to_value(g).expect("serialize a Gate")))
+        .collect();
+    [
+        wire_name(serde_json::to_value(c).expect("serialize a ConditionCode")),
+        wire_name(serde_json::to_value(e.severity).expect("serialize a Severity")),
+        wire_name(serde_json::to_value(e.affects).expect("serialize an Affects")),
+        if gates.is_empty() {
+            "none".to_string()
+        } else {
+            gates.join(", ")
+        },
+    ]
+}
+
+/// Every condition the daemon or weir-ctl can report has a row in the
+/// catalogue table that agrees with the code, and a `#### cond-<code>`
+/// runbook heading; every row names a real code.
+///
+/// The runbook link is printed by `weir-ctl status`, by the readiness script
+/// and by WeirConditionCritical, so a code without a heading sends an operator
+/// to a page that scrolls nowhere. The severity, `affects` and gates columns
+/// are compared with `weir_status` itself, because a table that says a
+/// condition does not gate readiness when it does is worse than no table.
+#[test]
+fn every_condition_has_a_catalogue_row_and_a_runbook_heading() {
+    // The offline-only list is weir_status's, not a copy that can drift.
+    let offline: Vec<String> = weir_status::OFFLINE_ONLY
+        .iter()
+        .map(|e| wire_name(serde_json::to_value(e.code).expect("serialize a ConditionCode")))
+        .collect();
+    assert_eq!(
+        offline, OFFLINE_ONLY_CODES,
+        "weir_status::OFFLINE_ONLY changed; update OFFLINE_ONLY_CODES and the catalogue"
+    );
+
+    let section = MONITORING
+        .split("\n## Conditions\n")
+        .nth(1)
+        .expect("docs/monitoring.md must keep its `## Conditions` section")
+        .split("\n## ")
+        .next()
+        .unwrap();
+    let rows: Vec<Vec<String>> = section
+        .lines()
+        .filter(|l| l.starts_with("| `"))
+        .map(|l| {
+            l.split('|')
+                .map(|cell| cell.trim().trim_matches('`').to_string())
+                .filter(|cell| !cell.is_empty())
+                .collect()
+        })
+        .collect();
+    let slugs = heading_slugs(MONITORING);
+    let daemon_codes = condition_code_names();
+    let mut problems = Vec::new();
+
+    for c in weir_status::ALL {
+        let want = catalogue_row(c);
+        let code = &want[0];
+        if OFFLINE_ONLY_CODES.contains(&code.as_str()) {
+            continue; // checked below; their gates cell carries "(weir-ctl only)"
+        }
+        match rows.iter().find(|r| r.first() == Some(code)) {
+            None => problems.push(format!("{code}: no row in the catalogue table")),
+            Some(r) if r.len() < 4 || r[..4] != want[..] => problems.push(format!(
+                "{code}: the table says {:?}, weir_status says {want:?}",
+                &r[..r.len().min(4)]
+            )),
+            Some(_) => {}
+        }
+        if !slugs.contains(&format!("cond-{code}")) {
+            problems.push(format!("{code}: no `#### cond-{code}` heading"));
+        }
+    }
+    for e in weir_status::OFFLINE_ONLY {
+        let mut want = catalogue_row(&e.code);
+        want[3] = format!("{} (weir-ctl only)", want[3]);
+        let code = &want[0];
+        match rows.iter().find(|r| r.first() == Some(code)) {
+            None => problems.push(format!("{code} (weir-ctl only): no row")),
+            Some(r) if r.len() < 4 || r[..4] != want[..] => problems.push(format!(
+                "{code} (weir-ctl only): the table says {:?}, weir_status says {want:?}",
+                &r[..r.len().min(4)]
+            )),
+            Some(_) => {}
+        }
+        if !slugs.contains(&format!("cond-{code}")) {
+            problems.push(format!(
+                "{code} (weir-ctl only): no `#### cond-{code}` heading"
+            ));
+        }
+    }
+    for r in &rows {
+        let code = &r[0];
+        if !daemon_codes.contains(code) && !OFFLINE_ONLY_CODES.contains(&code.as_str()) {
+            problems.push(format!("{code}: a row for a code nothing emits"));
+        }
+    }
+
+    assert!(
+        problems.is_empty(),
+        "docs/monitoring.md's Conditions catalogue disagrees with weir_status:\n  {}",
+        problems.join("\n  ")
+    );
+}
+
+fn top_level_keys(doc: &str) -> std::collections::BTreeSet<String> {
+    serde_json::from_str::<serde_json::Value>(doc)
+        .expect("a golden status document is valid JSON")
+        .as_object()
+        .expect("a status document is a JSON object")
+        .keys()
+        .cloned()
+        .collect()
+}
+
+/// docs/monitoring.md's `/status` reference has one row per top-level key of
+/// the document, marked with the views that carry it, and no row for a key
+/// the document does not have.
+///
+/// `weir.status/v1` is additive-only and `weir-ctl status --json` pins its
+/// shape, so its keys are a contract operators script against. The goldens
+/// are the serialized types (the weir-status tests pin them), so this follows
+/// the code, not a copy of it.
+#[test]
+fn the_status_reference_lists_every_top_level_key() {
+    let section = MONITORING
+        .split("\n### The `/status` document\n")
+        .nth(1)
+        .expect("docs/monitoring.md must keep its \"The `/status` document\" heading");
+    let section = ["\n## ", "\n### "]
+        .iter()
+        .filter_map(|m| section.find(m))
+        .min()
+        .map_or(section, |end| &section[..end]);
+
+    let mut documented_admin = std::collections::BTreeSet::new();
+    let mut documented_public = std::collections::BTreeSet::new();
+    for line in section.lines().filter(|l| l.starts_with("| `")) {
+        let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+        let key = cells[1].trim_matches('`').to_string();
+        documented_admin.insert(key.clone());
+        if cells[2].contains("public") {
+            documented_public.insert(key);
+        }
+    }
+
+    for (golden, view) in [
+        (STATUS_GOLDEN_PUBLIC, "public"),
+        (STATUS_GOLDEN_ADMIN, "admin"),
+    ] {
+        let v: serde_json::Value = serde_json::from_str(golden).expect("golden JSON");
+        assert_eq!(v["schema"], "weir.status/v1", "the {view} golden's schema");
+        assert_eq!(v["view"], view, "the {view} golden's view");
+    }
+    assert_eq!(
+        documented_admin,
+        top_level_keys(STATUS_GOLDEN_ADMIN),
+        "the `/status` reference rows (left) differ from the admin document's \n\
+         top-level keys (right)"
+    );
+    assert_eq!(
+        documented_public,
+        top_level_keys(STATUS_GOLDEN_PUBLIC),
+        "the rows marked `public` (left) differ from the public document's \n\
+         top-level keys (right); an admin-only key marked public tells operators \n\
+         a field is on the unauthenticated listener when it is not, and the \n\
+         reverse hides one that is"
+    );
+    assert!(MONITORING.contains("`\"weir.status/v1\"`"));
+}
+
+/// A config key and the spellings an operator types for it.
+struct KeySpelling {
+    key: &'static str,
+    env: &'static str,
+    /// `None` where the spec gives the key no flag (`admin_socket_enabled`).
+    cli: Option<&'static str>,
+}
+
+/// The keys Foundations added (spec §13).
+const FOUNDATIONS_KEYS: [KeySpelling; 4] = [
+    KeySpelling {
+        key: "drain_shutdown_budget_secs",
+        env: "WEIR_DRAIN_SHUTDOWN_BUDGET_SECS",
+        cli: Some("--drain-shutdown-budget-secs"),
+    },
+    KeySpelling {
+        key: "admin_socket_enabled",
+        env: "WEIR_ADMIN_SOCKET_ENABLED",
+        cli: None,
+    },
+    KeySpelling {
+        key: "admin_socket_path",
+        env: "WEIR_ADMIN_SOCKET_PATH",
+        cli: Some("--admin-socket-path"),
+    },
+    KeySpelling {
+        key: "livez_checks",
+        env: "WEIR_LIVEZ_CHECKS",
+        cli: Some("--livez-checks"),
+    },
+];
+
+/// The checks `livez_checks` accepts (spec §12).
+const LIVEZ_SELECTABLE: [&str; 5] = [
+    "no_live_shard",
+    "listener_down",
+    "worker_exited",
+    "drain_stopped",
+    "drain_wedged",
+];
+
+/// The body of `#### \`<key>\`` in configuration.md, up to the next heading or
+/// rule, or `None` when there is no such heading.
+fn configuration_section(key: &str) -> Option<&'static str> {
+    let marker = format!("\n#### `{key}`\n");
+    let start = CONFIGURATION.find(&marker)? + marker.len();
+    let rest = &CONFIGURATION[start..];
+    let end = ["\n#### ", "\n### ", "\n## ", "\n---"]
+        .iter()
+        .filter_map(|m| rest.find(m))
+        .min()
+        .unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
+/// Each Foundations key is parsed under the spellings the docs give, has its
+/// own section in the configuration reference naming them, and is in the
+/// example file that claims to list every option.
+///
+/// The parser is checked first, so a rename in the code fails here instead
+/// of leaving the docs naming a key the daemon ignores (an unknown TOML key
+/// only warns). `admin_socket_path` is also what `weir-ctl` reads from
+/// `WEIR_ADMIN_SOCKET_PATH`, so a drifted spelling breaks the client too.
+#[test]
+fn the_foundations_config_keys_are_documented_under_the_spellings_the_parser_reads() {
+    let mut problems = Vec::new();
+    for k in &FOUNDATIONS_KEYS {
+        if !CONFIG_FILE_SRC.contains(&format!("\"{}\"", k.key)) {
+            problems.push(format!(
+                "{}: not a known TOML key in src/config/file.rs",
+                k.key
+            ));
+        }
+        if !CONFIG_ENV_SRC.contains(&format!("\"{}\"", k.env)) {
+            problems.push(format!(
+                "{}: src/config/env.rs does not read {}",
+                k.key, k.env
+            ));
+        }
+        if let Some(flag) = k.cli
+            && !CONFIG_CLI_SRC.contains(&format!("\"{flag}\""))
+        {
+            problems.push(format!(
+                "{}: src/config/cli.rs does not parse {flag}",
+                k.key
+            ));
+        }
+        match configuration_section(k.key) {
+            None => problems.push(format!(
+                "{}: no `#### `{}`` section in docs/operations/configuration.md",
+                k.key, k.key
+            )),
+            Some(section) => {
+                if !section.contains(&format!("`{}`", k.env)) {
+                    problems.push(format!("{}: its section does not name `{}`", k.key, k.env));
+                }
+                match k.cli {
+                    Some(flag) if !section.contains(&format!("`{flag}")) => {
+                        problems.push(format!("{}: its section does not name `{flag}`", k.key))
+                    }
+                    None if !section.contains("**CLI**: none") => {
+                        problems.push(format!("{}: its section must say `**CLI**: none`", k.key))
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for needle in [k.key, k.env] {
+            if !CONFIG_EXAMPLE.contains(needle) {
+                problems.push(format!("deploy/docker/weir.toml.example: missing {needle}"));
+            }
+        }
+    }
+    if let Some(livez) = configuration_section("livez_checks") {
+        for check in LIVEZ_SELECTABLE {
+            if !livez.contains(&format!("`{check}`")) {
+                problems.push(format!("livez_checks: its section does not list `{check}`"));
+            }
+        }
+    }
+    // Spec §17: "pause's disk warning". A pause delivers nothing while ingest
+    // keeps writing, and the cap is the only thing between that and a full disk.
+    if !configuration_section("wab_max_bytes")
+        .is_some_and(|s| s.contains("**While delivery is paused**"))
+    {
+        problems.push(
+            "wab_max_bytes: its section does not warn that the WAB grows while \
+             delivery is paused"
+                .to_string(),
+        );
+    }
+    assert!(
+        problems.is_empty(),
+        "the Foundations config keys are not documented as the parser reads them:\n  {}",
+        problems.join("\n  ")
+    );
+}
+
+/// The threat model covers the two surfaces Foundations added, and no longer
+/// describes the shutdown it replaced.
+///
+/// Spec §17 lists these edits because each surface changes who can learn or
+/// do what: an unauthenticated listener that may bind 0.0.0.0 in Kubernetes,
+/// and a control socket that pauses delivery. A threat model that predates
+/// them is the document a reviewer trusts most and should trust least.
+#[test]
+fn the_threat_model_covers_the_health_listener_and_the_admin_socket() {
+    let section = |heading: &str| -> &'static str {
+        let marker = format!("\n## {heading}\n");
+        let start = THREAT_MODEL
+            .find(&marker)
+            .unwrap_or_else(|| panic!("threat-model.md has no `## {heading}`"))
+            + marker.len();
+        let rest = &THREAT_MODEL[start..];
+        &rest[..rest.find("\n## ").unwrap_or(rest.len())]
+    };
+    let in_scope = section("In scope");
+    let actors = section("Threat actors considered");
+    let mut problems = Vec::new();
+
+    for row in [
+        "| Network peer reading the metrics, health and status listener |", // PR 5 Task 5.11
+        "| Network peer starving the health probes |",                      // PR 5 Task 5.11
+        "| Local process reaching the admin socket |",                      // PR 6 Task 6.17
+    ] {
+        if !in_scope.contains(row) {
+            problems.push(format!("In scope: no row {row:?}"));
+        }
+    }
+    for actor in [
+        "- **Network peer reaching the metrics/health port**",
+        "- **Producer or sidecar sharing the socket volume**",
+    ] {
+        if !actors.contains(actor) {
+            problems.push(format!("Threat actors: no {actor:?}"));
+        }
+    }
+    if !actors.contains("producer containers that share the daemon's uid") {
+        problems.push(
+            "Threat actors: the daemon-uid actor must be qualified for producer \
+             containers that share the daemon's uid"
+                .to_string(),
+        );
+    }
+    if !THREAT_MODEL.contains("The admin socket deliberately also admits root") {
+        problems.push(
+            "the Unix socket section must reconcile \"Root is not implicitly trusted\" \
+             with the admin socket's root allowance"
+                .to_string(),
+        );
+    }
+    for stale in [
+        "the runtime is dropped before joining threads",
+        "A daemon that is shutting down still looks live",
+    ] {
+        if THREAT_MODEL.contains(stale) {
+            problems.push(format!("still describes the old shutdown: {stale:?}"));
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "docs/security/threat-model.md does not cover what Foundations added:\n  {}",
+        problems.join("\n  ")
+    );
 }

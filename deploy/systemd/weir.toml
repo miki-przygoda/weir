@@ -52,12 +52,10 @@ max_payload_bytes            = 1048576   # 1 MiB
 metrics_port = 9185
 metrics_bind = "127.0.0.1"
 
-# Connection-drain budget at shutdown. Keep TimeoutStopSec >=
-# shutdown_timeout_secs + drain_shutdown_budget_secs + 5 (45s).
-shutdown_timeout_secs = 30
-
-# Drain budget after the flushers join; the rest replays at the next start.
-# TimeoutStopSec must stay >= shutdown_timeout_secs + this + 5 (45s).
+# Graceful-shutdown budgets. The unit's TimeoutStopSec must be at least
+# shutdown_timeout_secs + drain_shutdown_budget_secs + 5 (45 s with these
+# values); raise it whenever you raise either key.
+shutdown_timeout_secs      = 30
 drain_shutdown_budget_secs = 10
 
 # Dead-letter cap. At the cap the drain BLOCKS all delivery, surfaced as

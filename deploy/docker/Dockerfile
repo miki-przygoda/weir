@@ -117,26 +117,30 @@ EXPOSE 9185
 # on the same volume refuses to start ("locked by"). Never delete that file.
 VOLUME ["/var/lib/weir/wab", "/run/weir"]
 
-# Weir's signal handlers expect SIGTERM for graceful shutdown. Make this
-# explicit so orchestrators that override Docker's default still get the
-# clean shutdown path. SIGTERM unwinds the pipeline in dependency order:
-# it goes lame duck, waits for in-flight connections (shutdown_timeout_secs),
-# seals, and gives the drain drain_shutdown_budget_secs; a second SIGTERM
-# forces it.
+# Weir shuts down on SIGTERM, within a bound: listeners close at once, an idle
+# connection is closed at once and a connection in the middle of a frame
+# finishes it and gets its ack (for at most shutdown_timeout_secs), active
+# segments are sealed, and the drain gets drain_shutdown_budget_secs to deliver
+# before the rest is left sealed for replay. Give it at least
+#   shutdown_timeout_secs + drain_shutdown_budget_secs + 5
+# seconds (45 s at the defaults): `docker stop -t 45`, compose
+# `stop_grace_period: 45s`, Kubernetes `terminationGracePeriodSeconds: 45`.
+# (The formula must stay on one line: a docs_drift test searches for it.)
 # SIGHUP never stops it: `docker kill --signal=HUP` reloads TLS material when
 # tcp_bind is set and is a counted no-op otherwise.
 STOPSIGNAL SIGTERM
 
-# Lightweight LIVENESS check using bash's /dev/tcp magic (no extra packages
-# needed). Opens a TCP connection to the metrics port; succeeds iff the
-# daemon is alive and the metrics server has bound. Adjust the cadence via the
-# HEALTHCHECK --interval/--timeout/--retries options below (there are no weir
-# "--health-*" CLI flags). This is liveness only — it does not check sink
-# health or drain progress; the image ships only weir-server (no curl/awk/
-# weir-ctl), so a readiness gate must be an external probe over /metrics
-# (see deploy/systemd/weir-readiness.sh for the logic).
-HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
-    CMD ["/bin/bash", "-c", "exec 3</dev/tcp/127.0.0.1/9185 || exit 1"]
+# LIVENESS: GET /livez over bash's /dev/tcp (the image has no curl or wget).
+# /livez answers 200 whenever the runtime serves HTTP: from a few milliseconds
+# after start, through WAB recovery, and while shutting down. It fails only on
+# the checks selected in `livez_checks` (default none), each a state a restart
+# fixes. It never fails on sink health, a paused, retrying or blocked drain, or
+# a long recovery, so Docker never restarts weir for a slow sink. Readiness
+# ("can it take ingest now?") is GET /readyz; probe it from outside
+# (deploy/systemd/weir-readiness.sh, or a Kubernetes readinessProbe). The port
+# is the default metrics_port: change 9185 here if you change it.
+HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
+    CMD ["/bin/bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9185 && printf 'GET /livez HTTP/1.0\\r\\n\\r\\n' >&3 && read -r l <&3 && [[ $l == *' 200 '* ]]"]
 
 USER weir
 

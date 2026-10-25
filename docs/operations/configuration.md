@@ -742,6 +742,12 @@ instead of discovering it from a full disk. Leaving it unset is not silent:
 the daemon separately warns when the WAB is growing while the sink is
 unhealthy and no cap is set (see the `CHANGELOG`).
 
+**While delivery is paused** (`weir-ctl drain pause`) the drain delivers
+nothing and the WAB grows at the ingest rate. With a cap, pushes start to
+nack at the cap (`wab_cap_rejecting`, `/readyz` 503); with `wab_max_bytes = 0`
+the WAB grows until the disk fills. A pause lives in memory only: a restart
+resumes delivery.
+
 ---
 
 #### `wab_compression`
@@ -1095,11 +1101,9 @@ record was committed (it may have been, since the WAB write may
 already be on disk).
 
 **When to tune**: deployments with long-running batched producers
-should raise this to match their batch flush interval. Container
-orchestrators usually have their own termination-grace setting
-(Kubernetes `terminationGracePeriodSeconds`, ECS `stopTimeout`). See
-[Shutdown grace period](#shutdown-grace-period) below for the
-orchestrator grace this implies.
+should raise this to match their batch flush interval, and raise the
+process manager's grace by the same amount (see
+[Shutdown grace period](#shutdown-grace-period)).
 
 #### `drain_shutdown_budget_secs`
 
@@ -1128,27 +1132,36 @@ orchestrator grace at `shutdown_timeout_secs + drain_shutdown_budget_secs + 5`.
 
 #### Shutdown grace period
 
-SIGTERM (or SIGINT) runs a bounded sequence:
+SIGTERM (or SIGINT) runs a bounded sequence, set by two keys:
 
-1. **Lame duck, at once.** The producer socket is unlinked and the TCP listener
-   closed, so new connects fail fast; open connections finish the frame they
-   are on.
-2. **Connection drain**, at most `shutdown_timeout_secs`.
-3. **Seal.** Workers and flushers join; every flusher seals, fsyncs and hands
-   off its active segment. If the drain is stuck, a flusher gives its hand-off
-   at most 1 s; that segment is durable and replays on the next start.
-4. **Drain budget**, at most `drain_shutdown_budget_secs`, then the in-flight
-   segment is abandoned without a `.confirmed`.
-5. **Exit 0**, with one log line naming how many segments are left for replay.
+| Phase | Bound |
+|---|---|
+| Lame duck: listeners closed, socket file unlinked, `/readyz` 503; a connection in the middle of a frame finishes it and gets its ack, an idle connection is closed at once | `shutdown_timeout_secs` |
+| Workers and flushers join: queues flushed, active segments sealed and fsynced, each flusher's last hand-off to the drain | the queue flush, one fsync per shard, and at most 1 s of waiting for the drain |
+| The drain delivers what it can | `drain_shutdown_budget_secs` |
+| The drain thread exits | 2 s |
+
+The daemon then exits 0, with one log line naming how many segments are left
+for replay.
+
+**Grace period.** Give the process manager at least
+
+`shutdown_timeout_secs + drain_shutdown_budget_secs + 5`
+
+seconds before it SIGKILLs: **45 s** at the defaults. The shipped units
+already do (`TimeoutStopSec=45` in `deploy/systemd/weir.service`,
+`stop_grace_period: 45s` in `deploy/docker/docker-compose.yml`). Elsewhere:
+Kubernetes `terminationGracePeriodSeconds: 45`, ECS `stopTimeout: 45`,
+`docker stop -t 45`. Docker's own default is 10 s. What the drain has not
+delivered when its budget runs out stays sealed and unconfirmed in the WAB
+and is delivered after the next start. A SIGKILL before the bound is
+crash-safe too, but the drain gets no budget at all and the active segments
+are left to recovery.
 
 A **second** SIGTERM at any point forces: open connections are aborted and the
-drain deadline becomes "now". The seal (step 3) still runs, so no acked record
-is lost. A third signal only logs. Exit status is 0 in every case.
-
-**Grace period.** Give the orchestrator at least
-`shutdown_timeout_secs + drain_shutdown_budget_secs + 5` seconds: **45 s** at
-the defaults (30 + 10 + 5). systemd `TimeoutStopSec=45`, compose
-`stop_grace_period: 45s`, Kubernetes `terminationGracePeriodSeconds: 45`.
+drain deadline becomes "now". The worker and flusher joins (the seal) still
+run, so no acked record is lost. A third signal only logs. Exit status is 0 in
+every case.
 
 **Duplicates.** For the one segment abandoned at the deadline (at most one per
 shutdown, forced or not): its committed prefix is re-delivered on replay; a
@@ -1159,8 +1172,9 @@ hand off was never started and adds no duplicates. This is the same window as
 a crash.
 
 **Decommissioning** a host: stop the producers, wait for
-`weir_wab_undelivered_segments` to reach 0, then stop the daemon; or raise
-`drain_shutdown_budget_secs` for that one stop.
+`weir_wab_undelivered_segments` to reach 0 (an empty backlog in
+`weir-ctl status`), then stop the daemon; or raise
+`drain_shutdown_budget_secs` (and the grace) for that one stop.
 
 ---
 

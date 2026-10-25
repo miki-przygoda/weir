@@ -110,10 +110,16 @@ nested umask 0o177) is belt-and-braces on top of these directory perms.
 
 Made explicit so orchestrators that override Docker's default
 (e.g. Kubernetes' `terminationGracePeriodSeconds` flow, which sends a
-configurable signal) still get the clean shutdown path. Weir's SIGTERM
-handler unwinds the pipeline in dependency order: socket close → workers
-drain → drain task finishes → WAB flush. See
-`crates/weir-server/src/main.rs` and the recent deadlock fix in PR #10.
+configurable signal) still get the clean shutdown path. Shutdown is
+bounded: listeners close at once (the socket file is unlinked and `/readyz`
+answers 503), an idle connection is closed at once and a connection in the
+middle of a frame finishes it and gets its ack (for at most
+`shutdown_timeout_secs`), the active segments are sealed and fsynced, and the
+drain gets `drain_shutdown_budget_secs` before the rest is left sealed for
+replay. Give the container `shutdown_timeout_secs + drain_shutdown_budget_secs + 5`
+seconds (45 s at the defaults) before the SIGKILL: `docker stop -t 45`,
+compose `stop_grace_period: 45s` (the shipped compose file sets it),
+Kubernetes `terminationGracePeriodSeconds: 45`. Docker's own default is 10 s.
 
 **SIGHUP never stops the daemon.** `main` sets SIGHUP to ignored before it
 reads the config. Once the runtime is up, each SIGHUP is a reload request
@@ -162,7 +168,9 @@ What this means for orchestration:
   refuse and crash-loop. A `RollingUpdate` that starts the new pod on the same
   node while the old one is still draining makes the new pod refuse with
   "locked by" until the old process exits. The old process holds the lock
-  until it exits, which can take up to `shutdown_timeout_secs` after SIGTERM;
+  until it exits, which can take up to
+  `shutdown_timeout_secs + drain_shutdown_budget_secs + 5` seconds after
+  SIGTERM;
   `strategy: type: Recreate` avoids the overlap. A `ReadWriteMany` volume
   shared across nodes is normally a network filesystem, where the lock is not
   a supported guard (next item).
@@ -208,22 +216,25 @@ whose directory is writable only by uid 10001.
 
 ### Healthcheck
 
-`HEALTHCHECK` opens a TCP connection to the metrics port (9185) using
-bash's `/dev/tcp` virtual file — no extra packages installed, no curl
-or wget needed. The check succeeds iff:
+`HEALTHCHECK` sends `GET /livez` to the metrics port (9185) over bash's
+`/dev/tcp` virtual file (no curl or wget in the image) and is healthy only on
+a `200` status line. `/livez` answers 200 whenever the daemon's runtime is
+serving HTTP: a few milliseconds after start, all through WAB recovery, and
+while shutting down. It fails only on the checks you select with
+`livez_checks` (default: none), each a state a restart fixes
+(`no_live_shard`, `listener_down`, `worker_exited`, and the opt-ins
+`drain_stopped`, `drain_wedged`). It never fails because the sink is down or
+the drain is paused, retrying or blocked, so Docker never restarts weir for a
+slow downstream.
 
-1. The daemon process is alive.
-2. The metrics HTTP server has bound the port.
+It is a liveness check, not readiness. "Can this daemon take ingest now?" is
+`GET /readyz`; see [Health and status endpoints](../monitoring.md#health-and-status-endpoints).
 
-It does not exercise the wire protocol (Unix socket) end-to-end. For a
-deeper liveness check, an operator can override `HEALTHCHECK CMD` at
-runtime with one that connects to the Unix socket and sends a
-`HealthCheck` frame.
-
-The defaults (10s interval, 3s timeout, 5s start period, 3 retries) are
-suited to development. Orchestrators (Kubernetes, ECS) usually replace
-the Dockerfile `HEALTHCHECK` with their own probes; the in-image version
-is a fallback for plain `docker run`.
+The defaults (10 s interval, 3 s timeout, 10 s start period, 3 retries) suit
+`docker run` and compose. The command hard-codes port 9185: if you change
+`metrics_port`, override `HEALTHCHECK` (or compose's `healthcheck.test`) with
+the new port. Kubernetes ignores the image's `HEALTHCHECK`; use the probe
+recipe in monitoring.md instead.
 
 ## What the image does NOT do
 

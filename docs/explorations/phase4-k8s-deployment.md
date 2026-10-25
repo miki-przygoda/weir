@@ -120,11 +120,12 @@ The `wab_segment_max_bytes` default of 256 MiB means a full segment rotation cre
 
 ### 3.3 Probes
 
-**Liveness probe:** HTTP GET `http://localhost:9185/metrics` (or the `/dev/tcp` bash trick from the Dockerfile). The metrics server (`metrics/server.rs`) comes up only after the Tokio runtime starts and the pipeline is running (it is spawned before `socket::run` in `main.rs`). A successful HTTP response confirms the daemon is alive. Recommended: `initialDelaySeconds: 10`, `periodSeconds: 10`, `failureThreshold: 3`.
-
-**Readiness probe:** Same endpoint. weir is ready to accept producers as soon as the metrics endpoint responds — the Unix socket listener is bound before the metrics server (`socket::run` is the final blocking call, but the metrics server and queue are set up before it). A more precise readiness signal would be a custom `/health` endpoint that also checks the WAB flusher state (non-zero `weir_wab_flusher_panics_total` means a shard is offline), but that requires a new HTTP handler. For now, the metrics endpoint is sufficient.
-
-**Startup probe:** The WAB crash-recovery path (`recover_open_segments` + `replay_unconfirmed`) runs on the calling thread before the metrics server comes up. On a large WAB with many unconfirmed segments, this can take tens of seconds. Set `startupProbe.failureThreshold` high enough (e.g. 30 failures × 10s = 300s budget) or use `initialDelaySeconds` to cover the expected recovery window. Do not set `livenessProbe.initialDelaySeconds` so short that it fires during crash recovery.
+**Superseded.** The daemon now serves `/livez`, `/readyz`, `/startupz` and
+`/status` on the metrics port; health answers within milliseconds of start,
+before recovery. The probe recipe (periods, thresholds, the recommended
+`livez_checks`, `terminationGracePeriodSeconds: 45`) is in
+[monitoring.md](../monitoring.md#probe-recipe). The analysis below this
+section predates those routes.
 
 ### 3.4 Graceful Shutdown
 

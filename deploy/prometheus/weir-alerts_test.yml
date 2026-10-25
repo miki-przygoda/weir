@@ -210,8 +210,8 @@ tests:
         values: "0 0 1 1 1 1 1 1"
       - series: 'weir_ack_timeout_total{job="weir",instance="w:9185"}'
         values: "0 0 1 1 1 1 1 1"
-      - series: 'weir_recovery_segments_quarantined_total{job="weir",instance="w:9185"}'
-        values: "0 0 1 1 1 1 1 1"
+      - series: 'weir_quarantine_bytes_on_disk{job="weir",instance="w:9185"}'
+        values: "0 0 4096 4096 4096 4096 4096 4096"
     alert_rule_test:
       - eval_time: 5m
         alertname: WeirFsyncFailure
@@ -243,8 +243,8 @@ tests:
               job: "weir"
               severity: "critical"
             exp_annotations:
-              summary: "weir ack timed out on w:9185 — flusher may be wedged"
-              description: "A record's ack never fired within the timeout without a panic — the classic wedged-flusher signature (e.g. a stuck fsync). Check fsync latency and the flusher threads."
+              summary: "weir ack timed out on w:9185 — check the drain hand-off before storage"
+              description: "A record's ack did not resolve within the timeout and the producer got ACK_TIMEOUT. Often this is delivery, not storage: with the drain channel full, flushers wait to hand sealed segments to the drain before the acks behind them resolve, so durable records are nacked. Check weir_wab_handoff_blocked_seconds and weir_drain_channel_depth first; only if both are idle, check fsync latency and the flusher threads."
               runbook: "docs/monitoring.md#weiracktimeout"
       - eval_time: 5m
         alertname: WeirSegmentQuarantined
@@ -254,8 +254,8 @@ tests:
               job: "weir"
               severity: "critical"
             exp_annotations:
-              summary: "weir quarantined a corrupt segment on w:9185"
-              description: "Crash recovery found a segment with bad magic, an unknown format version, or a CRC mismatch and moved it to the quarantine directory. Data-integrity event — inspect the quarantined file."
+              summary: "weir holds quarantined segment data on w:9185"
+              description: "<wab_dir>/quarantine/ is not empty: recovery or the drain moved a segment there (or, for mid-file corruption, a copy of it) because its bytes are bad (a header it cannot parse, in recovery a newer format too; a CRC mismatch; a truncated footer), a media-class read error outlasted three strand cycles and 10 minutes, or its .confirmed sidecar failed verification. A data-integrity event. The byte gauge survives restarts, so this keeps firing until quarantine/ is empty: `weir-ctl quarantine list` and `inspect`, `requeue --yes` (it deletes each fully recovered segment), then move out what it leaves, desynced or header-corrupt segments and the .wab.confirmed sidecars it ignores (see docs/operations/quarantine-recovery.md)."
               runbook: "docs/monitoring.md#weirsegmentquarantined"
 
   - interval: 1m
@@ -267,7 +267,7 @@ tests:
         values: "0x15"
       - series: 'weir_ack_timeout_total{job="weir",instance="w:9185"}'
         values: "0x15"
-      - series: 'weir_recovery_segments_quarantined_total{job="weir",instance="w:9185"}'
+      - series: 'weir_quarantine_bytes_on_disk{job="weir",instance="w:9185"}'
         values: "0x15"
       - series: 'up{job="weir",instance="w:9185"}'
         values: "1x15"
@@ -372,7 +372,7 @@ tests:
               severity: "warning"
             exp_annotations:
               summary: "weir queue depth sustained high on w:9185 (60000)"
-              description: "The work queue is backing up — the WAB flushers can't keep pace with ingest (usually storage pressure). Correlate with fsync latency. Producers see backpressure (slower acks)."
+              description: "The work queue is backing up and producers see slower acks. Check weir_wab_handoff_blocked_seconds and weir_drain_channel_depth first: a full drain channel stalls the flushers, and the queue backs up behind them. If both are idle, the WAB flushers cannot keep pace with ingest (usually storage pressure); correlate with fsync latency."
               runbook: "docs/monitoring.md#weirqueuesaturation"
 
   - interval: 1m
@@ -754,3 +754,259 @@ tests:
       - eval_time: 15m
         alertname: WeirSegmentParked
         exp_alerts: []
+
+  # ── Readiness and conditions: the daemon's own verdicts ─────────────────────
+  #
+  # weir_startup_phase is one-hot with every phase pre-created, so a serving
+  # daemon also exports its inactive phases at 0. The first test feeds all six
+  # so that an `unless` that forgot its `== 1` would exclude it and go quiet.
+
+  - interval: 1m
+    name: serving but not ready fires WeirNotReady - the inactive phases are present at 0
+    input_series:
+      - series: 'weir_ready{job="weir",instance="w:9185"}'
+        values: "0x10"
+      - series: 'weir_startup_phase{job="weir",instance="w:9185",phase="initializing"}'
+        values: "0x10"
+      - series: 'weir_startup_phase{job="weir",instance="w:9185",phase="recovering"}'
+        values: "0x10"
+      - series: 'weir_startup_phase{job="weir",instance="w:9185",phase="handoff"}'
+        values: "0x10"
+      - series: 'weir_startup_phase{job="weir",instance="w:9185",phase="binding"}'
+        values: "0x10"
+      - series: 'weir_startup_phase{job="weir",instance="w:9185",phase="serving"}'
+        values: "1x10"
+      - series: 'weir_startup_phase{job="weir",instance="w:9185",phase="shutting_down"}'
+        values: "0x10"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: WeirNotReady
+        exp_alerts:
+          - exp_labels:
+              instance: "w:9185"
+              job: "weir"
+              severity: "critical"
+            exp_annotations:
+              summary: "weir on w:9185 is serving but NOT READY for new ingest"
+              description: "/readyz has answered 503 for 5 minutes outside startup and shutdown: new connections are refused or pushes nack. The failing check is in `curl -s <host>:9185/readyz?verbose` or `weir-ctl status`: wab_cap_rejecting (delivery is behind and the WAB hit wab_max_bytes), no_live_shard or listener_down (restart after capturing the logs)."
+              runbook: "docs/monitoring.md#weirnotready"
+
+  - interval: 1m
+    name: a long recovery and a shutdown are not-ready by design and do not fire
+    input_series:
+      - series: 'weir_ready{job="weir",instance="r:9185"}'
+        values: "0x10"
+      - series: 'weir_startup_phase{job="weir",instance="r:9185",phase="recovering"}'
+        values: "1x10"
+      - series: 'weir_startup_phase{job="weir",instance="r:9185",phase="serving"}'
+        values: "0x10"
+      - series: 'weir_ready{job="weir",instance="s:9185"}'
+        values: "0x10"
+      - series: 'weir_startup_phase{job="weir",instance="s:9185",phase="shutting_down"}'
+        values: "1x10"
+      - series: 'weir_startup_phase{job="weir",instance="s:9185",phase="serving"}'
+        values: "0x10"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: WeirNotReady
+        exp_alerts: []
+
+  - interval: 1m
+    name: a ready daemon and a short not-ready blip do not fire WeirNotReady
+    input_series:
+      - series: 'weir_ready{job="weir",instance="w:9185"}'
+        values: "1 1 1 0 0 0 1 1 1 1 1"
+      - series: 'weir_startup_phase{job="weir",instance="w:9185",phase="serving"}'
+        values: "1x10"
+      - series: 'weir_startup_phase{job="weir",instance="w:9185",phase="shutting_down"}'
+        values: "0x10"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: WeirNotReady
+        exp_alerts: []
+
+  - interval: 1m
+    name: a critical condition fires per code - not for codes with their own rule, not for warnings
+    input_series:
+      - series: 'weir_condition_active{job="weir",instance="w:9185",code="shard_offline",severity="critical"}'
+        values: "1x10"
+      - series: 'weir_condition_active{job="weir",instance="w:9185",code="drain_stopped",severity="critical"}'
+        values: "1x10"
+      - series: 'weir_condition_active{job="weir",instance="w:9185",code="sink_down",severity="warning"}'
+        values: "1x10"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: WeirConditionCritical
+        exp_alerts:
+          - exp_labels:
+              code: "shard_offline"
+              instance: "w:9185"
+              job: "weir"
+              severity: "critical"
+            exp_annotations:
+              summary: "weir on w:9185 reports critical condition shard_offline"
+              description: "The daemon's own condition evaluator reports shard_offline, a critical condition with no dedicated rule in this file. `weir-ctl status` on the host shows it with its evidence, and the admin view adds the reason. Runbook for this code: docs/monitoring.md#cond-shard_offline."
+              runbook: "docs/monitoring.md#weirconditioncritical"
+
+  - interval: 1m
+    name: no active critical condition does not fire WeirConditionCritical
+    input_series:
+      - series: 'weir_condition_active{job="weir",instance="w:9185",code="shard_offline",severity="critical"}'
+        values: "0x10"
+      - series: 'weir_condition_active{job="weir",instance="w:9185",code="no_live_shard",severity="critical"}'
+        values: "0 0 1 0 0 0 0 0 0 0 0"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: WeirConditionCritical
+        exp_alerts: []
+
+  # ── Paused delivery, old undelivered data, hand-off backpressure, admin ─────
+
+  - interval: 1m
+    name: a pause held over an hour fires WeirDrainPausedLong
+    input_series:
+      - series: 'weir_drain_paused{job="weir",instance="w:9185"}'
+        values: "1x70"
+    alert_rule_test:
+      - eval_time: 65m
+        alertname: WeirDrainPausedLong
+        exp_alerts:
+          - exp_labels:
+              instance: "w:9185"
+              job: "weir"
+              severity: "warning"
+            exp_annotations:
+              summary: "weir delivery on w:9185 has been paused for over an hour"
+              description: "An operator paused the drain (`weir-ctl drain pause`) and it is still paused. Ingest keeps buffering into the WAB, which grows until wab_max_bytes makes pushes nack, or without bound if wab_max_bytes is 0. Resume with `weir-ctl drain resume`; a restart also resumes delivery."
+              runbook: "docs/monitoring.md#weirdrainpausedlong"
+
+  - interval: 1m
+    name: a pause under an hour, and no pause, do not fire
+    input_series:
+      - series: 'weir_drain_paused{job="weir",instance="p:9185"}'
+        values: "1x50"
+      - series: 'weir_drain_paused{job="weir",instance="w:9185"}'
+        values: "0x50"
+    alert_rule_test:
+      - eval_time: 50m
+        alertname: WeirDrainPausedLong
+        exp_alerts: []
+
+  - interval: 1m
+    name: undelivered data older than an hour fires WeirOldestUndeliveredAge
+    input_series:
+      - series: 'weir_wab_oldest_undelivered_age_seconds{job="weir",instance="w:9185"}'
+        values: "4000+60x30"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: WeirOldestUndeliveredAge
+        exp_alerts:
+          - exp_labels:
+              instance: "w:9185"
+              job: "weir"
+              severity: "warning"
+            exp_annotations:
+              summary: "weir on w:9185 holds undelivered data older than an hour"
+              description: "The oldest sealed segment the sink has not confirmed was created over an hour ago (an upper bound on the oldest record's age). Delivery is behind or stuck: `weir-ctl status` shows which (delivery_stalled, sink_down, sink_failing, drain_paused, segments_stranded, or delivery_lagging with commits succeeding)."
+              runbook: "docs/monitoring.md#weiroldestundeliveredage"
+
+  - interval: 1m
+    name: a young backlog, and a backlog that caught up, do not fire
+    input_series:
+      - series: 'weir_wab_oldest_undelivered_age_seconds{job="weir",instance="w:9185"}'
+        values: "100+0x30"
+      - series: 'weir_wab_oldest_undelivered_age_seconds{job="weir",instance="c:9185"}'
+        values: "4000x10 0x20"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: WeirOldestUndeliveredAge
+        exp_alerts: []
+
+  - interval: 1m
+    name: a hand-off blocked for minutes fires WeirDrainBackpressure
+    input_series:
+      - series: 'weir_wab_handoff_blocked_seconds{job="weir",instance="w:9185",shard="0"}'
+        values: "30x20"
+      - series: 'weir_wab_handoff_blocked_seconds{job="weir",instance="w:9185",shard="1"}'
+        values: "0x20"
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: WeirDrainBackpressure
+        exp_alerts:
+          - exp_labels:
+              instance: "w:9185"
+              job: "weir"
+              severity: "warning"
+            exp_annotations:
+              summary: "weir on w:9185: delivery is stalling ingest (drain hand-off blocked)"
+              description: "WAB flushers keep waiting to hand sealed segments to the drain because its channel is full. Acks wait behind the hand-off, so producers see ACK_TIMEOUT nacks of records that ARE durable. This is a delivery problem, not a storage one: check sink commit latency and the sink and drain conditions in `weir-ctl status`."
+              runbook: "docs/monitoring.md#weirdrainbackpressure"
+
+  - interval: 1m
+    name: no hand-off block, and one brief block, do not fire WeirDrainBackpressure
+    input_series:
+      - series: 'weir_wab_handoff_blocked_seconds{job="weir",instance="w:9185",shard="0"}'
+        values: "0x20"
+      - series: 'weir_wab_handoff_blocked_seconds{job="weir",instance="b:9185",shard="0"}'
+        values: "0 0 8 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
+    alert_rule_test:
+      - eval_time: 20m
+        alertname: WeirDrainBackpressure
+        exp_alerts: []
+
+  - interval: 1m
+    name: an enabled admin socket that could not bind fires WeirAdminUnavailable
+    input_series:
+      - series: 'weir_condition_active{job="weir",instance="w:9185",code="admin_unavailable",severity="warning"}'
+        values: "1x10"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: WeirAdminUnavailable
+        exp_alerts:
+          - exp_labels:
+              instance: "w:9185"
+              job: "weir"
+              severity: "warning"
+            exp_annotations:
+              summary: "weir admin socket is unavailable on w:9185"
+              description: "admin_socket_enabled is on but the daemon could not bind the admin socket (most often a parent directory that is group- or world-writable, or owned by another user). weir-ctl drain and weir-ctl reload do not work until it is fixed; kill -HUP still reloads TLS, and weir-ctl status falls back to HTTP and disk. The reason code is on /status under admin.reason_code."
+              runbook: "docs/monitoring.md#weiradminunavailable"
+
+  - interval: 1m
+    name: a bound or deliberately disabled admin socket does not fire WeirAdminUnavailable
+    input_series:
+      - series: 'weir_condition_active{job="weir",instance="w:9185",code="admin_unavailable",severity="warning"}'
+        values: "0x10"
+      - series: 'weir_admin_socket_up{job="weir",instance="w:9185"}'
+        values: "0x10"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: WeirAdminUnavailable
+        exp_alerts: []
+
+  # ── A quarantine outlives the process that made it ──────────────────────────
+  #
+  # weir_recovery_segments_quarantined_total is per process: a restart resets
+  # it while the quarantined files stay. The rule reads the byte gauge, which
+  # survives the restart, so it keeps firing until quarantine/ is empty.
+
+  - interval: 1m
+    name: a quarantine left on disk keeps firing after a restart reset the counter
+    input_series:
+      # The process restarted: its counter starts again at 0, the files remain.
+      - series: 'weir_recovery_segments_quarantined_total{job="weir",instance="w:9185"}'
+        values: "0x10"
+      - series: 'weir_quarantine_bytes_on_disk{job="weir",instance="w:9185"}'
+        values: "4096x10"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: WeirSegmentQuarantined
+        exp_alerts:
+          - exp_labels:
+              instance: "w:9185"
+              job: "weir"
+              severity: "critical"
+            exp_annotations:
+              summary: "weir holds quarantined segment data on w:9185"
+              description: "<wab_dir>/quarantine/ is not empty: recovery or the drain moved a segment there (or, for mid-file corruption, a copy of it) because its bytes are bad (a header it cannot parse, in recovery a newer format too; a CRC mismatch; a truncated footer), a media-class read error outlasted three strand cycles and 10 minutes, or its .confirmed sidecar failed verification. A data-integrity event. The byte gauge survives restarts, so this keeps firing until quarantine/ is empty: `weir-ctl quarantine list` and `inspect`, `requeue --yes` (it deletes each fully recovered segment), then move out what it leaves, desynced or header-corrupt segments and the .wab.confirmed sidecars it ignores (see docs/operations/quarantine-recovery.md)."
+              runbook: "docs/monitoring.md#weirsegmentquarantined"

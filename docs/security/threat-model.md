@@ -134,7 +134,7 @@ Threats the daemon defends against:
 | A stray SIGHUP (`systemctl reload`, a log-rotation script, a terminal hang-up) | SIGHUP is set to ignored at the top of `main`, before the config is read, and once the runtime is up it is a counted reload request (`weir_config_reloads_total{trigger="sighup"}`). It no longer terminates the daemon. Before this, any daemon without a TLS listener died on SIGHUP and skipped the seal and drain. |
 | WAB segment tampering (mode tightening) | `audit_segment_modes` runs at startup and warns on any `.wab`/`.wab.sealed`/`.wab.confirmed` file whose permissions are not 0o600. Increments `weir_wab_unexpected_mode_total`. |
 | Bad CRCs (header or payload) | Reject with `Nack(BadHeaderCrc \| BadPayloadCrc)` and close the connection; counter incremented. |
-| Stuck pipeline on shutdown | SIGTERM handler unwinds the pipeline in dependency order; the runtime is dropped before joining threads so background tasks holding queue sender clones don't deadlock the join. |
+| Stuck pipeline on shutdown | Shutdown is bounded. Listeners close at once (the socket file is unlinked, inode-checked); a connection in the middle of a frame finishes it and gets its ack, for at most `shutdown_timeout_secs`; an idle connection is closed at once. Each flusher waits at most 1 s to hand its last sealed segment to the drain, and the drain gets `drain_shutdown_budget_secs` before it abandons in-flight work, unconfirmed, for replay. The runtime outlives the worker and flusher joins, so `/metrics`, the probes and the admin `status` verb answer throughout, and the joins are never skipped. A drain stuck in a sink call that never yields is left behind: the process exits 0 and the kernel releases the `wab_dir` lock only once it is gone. A second SIGTERM shortens the connection drain and the drain wait, never the joins. |
 | Unauthenticated remote TCP producers (`--features tls`) | Mutual TLS with CA-signed client cert required. Anonymous clients rejected at handshake; increments `weir_tls_handshake_failures_total{reason="no_client_cert"}`. |
 | TLS-handshake slowloris on TCP path (`--features tls`) | `tls_handshake_timeout_secs` (default 10s) bounds handshake duration. The connection cap semaphore permit is held across the handshake, so a flood of stalled TCP connections is bounded by `max_connections`. Increments `weir_tls_handshake_failures_total{reason="timeout"}`. |
 | Plaintext TCP fallback | Setting `tcp_bind` without a valid TLS config is a fatal startup error. The daemon never opens a plaintext TCP socket. |
@@ -232,10 +232,10 @@ loud.
   between that recovery and its own exit can be false acks. Records it had
   already fsynced into files the second daemon recovers are delivered by the
   second daemon. The integrity check runs on its own thread from right after
-  the lock is taken, so the window is the same during recovery and a long
-  startup replay (when the socket and metrics port are not bound yet and a
-  duplicate with an identical config would pass preflight): proven loss there
-  exits 3 before anything is served. Detection cannot close this window. The only
+  the lock is taken, so the window is the same during a long recovery (when
+  the producer socket is not bound yet, so a duplicate with its own metrics
+  port would pass preflight): proven loss there exits 3 before anything is
+  served. Detection cannot close this window. The only
   defence is **never delete `.weir.lock`**. It is a dotfile, so `rm -rf wab/*`
   does not match it under default shell globbing. Alert on any increase of
   `weir_wab_dir_lock_integrity_failures_total`.
@@ -257,12 +257,13 @@ loud.
   (`refusing connection: peer uid does not match daemon uid`,
   `weir_connection_rejected_peer_uid_total`). An unexplained peer-uid
   rejection next to a refused start is most likely the probe.
-- **A daemon that is shutting down still looks live.** Its listener stays
-  open while in-flight connections drain (up to `shutdown_timeout_secs`), so
-  a new instance started in that window refuses with "in use by a running
-  process". It also holds the `wab_dir` lock until it exits. Under systemd
-  the old process has exited before the new one starts; elsewhere, wait for
-  the old process to exit.
+- **A daemon that is shutting down still holds the `wab_dir` lock.** At the
+  first SIGTERM it unlinks its socket and closes its listeners, so a new
+  instance's probe finds nothing live; it refuses with "locked by" instead,
+  until the old process exits, up to
+  `shutdown_timeout_secs + drain_shutdown_budget_secs + 5` seconds later.
+  Under systemd the old process has exited before the new one starts;
+  elsewhere, wait for it to exit.
 - **Preflight test-binds and releases.** Preflight does not hold the metrics
   and TCP addresses. A process that binds them after preflight still makes
   the authoritative bind fail later, after recovery. Preflight narrows that
