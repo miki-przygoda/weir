@@ -5,11 +5,9 @@
 //! endpoint. No new daemon-side API is required.
 
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use weir_client::WeirClient;
@@ -18,6 +16,7 @@ use weir_wab::SegmentReader;
 
 mod admin_client;
 mod attest;
+mod http;
 mod offline;
 mod status;
 
@@ -2301,21 +2300,7 @@ fn cmd_quarantine_requeue(
 /// Minimal HTTP/1.0 GET of `/metrics` — keeps weir-ctl free of an HTTP client
 /// dependency (the daemon's metrics server speaks plain HTTP/1.0).
 fn scrape(addr: &str) -> Result<String, String> {
-    let mut stream = TcpStream::connect(addr).map_err(|e| format!("connect {addr}: {e}"))?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .map_err(|e| format!("set timeout: {e}"))?;
-    stream
-        .write_all(b"GET /metrics HTTP/1.0\r\nHost: localhost\r\n\r\n")
-        .map_err(|e| format!("write GET: {e}"))?;
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .map_err(|e| format!("read /metrics: {e}"))?;
-    match response.split_once("\r\n\r\n") {
-        Some((_head, body)) => Ok(body.to_string()),
-        None => Ok(response),
-    }
+    http::http_get(addr, "/metrics").map(|r| r.body)
 }
 
 /// Sums every sample whose line starts with `prefix` (handles label sets, e.g.
