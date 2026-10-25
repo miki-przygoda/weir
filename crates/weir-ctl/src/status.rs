@@ -185,6 +185,241 @@ fn shards_json(f: &DiskFacts, now_ms: u64) -> Value {
     )
 }
 
+/// `--source`: `auto` walks the spec §14 chain; any other value consults
+/// that one source only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum SourceMode {
+    Auto,
+    Admin,
+    Http,
+    Metrics,
+    Disk,
+}
+
+/// Which source the printed document came from (`--json` key `source`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceKind {
+    Admin,
+    Http,
+    Metrics,
+    MetricsAndDisk,
+    Disk,
+    None,
+}
+
+impl SourceKind {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            SourceKind::Admin => "admin",
+            SourceKind::Http => "http",
+            SourceKind::Metrics => "metrics",
+            SourceKind::MetricsAndDisk => "metrics+disk",
+            SourceKind::Disk => "disk",
+            SourceKind::None => "none",
+        }
+    }
+}
+
+/// One entry of `sources_tried`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SourceAttempt {
+    pub source: &'static str,
+    pub ok: bool,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SourceFail {
+    /// Try the next source.
+    Skip(String),
+    /// Stop: the admin socket failed a client-side identity check. Falling
+    /// back to `/status` would hide the impersonation the check exists to
+    /// catch (README Q9).
+    Identity(String),
+}
+
+/// The four spec §14 sources, behind a trait so every branch of the chain is
+/// testable without a network.
+pub(crate) trait StatusSources {
+    /// The admin `status` result (`AdminStatusDoc`), identity already checked.
+    fn admin(&self) -> Result<Value, SourceFail>;
+    /// `GET /status` (`PublicStatusDoc`), JSON content type already checked.
+    fn http_status(&self) -> Result<Value, SourceFail>;
+    /// `GET /metrics` body containing weir series.
+    fn metrics(&self) -> Result<String, SourceFail>;
+    fn disk(&self) -> Result<DiskFacts, SourceFail>;
+}
+
+#[derive(Debug)]
+pub(crate) struct StatusOutcome {
+    /// The document as rendered, plus the `source` and `sources_tried` keys.
+    pub doc: Value,
+    pub source: SourceKind,
+    pub tried: Vec<SourceAttempt>,
+    pub exit: StatusExit,
+}
+
+/// The exit for a daemon-rendered document: its own `verdict.ready` (the same
+/// `readiness` /readyz renders) plus any critical condition. A document that
+/// is not `weir.status/v1` with a boolean `verdict.ready` is refused, so the
+/// chain moves on instead of trusting it.
+pub(crate) fn daemon_doc_exit(doc: &Value) -> Result<StatusExit, String> {
+    if doc.get("schema").and_then(Value::as_str) != Some(weir_status::SCHEMA) {
+        return Err(format!(
+            "the answer is not a {} document",
+            weir_status::SCHEMA
+        ));
+    }
+    let ready = doc
+        .pointer("/verdict/ready")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| "the document has no verdict.ready".to_string())?;
+    let any_critical = doc
+        .get("conditions")
+        .and_then(Value::as_array)
+        .is_some_and(|cs| cs.iter().any(|c| c["severity"] == "critical"));
+    Ok(StatusExit::from_parts(ready, any_critical))
+}
+
+fn ok_attempt(source: &'static str) -> SourceAttempt {
+    SourceAttempt {
+        source,
+        ok: true,
+        reason: None,
+    }
+}
+
+fn failed(source: &'static str, why: String) -> SourceAttempt {
+    SourceAttempt {
+        source,
+        ok: false,
+        reason: Some(why),
+    }
+}
+
+fn finish(
+    mut doc: Value,
+    source: SourceKind,
+    tried: Vec<SourceAttempt>,
+    exit: StatusExit,
+) -> StatusOutcome {
+    if let Some(o) = doc.as_object_mut() {
+        o.insert("source".into(), json!(source.label()));
+        o.insert(
+            "sources_tried".into(),
+            Value::Array(
+                tried
+                    .iter()
+                    .map(|a| json!({"source": a.source, "ok": a.ok, "reason": a.reason}))
+                    .collect(),
+            ),
+        );
+    }
+    StatusOutcome {
+        doc,
+        source,
+        tried,
+        exit,
+    }
+}
+
+/// Spec §14: in auto mode the first success wins, in the order admin socket,
+/// `GET /status`, `/metrics` plus disk, disk alone. A forced `mode` consults
+/// only that source (`metrics` still reads the disk to fill the backlog). An
+/// identity mismatch on the admin socket ends the chain with exit 2.
+pub(crate) fn collect_status(
+    src: &dyn StatusSources,
+    mode: SourceMode,
+    now_ms: u64,
+) -> StatusOutcome {
+    let want = |m: SourceMode| mode == SourceMode::Auto || mode == m;
+    let mut tried = Vec::new();
+
+    // A daemon-rendered document (admin, then http) is used as-is.
+    for kind in [SourceKind::Admin, SourceKind::Http] {
+        let (m, label) = match kind {
+            SourceKind::Admin => (SourceMode::Admin, "admin"),
+            _ => (SourceMode::Http, "http"),
+        };
+        if !want(m) {
+            continue;
+        }
+        let fetched = match kind {
+            SourceKind::Admin => src.admin(),
+            _ => src.http_status(),
+        };
+        match fetched {
+            Ok(doc) => match daemon_doc_exit(&doc) {
+                Ok(exit) => {
+                    tried.push(ok_attempt(label));
+                    return finish(doc, kind, tried, exit);
+                }
+                Err(why) => tried.push(failed(label, why)),
+            },
+            Err(SourceFail::Identity(why)) => {
+                tried.push(failed(label, format!("identity mismatch: {why}")));
+                // Nothing from the refused socket: no instance, no conditions.
+                let doc = json!({
+                    "schema": weir_status::SCHEMA, "view": "offline", "generated_at_ms": now_ms,
+                    "verdict": {"ready": false, "live": null, "startup_complete": null,
+                                "readiness_failing": null},
+                    "conditions": [], "unevaluated": [],
+                    "identity_error": why,
+                });
+                return finish(doc, SourceKind::None, tried, StatusExit::Unreachable);
+            }
+            Err(SourceFail::Skip(why)) => tried.push(failed(label, why)),
+        }
+    }
+
+    if want(SourceMode::Metrics) {
+        match src.metrics() {
+            Ok(body) => {
+                tried.push(ok_attempt("metrics"));
+                let disk = match src.disk() {
+                    Ok(f) => {
+                        tried.push(ok_attempt("disk"));
+                        Some(f)
+                    }
+                    Err(SourceFail::Skip(w) | SourceFail::Identity(w)) => {
+                        tried.push(failed("disk", w));
+                        None
+                    }
+                };
+                let kind = if disk.is_some() {
+                    SourceKind::MetricsAndDisk
+                } else {
+                    SourceKind::Metrics
+                };
+                let (doc, exit) = metrics_doc(&body, disk.as_ref(), now_ms);
+                return finish(doc, kind, tried, exit);
+            }
+            Err(SourceFail::Skip(w) | SourceFail::Identity(w)) => tried.push(failed("metrics", w)),
+        }
+    }
+
+    if want(SourceMode::Disk) {
+        match src.disk() {
+            Ok(f) => {
+                tried.push(ok_attempt("disk"));
+                // README Q9: disk facts are printed, so the exit is evaluated
+                // from them (not ready, 1), not "unreachable" (2).
+                let (doc, exit) = offline_doc(&f, now_ms);
+                return finish(doc, SourceKind::Disk, tried, exit);
+            }
+            Err(SourceFail::Skip(w) | SourceFail::Identity(w)) => tried.push(failed("disk", w)),
+        }
+    }
+
+    // No daemon answered and there are no offline facts: the exit-2 case.
+    finish(
+        unreachable_doc(now_ms),
+        SourceKind::None,
+        tried,
+        StatusExit::Unreachable,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,5 +585,293 @@ weir_wab_undelivered_segments 4\nweir_wab_undelivered_records 40\n";
         let (doc, _) = metrics_doc(body, Some(&facts(2, 0)), NOW);
         assert_eq!(doc["backlog"]["undelivered_segments"], 2);
         assert!(doc["backlog"].get("unreadable_segments").is_some());
+    }
+
+    use std::cell::RefCell;
+
+    struct Fake {
+        admin: Result<serde_json::Value, SourceFail>,
+        http: Result<serde_json::Value, SourceFail>,
+        metrics: Result<String, SourceFail>,
+        disk: Result<DiskFacts, SourceFail>,
+        calls: RefCell<Vec<&'static str>>,
+    }
+
+    impl Fake {
+        fn down() -> Fake {
+            let skip = || SourceFail::Skip("down".into());
+            Fake {
+                admin: Err(skip()),
+                http: Err(skip()),
+                metrics: Err(skip()),
+                disk: Err(skip()),
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    impl StatusSources for Fake {
+        fn admin(&self) -> Result<serde_json::Value, SourceFail> {
+            self.calls.borrow_mut().push("admin");
+            self.admin.clone()
+        }
+        fn http_status(&self) -> Result<serde_json::Value, SourceFail> {
+            self.calls.borrow_mut().push("http");
+            self.http.clone()
+        }
+        fn metrics(&self) -> Result<String, SourceFail> {
+            self.calls.borrow_mut().push("metrics");
+            self.metrics.clone()
+        }
+        fn disk(&self) -> Result<DiskFacts, SourceFail> {
+            self.calls.borrow_mut().push("disk");
+            self.disk.clone()
+        }
+    }
+
+    fn daemon_doc(view: &str, ready: bool, severity: &str) -> serde_json::Value {
+        json!({"schema": weir_status::SCHEMA, "view": view,
+               "verdict": {"ready": ready, "readiness_failing": if ready { json!([]) } else { json!(["starting"]) }},
+               "conditions": [{"code": "noop_sink", "severity": severity, "summary": "s"}],
+               "unevaluated": []})
+    }
+
+    fn tried(o: &StatusOutcome) -> Vec<&'static str> {
+        o.tried.iter().map(|a| a.source).collect()
+    }
+
+    #[test]
+    fn auto_prefers_the_admin_socket_and_adds_source_keys_only() {
+        let f = Fake {
+            admin: Ok(daemon_doc("admin", true, "warning")),
+            ..Fake::down()
+        };
+        let o = collect_status(&f, SourceMode::Auto, NOW);
+        assert_eq!(o.source, SourceKind::Admin);
+        assert_eq!(o.exit, StatusExit::Ready);
+        assert_eq!(f.calls(), ["admin"]);
+        let mut expected = keys(&daemon_doc("admin", true, "warning"));
+        expected.extend(["source".to_string(), "sources_tried".to_string()]);
+        expected.sort();
+        assert_eq!(
+            keys(&o.doc),
+            expected,
+            "--json is the document plus two keys"
+        );
+        assert_eq!(o.doc["source"], "admin");
+        assert_eq!(
+            o.doc["sources_tried"],
+            json!([{"source": "admin", "ok": true, "reason": null}])
+        );
+    }
+
+    #[test]
+    fn admin_down_falls_through_to_http_with_the_reason_recorded() {
+        let f = Fake {
+            admin: Err(SourceFail::Skip(
+                "no admin socket at /var/lib/weir/wab.admin.sock".into(),
+            )),
+            http: Ok(daemon_doc("public", false, "info")),
+            ..Fake::down()
+        };
+        let o = collect_status(&f, SourceMode::Auto, NOW);
+        assert_eq!(o.source, SourceKind::Http);
+        assert_eq!(o.exit, StatusExit::NotReady);
+        assert_eq!(tried(&o), ["admin", "http"]);
+        assert!(
+            o.tried[0]
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("no admin socket")
+        );
+    }
+
+    #[test]
+    fn an_identity_mismatch_is_terminal_and_exits_2() {
+        let f = Fake {
+            admin: Err(SourceFail::Identity(
+                "the daemon serves wab_dir (dev 1, ino 2)".into(),
+            )),
+            http: Ok(daemon_doc("public", true, "info")),
+            ..Fake::down()
+        };
+        let o = collect_status(&f, SourceMode::Auto, NOW);
+        assert_eq!(
+            f.calls(),
+            ["admin"],
+            "no fallback after a failed identity check"
+        );
+        assert_eq!(o.exit, StatusExit::Unreachable);
+        assert_eq!(o.source, SourceKind::None);
+        assert!(o.doc["identity_error"].as_str().unwrap().contains("ino 2"));
+        assert!(
+            o.tried[0]
+                .reason
+                .as_deref()
+                .unwrap()
+                .starts_with("identity mismatch")
+        );
+    }
+
+    #[test]
+    fn an_old_daemon_goes_to_metrics_plus_disk() {
+        let f = Fake {
+            http: Err(SourceFail::Skip(
+                "/status is not JSON (application/openmetrics-text); a pre-4.1 daemon".into(),
+            )),
+            metrics: Ok("weir_records_accepted_total{tier=\"durable\"} 5\n".into()),
+            disk: Ok(facts(2, 0)),
+            ..Fake::down()
+        };
+        let o = collect_status(&f, SourceMode::Auto, NOW);
+        assert_eq!(o.source, SourceKind::MetricsAndDisk);
+        assert_eq!(o.doc["source"], "metrics+disk");
+        assert_eq!(tried(&o), ["admin", "http", "metrics", "disk"]);
+        assert_eq!(o.doc["backlog"]["undelivered_segments"], 2);
+    }
+
+    #[test]
+    fn disk_only_is_not_ready_with_facts() {
+        // README Q9: disk facts printed, so the exit is evaluated from them (1).
+        let f = Fake {
+            disk: Ok(facts(1, 1)),
+            ..Fake::down()
+        };
+        let o = collect_status(&f, SourceMode::Auto, NOW);
+        assert_eq!(o.source, SourceKind::Disk);
+        assert_eq!(o.exit, StatusExit::NotReady);
+        assert_eq!(o.doc["view"], "offline");
+        assert_eq!(tried(&o), ["admin", "http", "metrics", "disk"]);
+    }
+
+    #[test]
+    fn nothing_at_all_is_unreachable() {
+        let o = collect_status(&Fake::down(), SourceMode::Auto, NOW);
+        assert_eq!(o.source, SourceKind::None);
+        assert_eq!(o.exit, StatusExit::Unreachable);
+        assert_eq!(o.doc["source"], "none");
+        assert_eq!(o.doc["conditions"][0]["code"], "daemon_unreachable");
+    }
+
+    #[test]
+    fn a_forced_source_consults_only_that_source() {
+        let f = Fake {
+            admin: Ok(daemon_doc("admin", true, "info")),
+            ..Fake::down()
+        };
+        let o = collect_status(&f, SourceMode::Http, NOW);
+        assert_eq!(f.calls(), ["http"]);
+        assert_eq!(o.exit, StatusExit::Unreachable);
+        let f = Fake {
+            disk: Ok(facts(0, 0)),
+            ..Fake::down()
+        };
+        let o = collect_status(&f, SourceMode::Disk, NOW);
+        assert_eq!(f.calls(), ["disk"]);
+        assert_eq!(o.source, SourceKind::Disk);
+    }
+
+    #[test]
+    fn a_daemon_document_must_be_weir_status_v1_with_a_verdict() {
+        assert_eq!(
+            daemon_doc_exit(&daemon_doc("admin", true, "critical")),
+            Ok(StatusExit::ReadyWithCritical)
+        );
+        assert_eq!(
+            daemon_doc_exit(&daemon_doc("admin", false, "critical")),
+            Ok(StatusExit::NotReady)
+        );
+        assert!(
+            daemon_doc_exit(&json!({"schema": "weir.status/v2", "verdict": {"ready": true}}))
+                .is_err()
+        );
+        assert!(daemon_doc_exit(&json!({"schema": weir_status::SCHEMA})).is_err());
+        // A bad admin document falls through instead of being trusted.
+        let f = Fake {
+            admin: Ok(json!({"hello": 1})),
+            http: Ok(daemon_doc("public", true, "info")),
+            ..Fake::down()
+        };
+        let o = collect_status(&f, SourceMode::Auto, NOW);
+        assert_eq!(o.source, SourceKind::Http);
+        assert!(
+            o.tried[0]
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("weir.status/v1")
+        );
+    }
+
+    #[test]
+    fn an_identity_mismatch_under_a_forced_admin_source_is_also_exit_2() {
+        let f = Fake {
+            admin: Err(SourceFail::Identity(
+                "socket owned by uid 1001, not 1000".into(),
+            )),
+            ..Fake::down()
+        };
+        let o = collect_status(&f, SourceMode::Admin, NOW);
+        assert_eq!(f.calls(), ["admin"]);
+        assert_eq!(o.exit, StatusExit::Unreachable);
+        assert_eq!(o.doc["source"], "none");
+        assert!(
+            o.doc["identity_error"]
+                .as_str()
+                .unwrap()
+                .contains("uid 1001")
+        );
+        // Nothing from the refused socket reaches the document.
+        assert!(o.doc.get("instance").is_none());
+        assert!(o.doc["conditions"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn source_mode_cli_values_and_kind_labels() {
+        use clap::ValueEnum;
+        let names: Vec<String> = SourceMode::value_variants()
+            .iter()
+            .map(|m| m.to_possible_value().unwrap().get_name().to_string())
+            .collect();
+        assert_eq!(names, ["auto", "admin", "http", "metrics", "disk"]);
+        let labels: Vec<&str> = [
+            SourceKind::Admin,
+            SourceKind::Http,
+            SourceKind::Metrics,
+            SourceKind::MetricsAndDisk,
+            SourceKind::Disk,
+            SourceKind::None,
+        ]
+        .into_iter()
+        .map(SourceKind::label)
+        .collect();
+        assert_eq!(
+            labels,
+            ["admin", "http", "metrics", "metrics+disk", "disk", "none"]
+        );
+    }
+
+    #[test]
+    fn metrics_without_disk_is_the_metrics_source() {
+        let f = Fake {
+            metrics: Ok("weir_records_accepted_total{tier=\"durable\"} 5\n".into()),
+            ..Fake::down()
+        };
+        let o = collect_status(&f, SourceMode::Metrics, NOW);
+        assert_eq!(f.calls(), ["metrics", "disk"]);
+        assert_eq!(o.source, SourceKind::Metrics);
+        assert_eq!(o.doc["source"], "metrics");
+        assert_eq!(
+            o.tried[1],
+            SourceAttempt {
+                source: "disk",
+                ok: false,
+                reason: Some("down".into())
+            }
+        );
     }
 }
