@@ -1335,3 +1335,70 @@ fn every_condition_code_an_alert_names_is_real() {
          known codes: {known:?}"
     );
 }
+
+/// The body under `#### <heading>` in docs/monitoring.md, up to the next
+/// heading of any level.
+fn monitoring_section(heading: &str) -> &'static str {
+    let marker = format!("\n#### {heading}\n");
+    let start = MONITORING
+        .find(&marker)
+        .unwrap_or_else(|| panic!("docs/monitoring.md has no `#### {heading}`"))
+        + marker.len();
+    let rest = &MONITORING[start..];
+    let end = ["\n## ", "\n### ", "\n#### "]
+        .iter()
+        .filter_map(|m| rest.find(m))
+        .min()
+        .unwrap_or(rest.len());
+    &rest[..end]
+}
+
+/// The double-quoted value of `<key>:` in the rule named `rule`.
+fn alert_annotation(rule: &str, key: &str) -> &'static str {
+    let at = ALERTS
+        .find(&format!("- alert: {rule}\n"))
+        .unwrap_or_else(|| panic!("weir-alerts.yml has no rule {rule}"));
+    let rest = &ALERTS[at..];
+    let needle = format!("{key}: \"");
+    let start = rest
+        .find(&needle)
+        .unwrap_or_else(|| panic!("{rule} has no {key} annotation"))
+        + needle.len();
+    let end = rest[start..].find("\"\n").expect("unterminated annotation") + start;
+    &rest[start..end]
+}
+
+/// Both runbooks send the operator to the drain hand-off before storage.
+///
+/// When the drain channel is full, flushers block handing sealed segments to
+/// the drain before the acks of the batch behind resolve, so producers get
+/// ACK_TIMEOUT for records that are durable. The old text said "flusher may
+/// be wedged, check fsync latency", which sent every such incident to the
+/// disk. Order matters here, not just presence: a runbook that mentions the
+/// hand-off after three paragraphs of fsync triage still misdirects.
+#[test]
+fn ack_timeout_and_queue_saturation_runbooks_check_the_drain_hand_off_first() {
+    for rule in ["WeirAckTimeout", "WeirQueueSaturation"] {
+        for (place, text) in [
+            ("docs/monitoring.md", monitoring_section(rule)),
+            (
+                "weir-alerts.yml description",
+                alert_annotation(rule, "description"),
+            ),
+        ] {
+            let storage = text
+                .find("fsync")
+                .unwrap_or_else(|| panic!("{rule} ({place}) no longer mentions fsync at all"));
+            for signal in [
+                "weir_wab_handoff_blocked_seconds",
+                "weir_drain_channel_depth",
+            ] {
+                match text.find(signal) {
+                    Some(i) if i < storage => {}
+                    Some(_) => panic!("{rule} ({place}): {signal} comes after the fsync triage"),
+                    None => panic!("{rule} ({place}): does not mention {signal}"),
+                }
+            }
+        }
+    }
+}

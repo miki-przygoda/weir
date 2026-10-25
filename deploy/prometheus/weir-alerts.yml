@@ -49,8 +49,8 @@ groups:
         for: 0m
         labels: { severity: critical }
         annotations:
-          summary: "weir ack timed out on {{ $labels.instance }} — flusher may be wedged"
-          description: "A record's ack never fired within the timeout without a panic — the classic wedged-flusher signature (e.g. a stuck fsync). Check fsync latency and the flusher threads."
+          summary: "weir ack timed out on {{ $labels.instance }} — check the drain hand-off before storage"
+          description: "A record's ack did not resolve within the timeout and the producer got ACK_TIMEOUT. Often this is delivery, not storage: with the drain channel full, flushers wait to hand sealed segments to the drain before the acks behind them resolve, so durable records are nacked. Check weir_wab_handoff_blocked_seconds and weir_drain_channel_depth first; only if both are idle, check fsync latency and the flusher threads."
           runbook: "docs/monitoring.md#weiracktimeout"
 
       # On the BYTES in quarantine/, not the per-process counter: a restart
@@ -344,7 +344,7 @@ groups:
         labels: { severity: warning }
         annotations:
           summary: "weir queue depth sustained high on {{ $labels.instance }} ({{ $value }})"
-          description: "The work queue is backing up — the WAB flushers can't keep pace with ingest (usually storage pressure). Correlate with fsync latency. Producers see backpressure (slower acks)."
+          description: "The work queue is backing up and producers see slower acks. Check weir_wab_handoff_blocked_seconds and weir_drain_channel_depth first: a full drain channel stalls the flushers, and the queue backs up behind them. If both are idle, the WAB flushers cannot keep pace with ingest (usually storage pressure); correlate with fsync latency."
           runbook: "docs/monitoring.md#weirqueuesaturation"
 
       # weir_wab_handoff_blocked_seconds{shard} is how long that shard's flusher

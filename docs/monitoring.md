@@ -99,11 +99,23 @@ Real flusher panics are logical bugs — capture the backtrace and restart the
 daemon to clear the offline shard. Repeated panics on the same shard = file a bug.
 
 #### WeirAckTimeout
-A record's ack never fired within the timeout, with no panic — the wedged-flusher
-signature (e.g. a stuck `fsync` on a hung disk).
-**Respond:** correlate with `WeirFsyncLatencyHigh` and `weir_queue_depth`. If
-fsync latency is spiking, it's storage. If a `WeirFlusherPanic` follows shortly,
-treat it as a flusher panic. A hung daemon may need a restart.
+A record's ack did not resolve within the timeout, and the producer got an
+`ACK_TIMEOUT` nack. The common cause is **not** storage: when the drain's
+channel is full, a flusher waits to hand a sealed segment to the drain before
+the acks of the batch behind it resolve, so records that are already durable
+are nacked.
+**Respond, in this order:**
+1. `weir_wab_handoff_blocked_seconds` above 0, or `weir_drain_channel_depth`
+   at or near `weir_drain_channel_capacity` (256): delivery is stalling
+   ingest. Follow [WeirDrainBackpressure](#weirdrainbackpressure). The
+   records were durable, and producers' retries will deliver them twice.
+2. Both idle: look at storage. Correlate with `WeirFsyncLatencyHigh` and
+   `weir_queue_depth`; spiking fsync latency means a slow or failing disk.
+3. A `WeirFlusherPanic` shortly after: treat it as a flusher panic. A hung
+   daemon may need a restart.
+
+`weir-ctl status` shows the `ack_timeouts_recent` condition with the cause it
+infers from the same signals.
 
 #### WeirSegmentQuarantined
 `<wab_dir>/quarantine/` holds data. Recovery or the drain moved a segment there
@@ -414,12 +426,18 @@ should retry, but a *sustained* Nack rate means a shard or the storage is
 unhealthy — chase the root cause above.
 
 #### WeirQueueSaturation
-The work queue is backing up — the WAB flushers can't keep pace with ingest
-(usually storage pressure). Producers see backpressure (slower acks).
-**Respond:** correlate with fsync latency. If fsync is the bottleneck, you're at
-the storage durability ceiling — faster disk, more shards (one flusher/disk), or
-shift latency-tolerant traffic to the `Buffered` tier. `[TUNE]` the
-threshold to your `batch_size × shard_count` and burst profile.
+The work queue between the sockets and the WAB workers is backing up, and
+producers see slower acks.
+**Respond, in this order:**
+1. `weir_wab_handoff_blocked_seconds` above 0, or `weir_drain_channel_depth`
+   near its capacity: a full drain channel stalls the flushers and the queue
+   backs up behind them. That is a delivery problem; follow
+   [WeirDrainBackpressure](#weirdrainbackpressure).
+2. Both idle: the flushers cannot keep pace with ingest, usually storage.
+   Correlate with fsync latency. If fsync is the bottleneck you are at the
+   storage durability ceiling: a faster disk, more shards (one flusher per
+   disk), or latency-tolerant traffic on the `Buffered` tier. `[TUNE]` the
+   threshold to your `batch_size × shard_count` and burst profile.
 
 #### WeirDrainBackpressure
 WAB flushers have spent the last ten minutes repeatedly waiting to hand sealed
