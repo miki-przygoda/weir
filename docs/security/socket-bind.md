@@ -273,10 +273,11 @@ That daemon's connection metrics count it. If the prober runs as a different
 uid, the live daemon's `peer_uid_check` refuses it and logs `refusing
 connection: peer uid does not match daemon uid` (counted in
 `weir_connection_rejected_peer_uid_total`). A daemon that is shutting down
-keeps its listener open while in-flight connections drain (up to
-`shutdown_timeout_secs`), so a probe in that window sees it as live and the
-new instance refuses. Under systemd the old process has exited before the
-new one starts.
+unlinks its socket at the first SIGTERM, so a probe finds no socket. A new
+instance on the same `wab_dir` never gets that far: it refuses on the
+`wab_dir` lock ("locked by"), which is taken before the probe, until the old
+process exits. Under systemd the old process has exited before the new one
+starts.
 
 ## Own-inode-only removal at shutdown
 

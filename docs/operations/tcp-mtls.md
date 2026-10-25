@@ -180,6 +180,9 @@ TLS material can be rotated **without dropping active connections**:
    sudo systemctl kill --signal=SIGHUP weir
    # in a container:
    docker kill --signal=HUP <container>
+   # or through the admin socket, which prints whether the new certificates
+   # were applied:
+   sudo weir-ctl reload
    ```
    weir writes no PID file. Do not use `systemctl reload`: the unit has no
    `ExecReload=` (see [`deploy/systemd/README.md`](https://github.com/miki-przygoda/weir/blob/main/deploy/systemd/README.md#sighup-and-why-there-is-no-execreload)).
@@ -193,8 +196,11 @@ a single reload loop (`crates/weir-server/src/reload.rs`), so reloads never
 overlap. A TLS reload is counted twice: once in the TLS-specific counter
 below, whose contract is unchanged, and once in the general
 `weir_config_reloads_total{trigger="sighup",outcome=…}`, which also counts
-the SIGHUPs that reload nothing. The same loop will
-serve the admin socket's `reload` verb later (`trigger="admin"` is reserved).
+the SIGHUPs that reload nothing. The admin socket's `reload` verb
+(`weir-ctl reload`) goes through the same loop, is counted as
+`trigger="admin"`, and returns its outcome (`applied`, `noop` or `failed`)
+with a per-item report instead of only a log line. A failed reload keeps the
+previous certificates either way.
 
 | Situation | `weir_tls_config_reloads_total` | `weir_config_reloads_total{trigger="sighup"}` |
 |---|---|---|
@@ -249,7 +255,7 @@ startup and never reloaded. Changing those settings requires a daemon restart.
 |--------|--------|----------------|
 | `weir_tls_handshake_failures_total` | `reason` ∈ {`no_client_cert`, `bad_cert`, `timeout`, `other`} | Any non-zero rate warrants investigation |
 | `weir_tls_config_reloads_total` | `outcome` ∈ {`ok`, `failed`} | Alert on `outcome="failed"` after a rotation attempt |
-| `weir_config_reloads_total` | `trigger` ∈ {`sighup`, `admin` (reserved)}, `outcome` ∈ {`ok`, `failed`, `noop`, `dropped`} | Every reload request, TLS or not; `noop` means nothing was reloadable |
+| `weir_config_reloads_total` | `trigger` ∈ {`sighup`, `admin`}, `outcome` ∈ {`ok`, `failed`, `noop`, `dropped`} | Every reload request, TLS or not; `noop` means nothing was reloadable |
 
 ### Suggested alert rules
 

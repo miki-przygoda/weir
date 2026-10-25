@@ -168,7 +168,9 @@ What this means for orchestration:
   refuse and crash-loop. A `RollingUpdate` that starts the new pod on the same
   node while the old one is still draining makes the new pod refuse with
   "locked by" until the old process exits. The old process holds the lock
-  until it exits, which can take up to `shutdown_timeout_secs` after SIGTERM;
+  until it exits, which can take up to
+  `shutdown_timeout_secs + drain_shutdown_budget_secs + 5` seconds after
+  SIGTERM;
   `strategy: type: Recreate` avoids the overlap. A `ReadWriteMany` volume
   shared across nodes is normally a network filesystem, where the lock is not
   a supported guard (next item).

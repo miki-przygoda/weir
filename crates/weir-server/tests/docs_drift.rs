@@ -36,6 +36,7 @@ const SYSTEMD_TOML: &str = include_str!("../../../deploy/systemd/weir.toml");
 const DOCKER_IMAGE: &str = include_str!("../../../deploy/docker/Dockerfile");
 const CONTAINER_MD: &str = include_str!("../../../docs/security/container.md");
 const CONFIG_FILE_SRC: &str = include_str!("../src/config/file.rs");
+const THREAT_MODEL: &str = include_str!("../../../docs/security/threat-model.md");
 
 /// What a process manager must wait, after SIGTERM, before it SIGKILLs weir.
 /// Spec §7: connection drain + joins (~1 s) + drain budget + 2 s exit grace,
@@ -1733,6 +1734,74 @@ fn the_foundations_config_keys_are_documented_under_the_spellings_the_parser_rea
     assert!(
         problems.is_empty(),
         "the Foundations config keys are not documented as the parser reads them:\n  {}",
+        problems.join("\n  ")
+    );
+}
+
+/// The threat model covers the two surfaces Foundations added, and no longer
+/// describes the shutdown it replaced.
+///
+/// Spec §17 lists these edits because each surface changes who can learn or
+/// do what: an unauthenticated listener that may bind 0.0.0.0 in Kubernetes,
+/// and a control socket that pauses delivery. A threat model that predates
+/// them is the document a reviewer trusts most and should trust least.
+#[test]
+fn the_threat_model_covers_the_health_listener_and_the_admin_socket() {
+    let section = |heading: &str| -> &'static str {
+        let marker = format!("\n## {heading}\n");
+        let start = THREAT_MODEL
+            .find(&marker)
+            .unwrap_or_else(|| panic!("threat-model.md has no `## {heading}`"))
+            + marker.len();
+        let rest = &THREAT_MODEL[start..];
+        &rest[..rest.find("\n## ").unwrap_or(rest.len())]
+    };
+    let in_scope = section("In scope");
+    let actors = section("Threat actors considered");
+    let mut problems = Vec::new();
+
+    for row in [
+        "| Network peer reading the metrics, health and status listener |", // PR 5 Task 5.11
+        "| Network peer starving the health probes |",                      // PR 5 Task 5.11
+        "| Local process reaching the admin socket |",                      // PR 6 Task 6.17
+    ] {
+        if !in_scope.contains(row) {
+            problems.push(format!("In scope: no row {row:?}"));
+        }
+    }
+    for actor in [
+        "- **Network peer reaching the metrics/health port**",
+        "- **Producer or sidecar sharing the socket volume**",
+    ] {
+        if !actors.contains(actor) {
+            problems.push(format!("Threat actors: no {actor:?}"));
+        }
+    }
+    if !actors.contains("producer containers that share the daemon's uid") {
+        problems.push(
+            "Threat actors: the daemon-uid actor must be qualified for producer \
+             containers that share the daemon's uid"
+                .to_string(),
+        );
+    }
+    if !THREAT_MODEL.contains("The admin socket deliberately also admits root") {
+        problems.push(
+            "the Unix socket section must reconcile \"Root is not implicitly trusted\" \
+             with the admin socket's root allowance"
+                .to_string(),
+        );
+    }
+    for stale in [
+        "the runtime is dropped before joining threads",
+        "A daemon that is shutting down still looks live",
+    ] {
+        if THREAT_MODEL.contains(stale) {
+            problems.push(format!("still describes the old shutdown: {stale:?}"));
+        }
+    }
+    assert!(
+        problems.is_empty(),
+        "docs/security/threat-model.md does not cover what Foundations added:\n  {}",
         problems.join("\n  ")
     );
 }
