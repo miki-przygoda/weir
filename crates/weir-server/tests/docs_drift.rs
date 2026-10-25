@@ -31,6 +31,15 @@ const CONFIG_EXAMPLE: &str = include_str!("../../../deploy/docker/weir.toml.exam
 const CONFIG_ENV_SRC: &str = include_str!("../src/config/env.rs");
 const CONFIG_CLI_SRC: &str = include_str!("../src/config/cli.rs");
 const CI_YML: &str = include_str!("../../../.github/workflows/ci.yml");
+const CONFIG_MOD_SRC: &str = include_str!("../src/config/mod.rs");
+const SYSTEMD_TOML: &str = include_str!("../../../deploy/systemd/weir.toml");
+const DOCKER_IMAGE: &str = include_str!("../../../deploy/docker/Dockerfile");
+const CONTAINER_MD: &str = include_str!("../../../docs/security/container.md");
+
+/// What a process manager must wait, after SIGTERM, before it SIGKILLs weir.
+/// Spec §7: connection drain + joins (~1 s) + drain budget + 2 s exit grace,
+/// rounded up.
+const GRACE_FORMULA: &str = "shutdown_timeout_secs + drain_shutdown_budget_secs + 5";
 
 /// `Version: 2.1.0  ` → `2.1.0`.
 fn latest_md_version() -> &'static str {
@@ -990,49 +999,170 @@ const SYSTEMD_UNIT: &str = include_str!("../../../deploy/systemd/weir.service");
 const SYSTEMD_README: &str = include_str!("../../../deploy/systemd/README.md");
 const COMPOSE: &str = include_str!("../../../deploy/docker/docker-compose.yml");
 
-/// `[default: N]` from the CLI help line naming `flag`.
-fn help_default(flag: &str) -> u64 {
-    let line = CONFIG_CLI_SRC
-        .lines()
-        .skip_while(|l| !l.contains(flag))
-        .take(3)
-        .collect::<String>();
-    line.split("[default: ")
-        .nth(1)
-        .and_then(|s| s.split(']').next())
-        .and_then(|n| n.trim().parse().ok())
-        .unwrap_or_else(|| panic!("no `[default: N]` for {flag} in src/config/cli.rs HELP"))
+/// The default `Config::resolve` applies to `key`: the integer literal in the
+/// `.unwrap_or(<n>)` that follows `merge!(<key>)` in src/config/mod.rs.
+fn config_default(key: &str) -> u64 {
+    let call = format!("merge!({key})");
+    let at = CONFIG_MOD_SRC.find(&call).unwrap_or_else(|| {
+        panic!("src/config/mod.rs no longer resolves {key} with `{call}`; update this parser")
+    });
+    let rest = &CONFIG_MOD_SRC[at..];
+    let open = rest
+        .find(".unwrap_or(")
+        .unwrap_or_else(|| panic!("`{call}` has no `.unwrap_or(<default>)`"))
+        + ".unwrap_or(".len();
+    assert!(
+        open < call.len() + 80,
+        "the first `.unwrap_or(` after `{call}` is {open} bytes away, so it belongs to \n\
+         another statement; {key}'s default is no longer an inline literal"
+    );
+    let close = rest[open..].find(')').expect("unterminated unwrap_or") + open;
+    let lit = rest[open..close].trim().replace('_', "");
+    lit.parse().unwrap_or_else(|_| {
+        panic!(
+            "the default of {key} is {lit:?}, not an integer literal; if it is now a \n\
+             named constant, make this parser read the constant"
+        )
+    })
 }
 
-/// Foundations §7: the orchestrator grace must be at least
-/// shutdown_timeout_secs + drain_shutdown_budget_secs + 5, derived here from
-/// the defaults the binary actually ships, and stated identically in every
-/// deploy file and doc that states it.
+/// `key = <integer>` on an uncommented line of one of the flat `[server]`
+/// TOML files this repository ships.
+fn toml_int(toml: &str, key: &str) -> Option<u64> {
+    toml.lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#'))
+        .find_map(|l| {
+            let (k, v) = l.split_once('=')?;
+            if k.trim() != key {
+                return None;
+            }
+            v.split('#').next()?.trim().replace('_', "").parse().ok()
+        })
+}
+
+/// Every place an operator learns how long to give weir to stop says the same
+/// thing, and the shipped units actually give it that long.
+///
+/// Shutdown became bounded in two terms: the connection drain
+/// (`shutdown_timeout_secs`) and the drain's delivery budget
+/// (`drain_shutdown_budget_secs`). Before this, `weir.service` carried
+/// `TimeoutStopSec=35` sized for the first term only, the compose file had no
+/// `stop_grace_period` (Docker SIGKILLs after 10 s), and nothing tied either
+/// to the config they ship with. A grace shorter than the bound is
+/// crash-safe, but it turns every stop into a crash: the drain gets no budget
+/// and every active segment waits for recovery.
+///
+/// Each unit is checked against the config file it actually runs with, so
+/// raising `shutdown_timeout_secs` in `deploy/systemd/weir.toml` without
+/// raising `TimeoutStopSec` fails here.
 #[test]
-fn the_shutdown_grace_follows_the_shutdown_bound_everywhere() {
-    let grace =
-        help_default("--shutdown-timeout-secs") + help_default("--drain-shutdown-budget-secs") + 5;
-    assert!(
-        SYSTEMD_UNIT
-            .lines()
-            .any(|l| l.trim() == format!("TimeoutStopSec={grace}")),
-        "deploy/systemd/weir.service must set TimeoutStopSec={grace}"
-    );
-    assert!(
-        COMPOSE.contains(&format!("stop_grace_period: {grace}s")),
-        "deploy/docker/docker-compose.yml must set stop_grace_period: {grace}s"
-    );
-    for (name, doc) in [
-        ("configuration.md", CONFIGURATION),
+fn the_shutdown_grace_formula_holds_in_every_deploy_file() {
+    let shutdown = config_default("shutdown_timeout_secs");
+    let budget = config_default("drain_shutdown_budget_secs");
+    let default_grace = shutdown + budget + 5;
+    let grace_for = |toml: &str| {
+        toml_int(toml, "shutdown_timeout_secs").unwrap_or(shutdown)
+            + toml_int(toml, "drain_shutdown_budget_secs").unwrap_or(budget)
+            + 5
+    };
+
+    let mut problems = Vec::new();
+
+    // weir.service runs with deploy/systemd/weir.toml.
+    let unit = grace_for(SYSTEMD_TOML);
+    if !SYSTEMD_UNIT
+        .lines()
+        .any(|l| l.trim() == format!("TimeoutStopSec={unit}"))
+    {
+        problems.push(format!(
+            "deploy/systemd/weir.service: needs `TimeoutStopSec={unit}` \
+             ({GRACE_FORMULA} with deploy/systemd/weir.toml's values)"
+        ));
+    }
+
+    // The compose file bind-mounts deploy/docker/weir.toml.example.
+    let compose = grace_for(CONFIG_EXAMPLE);
+    if !COMPOSE
+        .lines()
+        .any(|l| l.trim() == format!("stop_grace_period: {compose}s"))
+    {
+        problems.push(format!(
+            "deploy/docker/docker-compose.yml: needs `stop_grace_period: {compose}s` \
+             ({GRACE_FORMULA} with deploy/docker/weir.toml.example's values)"
+        ));
+    }
+
+    for (file, text) in [
+        ("deploy/systemd/weir.service", SYSTEMD_UNIT),
+        ("deploy/systemd/weir.toml", SYSTEMD_TOML),
+        ("deploy/systemd/README.md", SYSTEMD_README),
+        ("deploy/docker/docker-compose.yml", COMPOSE),
+        ("deploy/docker/Dockerfile", DOCKER_IMAGE),
+        ("deploy/docker/weir.toml.example", CONFIG_EXAMPLE),
+        ("docs/operations/configuration.md", CONFIGURATION),
+        ("docs/security/container.md", CONTAINER_MD),
+    ] {
+        if !text.contains(GRACE_FORMULA) {
+            problems.push(format!("{file}: does not state `{GRACE_FORMULA}`"));
+        }
+    }
+
+    for (file, text) in [
+        ("docs/operations/configuration.md", CONFIGURATION),
         ("deploy/systemd/README.md", SYSTEMD_README),
     ] {
-        assert!(
-            doc.contains("shutdown_timeout_secs + drain_shutdown_budget_secs + 5"),
-            "{name} must state the grace formula"
-        );
-        assert!(
-            doc.contains(&format!("{grace} s")) || doc.contains(&format!("**{grace}**")),
-            "{name} must state the resulting grace ({grace} s)"
-        );
+        if !text.contains(&format!("**{default_grace} s**")) {
+            problems.push(format!(
+                "{file}: does not state the default grace as `**{default_grace} s**`"
+            ));
+        }
     }
+
+    // The figures this replaced. A paragraph left behind beside the new one
+    // contradicts it.
+    for (file, text, stale) in [
+        (
+            "deploy/systemd/weir.toml",
+            SYSTEMD_TOML,
+            "TimeoutStopSec (35s)",
+        ),
+        (
+            "deploy/systemd/README.md",
+            SYSTEMD_README,
+            "(in `weir.service`, **35**)",
+        ),
+        (
+            "deploy/systemd/weir.service",
+            SYSTEMD_UNIT,
+            "TimeoutStopSec=35",
+        ),
+    ] {
+        if text.contains(stale) {
+            problems.push(format!("{file}: still says {stale:?}"));
+        }
+    }
+
+    // PR 4 Task 4.14 already added one `stop_grace_period`; a second one is a
+    // duplicate mapping key, which compose refuses to load. Nothing in CI
+    // parses this compose file, and the `.any(..)` check above still passes
+    // with two, so count them.
+    let grace_keys = COMPOSE
+        .lines()
+        .filter(|l| l.trim_start().starts_with("stop_grace_period:"))
+        .count();
+    if grace_keys != 1 {
+        problems.push(format!(
+            "deploy/docker/docker-compose.yml: {grace_keys} `stop_grace_period:` keys \
+             (compose rejects a duplicate key)"
+        ));
+    }
+
+    assert!(
+        problems.is_empty(),
+        "the shutdown grace has drifted:\n  {}\n\n\
+         A grace below the bound turns a stop into a crash: the drain gets no \n\
+         budget and the active segments wait for recovery.",
+        problems.join("\n  ")
+    );
 }

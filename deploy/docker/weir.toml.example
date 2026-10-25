@@ -124,7 +124,10 @@ metrics_max_connections = 8
 
 # Graceful shutdown timeout in seconds. After a SIGTERM or Ctrl-C, the daemon
 # waits this long for in-flight connections to finish before aborting them.
-# Keep the orchestrator grace >= shutdown_timeout_secs + drain_shutdown_budget_secs + 5.
+# The orchestrator must wait at least
+# shutdown_timeout_secs + drain_shutdown_budget_secs + 5 seconds before it
+# SIGKILLs (Kubernetes terminationGracePeriodSeconds, compose stop_grace_period,
+# `docker stop -t`): 45 s with the defaults.
 # Env: WEIR_SHUTDOWN_TIMEOUT_SECS
 shutdown_timeout_secs = 30
 

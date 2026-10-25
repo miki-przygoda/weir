@@ -126,26 +126,27 @@ guards the systemd the runner ships, not every host's, so the check above is
 still worth running on an unusual distribution. If you tighten the filter, keep
 `flock` in it.
 
-## Graceful shutdown: `TimeoutStopSec`, `shutdown_timeout_secs` and `drain_shutdown_budget_secs`
+## Graceful shutdown: `TimeoutStopSec`
 
-On `systemctl stop` (or a host shutdown), systemd sends `SIGTERM`. weir unlinks
-its socket at once (new connects fail fast), lets open connections finish,
-seals every active WAB segment, gives the drain a bounded budget, and exits.
-Three settings bound that:
+On `systemctl stop` (or a host shutdown), systemd sends `SIGTERM`. weir closes
+its listeners and unlinks its socket at once, seals the open WAB segments,
+gives the drain a delivery budget, and exits. An idle connection is closed at
+once; a connection in the middle of a frame finishes it and gets its ack. Two
+keys in `weir.toml` bound that:
 
-- **`shutdown_timeout_secs`** (in `weir.toml`, default **30**): how long open
-  connections may take to finish.
-- **`drain_shutdown_budget_secs`** (in `weir.toml`, default **10**): how long the
-  drain keeps delivering once everything is sealed; the rest replays at the
-  next start.
-- **`TimeoutStopSec`** (in `weir.service`, **45**): how long *systemd* waits
-  before `SIGKILL`.
+- **`shutdown_timeout_secs`** (default **30**): how long a connection in the
+  middle of a frame gets to finish it and receive its ack.
+- **`drain_shutdown_budget_secs`** (default **10**): how long the drain keeps
+  delivering once every segment is sealed. What it does not deliver stays
+  sealed in the WAB and is delivered after the next start.
 
-Keep `TimeoutStopSec` at least
-`shutdown_timeout_secs + drain_shutdown_budget_secs + 5`: **45 s** at the
-defaults. A second `systemctl kill --signal=SIGTERM weir` forces a prompt exit
-(open connections aborted, the drain stopped); the seal still runs, so no
-acked record is lost.
+`TimeoutStopSec` must be at least
+`shutdown_timeout_secs + drain_shutdown_budget_secs + 5`, which is
+**45 s** with the shipped `weir.toml`, and is what `weir.service` sets. If you
+raise either key, raise `TimeoutStopSec` by the same amount; a CI test fails
+if the shipped files disagree. A second
+`systemctl kill --signal=SIGTERM weir` forces a prompt exit (open connections
+aborted, the drain stopped); the seal still runs, so no acked record is lost.
 
 ## TCP + mutual TLS on this deployment path
 

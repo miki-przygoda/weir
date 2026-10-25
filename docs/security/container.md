@@ -110,10 +110,16 @@ nested umask 0o177) is belt-and-braces on top of these directory perms.
 
 Made explicit so orchestrators that override Docker's default
 (e.g. Kubernetes' `terminationGracePeriodSeconds` flow, which sends a
-configurable signal) still get the clean shutdown path. Weir's SIGTERM
-handler unwinds the pipeline in dependency order: socket close → workers
-drain → drain task finishes → WAB flush. See
-`crates/weir-server/src/main.rs` and the recent deadlock fix in PR #10.
+configurable signal) still get the clean shutdown path. Shutdown is
+bounded: listeners close at once (the socket file is unlinked and `/readyz`
+answers 503), an idle connection is closed at once and a connection in the
+middle of a frame finishes it and gets its ack (for at most
+`shutdown_timeout_secs`), the active segments are sealed and fsynced, and the
+drain gets `drain_shutdown_budget_secs` before the rest is left sealed for
+replay. Give the container `shutdown_timeout_secs + drain_shutdown_budget_secs + 5`
+seconds (45 s at the defaults) before the SIGKILL: `docker stop -t 45`,
+compose `stop_grace_period: 45s` (the shipped compose file sets it),
+Kubernetes `terminationGracePeriodSeconds: 45`. Docker's own default is 10 s.
 
 **SIGHUP never stops the daemon.** `main` sets SIGHUP to ignored before it
 reads the config. Once the runtime is up, each SIGHUP is a reload request
