@@ -104,6 +104,28 @@ pub(crate) fn peer_uid_allowed(peer: u32, euid: u32, wab_owner: Option<u32>) -> 
     peer == euid || peer == 0 || wab_owner == Some(peer)
 }
 
+/// Why a peer uid was refused (exit 2). With no wab_dir owner to accept (only
+/// --admin-socket given, or the packaged default wab_dir absent), a daemon
+/// running as its own service user is refused until the operator names the
+/// wab_dir, so the message says so.
+pub(crate) fn peer_uid_refusal(
+    sock: &Path,
+    peer: u32,
+    euid: u32,
+    wab_owner: Option<u32>,
+) -> String {
+    format!(
+        "{} is served by uid {peer}, which is not weir-ctl's uid {euid}, the wab_dir owner, or \
+         root{}",
+        sock.display(),
+        if wab_owner.is_none() {
+            " (no wab_dir was named: pass --wab-dir so its owner can be accepted)"
+        } else {
+            ""
+        }
+    )
+}
+
 /// The reply's `instance` must name the same wab_dir inode the operator meant.
 /// `expected` is `None` when there is no wab_dir to compare.
 pub(crate) fn check_instance(instance: &Value, expected: Option<(u64, u64)>) -> Result<(), String> {
@@ -242,10 +264,8 @@ pub(crate) fn call(
     // SAFETY: geteuid has no preconditions and cannot fail.
     let euid = unsafe { libc::geteuid() };
     if !peer_uid_allowed(peer, euid, wab_owner) {
-        return Err(CallError::Identity(format!(
-            "{} is served by uid {peer}, which is not weir-ctl's uid {euid}, the wab_dir \
-             owner, or root",
-            sock.display()
+        return Err(CallError::Identity(peer_uid_refusal(
+            sock, peer, euid, wab_owner,
         )));
     }
 
@@ -544,6 +564,39 @@ mod tests {
             "a stranger is refused: the wrong-uid identity check"
         );
         assert!(!peer_uid_allowed(4242, 1000, None));
+    }
+
+    /// With only --admin-socket there is no wab_dir owner to accept, so the
+    /// refusal says how to name one.
+    #[test]
+    fn a_refused_peer_uid_without_a_wab_dir_hints_at_wab_dir() {
+        let sock = Path::new("/run/weir/wab.admin.sock");
+        let e = peer_uid_refusal(sock, 10001, 1000, None);
+        assert_eq!(
+            e,
+            "/run/weir/wab.admin.sock is served by uid 10001, which is not weir-ctl's uid 1000, \
+             the wab_dir owner, or root (no wab_dir was named: pass --wab-dir so its owner can \
+             be accepted)"
+        );
+        let e = peer_uid_refusal(sock, 4242, 1000, Some(10001));
+        assert!(
+            !e.contains("--wab-dir"),
+            "a named wab_dir needs no hint: {e}"
+        );
+        assert!(e.ends_with("or root"), "{e}");
+        let mut err = Vec::new();
+        assert_eq!(
+            crate::admin_cmds::report_call_error(
+                "reload",
+                &CallError::Identity(peer_uid_refusal(sock, 10001, 1000, None)),
+                false,
+                &mut err,
+                None,
+            ),
+            2,
+            "still an identity mismatch"
+        );
+        assert!(String::from_utf8(err).unwrap().contains("pass --wab-dir"));
     }
 
     #[test]
