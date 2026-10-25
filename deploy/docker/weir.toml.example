@@ -122,6 +122,12 @@ metrics_bind = "127.0.0.1"
 # Env: WEIR_METRICS_MAX_CONNECTIONS
 metrics_max_connections = 8
 
+# Checks that make GET /livez answer 503. Default [] (fails only when the
+# process stops answering). Recommended: no_live_shard, listener_down,
+# worker_exited; also drain_stopped, drain_wedged.
+# Env: WEIR_LIVEZ_CHECKS (comma-separated)
+# livez_checks = ["no_live_shard", "listener_down", "worker_exited"]
+
 # Graceful shutdown timeout in seconds. After a SIGTERM or Ctrl-C, the daemon
 # waits this long for in-flight connections to finish before aborting them.
 # The orchestrator must wait at least

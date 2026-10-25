@@ -35,6 +35,7 @@ const CONFIG_MOD_SRC: &str = include_str!("../src/config/mod.rs");
 const SYSTEMD_TOML: &str = include_str!("../../../deploy/systemd/weir.toml");
 const DOCKER_IMAGE: &str = include_str!("../../../deploy/docker/Dockerfile");
 const CONTAINER_MD: &str = include_str!("../../../docs/security/container.md");
+const CONFIG_FILE_SRC: &str = include_str!("../src/config/file.rs");
 
 /// What a process manager must wait, after SIGTERM, before it SIGKILLs weir.
 /// Spec §7: connection drain + joins (~1 s) + drain budget + 2 s exit grace,
@@ -1596,4 +1597,142 @@ fn the_status_reference_lists_every_top_level_key() {
          reverse hides one that is"
     );
     assert!(MONITORING.contains("`\"weir.status/v1\"`"));
+}
+
+/// A config key and the spellings an operator types for it.
+struct KeySpelling {
+    key: &'static str,
+    env: &'static str,
+    /// `None` where the spec gives the key no flag (`admin_socket_enabled`).
+    cli: Option<&'static str>,
+}
+
+/// The keys Foundations added (spec §13).
+const FOUNDATIONS_KEYS: [KeySpelling; 4] = [
+    KeySpelling {
+        key: "drain_shutdown_budget_secs",
+        env: "WEIR_DRAIN_SHUTDOWN_BUDGET_SECS",
+        cli: Some("--drain-shutdown-budget-secs"),
+    },
+    KeySpelling {
+        key: "admin_socket_enabled",
+        env: "WEIR_ADMIN_SOCKET_ENABLED",
+        cli: None,
+    },
+    KeySpelling {
+        key: "admin_socket_path",
+        env: "WEIR_ADMIN_SOCKET_PATH",
+        cli: Some("--admin-socket-path"),
+    },
+    KeySpelling {
+        key: "livez_checks",
+        env: "WEIR_LIVEZ_CHECKS",
+        cli: Some("--livez-checks"),
+    },
+];
+
+/// The checks `livez_checks` accepts (spec §12).
+const LIVEZ_SELECTABLE: [&str; 5] = [
+    "no_live_shard",
+    "listener_down",
+    "worker_exited",
+    "drain_stopped",
+    "drain_wedged",
+];
+
+/// The body of `#### \`<key>\`` in configuration.md, up to the next heading or
+/// rule, or `None` when there is no such heading.
+fn configuration_section(key: &str) -> Option<&'static str> {
+    let marker = format!("\n#### `{key}`\n");
+    let start = CONFIGURATION.find(&marker)? + marker.len();
+    let rest = &CONFIGURATION[start..];
+    let end = ["\n#### ", "\n### ", "\n## ", "\n---"]
+        .iter()
+        .filter_map(|m| rest.find(m))
+        .min()
+        .unwrap_or(rest.len());
+    Some(&rest[..end])
+}
+
+/// Each Foundations key is parsed under the spellings the docs give, has its
+/// own section in the configuration reference naming them, and is in the
+/// example file that claims to list every option.
+///
+/// The parser is checked first, so a rename in the code fails here instead
+/// of leaving the docs naming a key the daemon ignores (an unknown TOML key
+/// only warns). `admin_socket_path` is also what `weir-ctl` reads from
+/// `WEIR_ADMIN_SOCKET_PATH`, so a drifted spelling breaks the client too.
+#[test]
+fn the_foundations_config_keys_are_documented_under_the_spellings_the_parser_reads() {
+    let mut problems = Vec::new();
+    for k in &FOUNDATIONS_KEYS {
+        if !CONFIG_FILE_SRC.contains(&format!("\"{}\"", k.key)) {
+            problems.push(format!(
+                "{}: not a known TOML key in src/config/file.rs",
+                k.key
+            ));
+        }
+        if !CONFIG_ENV_SRC.contains(&format!("\"{}\"", k.env)) {
+            problems.push(format!(
+                "{}: src/config/env.rs does not read {}",
+                k.key, k.env
+            ));
+        }
+        if let Some(flag) = k.cli
+            && !CONFIG_CLI_SRC.contains(&format!("\"{flag}\""))
+        {
+            problems.push(format!(
+                "{}: src/config/cli.rs does not parse {flag}",
+                k.key
+            ));
+        }
+        match configuration_section(k.key) {
+            None => problems.push(format!(
+                "{}: no `#### `{}`` section in docs/operations/configuration.md",
+                k.key, k.key
+            )),
+            Some(section) => {
+                if !section.contains(&format!("`{}`", k.env)) {
+                    problems.push(format!("{}: its section does not name `{}`", k.key, k.env));
+                }
+                match k.cli {
+                    Some(flag) if !section.contains(&format!("`{flag}")) => {
+                        problems.push(format!("{}: its section does not name `{flag}`", k.key))
+                    }
+                    None if !section.contains("**CLI**: none") => {
+                        problems.push(format!("{}: its section must say `**CLI**: none`", k.key))
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for needle in [k.key, k.env] {
+            if !CONFIG_EXAMPLE.contains(needle) {
+                problems.push(format!("deploy/docker/weir.toml.example: missing {needle}"));
+            }
+        }
+    }
+    if let Some(livez) = configuration_section("livez_checks") {
+        for check in LIVEZ_SELECTABLE {
+            if !livez.contains(&format!("`{check}`")) {
+                problems.push(format!("livez_checks: its section does not list `{check}`"));
+            }
+        }
+    }
+    // Spec §17: "pause's disk warning". A pause delivers nothing while ingest
+    // keeps writing, and the cap is the only thing between that and a full disk.
+    if !configuration_section("wab_max_bytes")
+        .is_some_and(|s| s.contains("**While delivery is paused**"))
+    {
+        problems.push(
+            "wab_max_bytes: its section does not warn that the WAB grows while \
+             delivery is paused"
+                .to_string(),
+        );
+    }
+    assert!(
+        problems.is_empty(),
+        "the Foundations config keys are not documented as the parser reads them:\n  {}",
+        problems.join("\n  ")
+    );
 }

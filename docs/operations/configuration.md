@@ -742,6 +742,12 @@ instead of discovering it from a full disk. Leaving it unset is not silent:
 the daemon separately warns when the WAB is growing while the sink is
 unhealthy and no cap is set (see the `CHANGELOG`).
 
+**While delivery is paused** (`weir-ctl drain pause`) the drain delivers
+nothing and the WAB grows at the ingest rate. With a cap, pushes start to
+nack at the cap (`wab_cap_rejecting`, `/readyz` 503); with `wab_max_bytes = 0`
+the WAB grows until the disk fills. A pause lives in memory only: a restart
+resumes delivery.
+
 ---
 
 #### `wab_compression`
