@@ -107,7 +107,10 @@ jobs:
             --socket "$SOCKDIR/weir.sock" \
             --count 60
 
-          # Verify key metrics are exported.
+          # Verify key metrics are exported. grep reads a here-string, not a
+          # pipe from echo: under pipefail, `echo | grep -q` fails with SIGPIPE
+          # (141) once grep exits on an early match while echo is still writing
+          # the ~32 KiB body, and reports a present metric as MISSING.
           echo "Checking /metrics…"
           METRICS=$(curl -sf http://127.0.0.1:19185/metrics)
           for metric in \
@@ -115,7 +118,7 @@ jobs:
             weir_records_ack_total \
             weir_wab_bytes_on_disk \
             weir_drain_state; do
-            if echo "$METRICS" | grep -q "$metric"; then
+            if grep -q -- "$metric" <<<"$METRICS"; then
               echo "  ✓ $metric"
             else
               echo "  ✗ $metric MISSING"
