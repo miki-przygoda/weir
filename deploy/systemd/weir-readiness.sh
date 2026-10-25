@@ -21,9 +21,12 @@
 #   1. GET /readyz. No answer is DEAD. A daemon from before the health routes
 #      existed answers every path with its metrics; reachable then counts as
 #      ready, and the script says so.
-#   2. A 503 is NOT READY. A 200 is READY, and the active conditions come from
-#      weir_condition_active on /metrics (refreshed every 5 s by the daemon,
-#      from the same evaluator /readyz and /status use).
+#   2. If a weir-ctl with a `status` subcommand is installed (PATH, or --ctl),
+#      its exit code is the verdict; its output is relayed. It adds the admin
+#      socket's identity checks and the admin view's reasons.
+#   3. Otherwise a 503 is NOT READY, and a 200 is READY with the active
+#      conditions read from weir_condition_active on /metrics (refreshed every
+#      5 s by the daemon, from the same evaluator /readyz and /status use).
 #
 # Usage:
 #   weir-readiness.sh [--addr HOST:PORT] [--ctl PATH] [--admin-socket PATH]
@@ -92,7 +95,32 @@ else
   fail_dead "http://${ADDR}/readyz answered HTTP ${code} with '${body:0:80}' - not a weir daemon?"
 fi
 
-# ── 2. The verdict from /readyz ─────────────────────────────────────────────
+# ── 2. weir-ctl, when installed, decides ────────────────────────────────────
+# `weir-ctl status` reads the same evaluator through the admin socket (with its
+# identity checks) or /status, and exits with the table above, so its exit code
+# is the verdict. /readyz has already answered, so a dead daemon never reaches
+# here: weir-ctl's offline fallback would report it NOT READY instead of DEAD.
+# A weir-ctl from before `status` existed exits 2 on `status --help` (clap);
+# the /readyz verdict below is used for it.
+if [[ -n "$CTL" && -x "$CTL" ]] && "$CTL" status --help >/dev/null 2>&1; then
+  args=(status --addr "$ADDR")
+  if [[ -n "$ADMIN_SOCKET" ]]; then args+=(--admin-socket "$ADMIN_SOCKET"); fi
+  if [[ -n "$WAB_DIR" ]]; then args+=(--wab-dir "$WAB_DIR"); fi
+  rc=0
+  out="$("$CTL" "${args[@]}" 2>&1)" || rc=$?
+  if [[ "$ALLOW_NOOP" -eq 1 ]]; then out="$(grep -v 'noop_sink' <<<"$out" || true)"; fi
+  if [[ -n "$out" ]]; then printf '%s\n' "$out"; fi
+  case "$rc" in
+    0) exit 0 ;;
+    1) exit 1 ;;
+    3) if [[ "$FAIL_ON_CRITICAL" -eq 1 ]]; then exit 3; fi
+       echo "WARN: a critical condition is active (pass --fail-on-critical to exit 3)"
+       exit 0 ;;
+    *) fail_dead "weir-ctl status exited ${rc} (unreachable, or the daemon failed weir-ctl's identity check)" ;;
+  esac
+fi
+
+# ── 3. The verdict from /readyz (no weir-ctl) ───────────────────────────────
 if [[ "$ready" -eq 0 ]]; then
   echo "NOT READY: ${body#not ready: }"
   exit 1

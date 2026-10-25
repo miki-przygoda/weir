@@ -15,6 +15,8 @@
 
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -415,4 +417,168 @@ fn a_daemon_without_readyz_counts_as_ready_when_it_answers_with_weir_metrics() {
     )]);
     let (code, out) = readiness(not_weir.port, &[], &[]);
     assert_eq!(code, 2, "{out}");
+}
+
+/// A fake `weir-ctl` that echoes its argv and then prints `$STUB_OUT` and
+/// exits `$STUB_RC` for `status`. `has_status: false` imitates a weir-ctl
+/// from before the subcommand existed: clap exits 2 on `status --help`.
+fn stub_ctl(tag: &str, has_status: bool) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("weir-deploy-{}-{tag}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("stub dir");
+    let path = dir.join("weir-ctl");
+    let help_rc = if has_status { 0 } else { 2 };
+    std::fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = status ] && [ \"$2\" = --help ]; then exit {help_rc}; fi\n\
+             if [ \"$1\" = status ]; then echo \"args: $*\"; printf '%s\\n' \"$STUB_OUT\"; exit \"$STUB_RC\"; fi\n\
+             exit 64\n"
+        ),
+    )
+    .expect("write stub weir-ctl");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    path
+}
+
+#[test]
+fn weir_ctl_status_decides_the_verdict_when_installed() {
+    let stub = ready_daemon(&[]);
+    let ctl = stub_ctl("verdict", true);
+    let ctl = ctl.to_str().expect("utf-8 temp path");
+    let addr = format!("127.0.0.1:{}", stub.port);
+    // (weir-ctl exit, script exit, script exit with --fail-on-critical)
+    for (rc, plain, strict) in [
+        ("0", 0, 0),
+        ("1", 1, 1),
+        ("2", 2, 2),
+        ("3", 0, 3),
+        ("4", 2, 2),
+    ] {
+        let env = [("STUB_RC", rc), ("STUB_OUT", "verdict from weir-ctl")];
+        let (code, out) = readiness(stub.port, &["--ctl", ctl], &env);
+        assert_eq!(code, plain, "weir-ctl exited {rc}:\n{out}");
+        assert!(
+            out.contains(&format!("args: status --addr {addr}")),
+            "{out}"
+        );
+        assert!(
+            out.contains("verdict from weir-ctl"),
+            "weir-ctl's output was not relayed:\n{out}"
+        );
+        let (code, out) = readiness(stub.port, &["--ctl", ctl, "--fail-on-critical"], &env);
+        assert_eq!(
+            code, strict,
+            "weir-ctl exited {rc}, --fail-on-critical:\n{out}"
+        );
+    }
+}
+
+#[test]
+fn weir_ctl_gets_the_admin_socket_and_wab_dir_it_was_given() {
+    let stub = ready_daemon(&[]);
+    let ctl = stub_ctl("args", true);
+    let (code, out) = readiness(
+        stub.port,
+        &[
+            "--ctl",
+            ctl.to_str().unwrap(),
+            "--admin-socket",
+            "/x/wab.admin.sock",
+            "--wab-dir",
+            "/x/wab",
+        ],
+        &[("STUB_RC", "0"), ("STUB_OUT", "READY")],
+    );
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        out.contains(&format!(
+            "args: status --addr 127.0.0.1:{} --admin-socket /x/wab.admin.sock --wab-dir /x/wab",
+            stub.port
+        )),
+        "{out}"
+    );
+}
+
+#[test]
+fn allow_noop_filters_weir_ctl_output_too() {
+    let stub = ready_daemon(&[]);
+    let ctl = stub_ctl("noop", true);
+    let env = [
+        ("STUB_RC", "0"),
+        (
+            "STUB_OUT",
+            "READY\nwarning noop_sink: records are acked and DISCARDED",
+        ),
+    ];
+    let (code, out) = readiness(
+        stub.port,
+        &["--ctl", ctl.to_str().unwrap(), "--allow-noop"],
+        &env,
+    );
+    assert_eq!(code, 0, "{out}");
+    // The /readyz path also prints a READY line, so pin that this one is
+    // weir-ctl's output, relayed and filtered.
+    assert!(
+        out.contains("args: status"),
+        "weir-ctl was not consulted:\n{out}"
+    );
+    assert!(!out.contains("noop_sink"), "{out}");
+    assert!(out.lines().any(|l| l == "READY"), "{out}");
+}
+
+#[test]
+fn an_unreachable_daemon_is_dead_without_asking_weir_ctl() {
+    let port = {
+        let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+        l.local_addr().expect("addr").port()
+    };
+    let ctl = stub_ctl("dead", true);
+    // A weir-ctl that would answer "not ready" from disk must not turn a dead
+    // daemon into exit 1.
+    let (code, out) = readiness(
+        port,
+        &["--ctl", ctl.to_str().unwrap()],
+        &[
+            ("STUB_RC", "1"),
+            ("STUB_OUT", "NOT READY: daemon_unreachable"),
+        ],
+    );
+    assert_eq!(code, 2, "{out}");
+    assert!(
+        !out.contains("args: status"),
+        "weir-ctl was consulted for a dead daemon:\n{out}"
+    );
+}
+
+#[test]
+fn an_older_weir_ctl_without_status_falls_back_to_readyz() {
+    let stub = Stub::start(vec![
+        route("/readyz", 503, TEXT, "not ready: starting\n"),
+        route("/metrics", 200, OPENMETRICS, exposition(&[])),
+    ]);
+    let ctl = stub_ctl("old", false);
+    let (code, out) = readiness(
+        stub.port,
+        &["--ctl", ctl.to_str().unwrap()],
+        &[("STUB_RC", "0"), ("STUB_OUT", "unused")],
+    );
+    assert_eq!(code, 1, "the verdict must come from /readyz:\n{out}");
+    assert!(out.contains("NOT READY: starting"), "{out}");
+}
+
+#[test]
+fn the_readiness_script_reports_a_live_daemon_ready() {
+    let srv = weir_server!("readiness_live").start();
+    // wait_ready returns once the socket accepts; `serving` is stored a moment later.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (code, out) = loop {
+        let (code, out) = readiness(srv.metrics_port, &[], &[]);
+        if code == 0 || Instant::now() >= deadline {
+            break (code, out);
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("READY: /readyz ok"), "{out}");
 }

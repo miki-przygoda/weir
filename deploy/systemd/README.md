@@ -9,7 +9,7 @@ on a host (no container). For the containerised path, see
 | `weir.service` | `/etc/systemd/system/weir.service` | Hardened systemd unit (sandboxing, graceful shutdown, journald logging). |
 | `weir.toml` | `/etc/weir/weir.toml` | Daemon config (no secrets). Every key falls back to the documented default. |
 | `weir.env.example` | `/etc/weir/weir.env` | Secrets template (sink URL / bearer token). **Copy, fill in, lock down.** |
-| `weir-readiness.sh` | anywhere (e.g. `/usr/local/bin/`) | Optional liveness + readiness probe. |
+| `weir-readiness.sh` | anywhere (e.g. `/usr/local/bin/`) | Optional readiness check: `/readyz`, or `weir-ctl status` when installed. |
 
 ## Install
 
@@ -179,24 +179,39 @@ filled-in copy. See `weir.env.example`.
 
 ## Readiness probe (optional)
 
-`weir-readiness.sh` combines a liveness check (`weir-ctl health` over the socket
-+ a `/metrics` scrape) with a readiness check (sink not `down`, drain not blocked
-on a full dead-letter dir, zero fsync failures / flusher panics, and a loud WARN
-if the sink is `noop`). Exit codes: `0` ready, `1` degraded, `2` dead.
+`weir-readiness.sh` answers one question: can this daemon accept ingest right
+now? The verdict is the daemon's own `GET /readyz`: recovery done, a producer
+listener bound, not shutting down, the `wab_max_bytes` cap not rejecting, and
+at least one shard up. When a `weir-ctl` with a `status` subcommand is
+installed, the script asks `weir-ctl status` instead, which reads the same
+evaluator through the admin socket and checks that it is talking to the daemon
+that owns this `wab_dir`.
 
-A `/metrics` endpoint that answers `200` but exposes no `weir_*` metrics (a
-misrouted `--addr` pointing at some other live service) is treated as `2` dead
-("wrong target?"), not as a degraded `1` — so a misconfigured probe surfaces
-loudly instead of looking like a transient not-ready.
+| Exit | Meaning |
+|---|---|
+| `0` | READY |
+| `1` | NOT READY, exactly when `/readyz` answers 503; the failing codes are printed |
+| `2` | DEAD: unreachable, not a weir daemon, or an identity mismatch |
+| `3` | READY, but a critical condition that does not gate readiness is active; only with `--fail-on-critical` |
+
+Sink health, a blocked or paused drain, dead-letter and quarantine, and fsync
+or flusher-panic history do not make it NOT READY. weir keeps buffering
+durably through all of them, and the old gates on lifetime counters stayed NOT
+READY until a restart after one recovered panic. They are printed as `WARN:`
+lines naming the condition and its runbook. `--allow-noop` silences the
+`noop_sink` warning.
 
 ```bash
 sudo install -m0755 weir-readiness.sh /usr/local/bin/weir-readiness.sh
-weir-readiness.sh --socket /run/weir/weir.sock --addr 127.0.0.1:9185
+weir-readiness.sh --addr 127.0.0.1:9185                       # the verdict
+weir-readiness.sh --addr 127.0.0.1:9185 --fail-on-critical    # exit 3 on a critical condition
 ```
 
-It needs `bash`, `curl`, and `awk` (standard on a bare-metal host; not present in
-the container image — inside Docker, use the Dockerfile's bash `/dev/tcp` probe
-instead). Wire it into a monitoring cron, or a `systemd` timer, or a k8s
-`readinessProbe` exec. To scrape `/metrics` remotely set `metrics_bind =
-"0.0.0.0"` in `weir.toml` **and firewall the port** — `/metrics` is
-unauthenticated.
+`--socket` is still accepted and ignored. The script needs `bash`, `curl` and
+`awk` (standard on a bare-metal host, absent from the container image, whose
+`HEALTHCHECK` probes `/livez` with bash alone). Run it from cron, a systemd
+timer or a deploy gate. For Kubernetes, probe `/startupz`, `/readyz` and
+`/livez` directly: see [Health and status
+endpoints](../../docs/monitoring.md#health-and-status-endpoints). To reach the
+port remotely set `metrics_bind = "0.0.0.0"` **and firewall it**: the listener
+is unauthenticated.
