@@ -13,6 +13,7 @@ pub mod condition;
 pub mod config;
 pub mod doc;
 pub mod evidence;
+pub mod exit;
 pub mod exposition;
 mod probe;
 mod public;
