@@ -5,11 +5,17 @@
 //! Every `weir-status` call weir-ctl's status path makes sits in this file, so
 //! a rename in that crate is a one-file fix here.
 
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::time::Duration;
+
 use serde_json::{Value, json};
 use weir_status::exit::StatusExit;
 use weir_status::offline::{NoLatches, daemon_unreachable, recovery_pending};
 use weir_status::{BacklogEvidence, Evidence, Source, Thresholds, evaluate, readiness};
 
+use crate::admin_client::{self, AdminTarget, CallError};
 use crate::offline::DiskFacts;
 
 /// `weir_condition_active{code,severity}` at 1, plus `weir_ready`. `None`
@@ -418,6 +424,297 @@ pub(crate) fn collect_status(
         tried,
         StatusExit::Unreachable,
     )
+}
+
+/// How long the admin `status` verb may take to answer. The daemon renders
+/// it from atomics only, so 5 s is generous.
+pub(crate) const STATUS_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+
+pub(crate) fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// The four spec §14 sources as weir-ctl really reaches them: the admin
+/// socket (identity-checked by `admin_client::call`), `GET /status`,
+/// `GET /metrics`, and the read-only disk scan.
+pub(crate) struct RealSources {
+    pub admin: AdminTarget,
+    pub addr: String,
+    pub wab_dir: PathBuf,
+}
+
+impl StatusSources for RealSources {
+    fn admin(&self) -> Result<Value, SourceFail> {
+        match admin_client::call(&self.admin, "status", json!({}), STATUS_REPLY_TIMEOUT) {
+            Ok(r) => {
+                let mut doc = r.result;
+                if let Some(o) = doc.as_object_mut() {
+                    o.entry("instance").or_insert(r.instance);
+                }
+                Ok(doc)
+            }
+            Err(CallError::Identity(w)) => Err(SourceFail::Identity(w)),
+            Err(CallError::Unreachable(w) | CallError::Protocol(w)) => Err(SourceFail::Skip(w)),
+            // An authenticated daemon refused the verb (busy, shutting down):
+            // the next source may still answer. The reason keeps whether a
+            // retry could help, in the words `reload` and `drain` use.
+            Err(CallError::Remote {
+                code,
+                message,
+                retryable,
+            }) => Err(SourceFail::Skip(format!(
+                "{code}: {message}{}",
+                if retryable { " (retryable)" } else { "" }
+            ))),
+        }
+    }
+
+    fn http_status(&self) -> Result<Value, SourceFail> {
+        let r = crate::http::http_get(&self.addr, "/status").map_err(SourceFail::Skip)?;
+        if !crate::http::is_json(r.content_type.as_deref()) {
+            return Err(SourceFail::Skip(format!(
+                "/status at {} is not JSON ({}); a pre-4.1 daemon",
+                self.addr,
+                r.content_type.as_deref().unwrap_or("no content type")
+            )));
+        }
+        if r.status != Some(200) {
+            return Err(SourceFail::Skip(format!(
+                "/status answered HTTP {}",
+                r.status.map_or_else(|| "?".to_string(), |s| s.to_string())
+            )));
+        }
+        serde_json::from_str(&r.body)
+            .map_err(|e| SourceFail::Skip(format!("/status is not valid JSON: {e}")))
+    }
+
+    fn metrics(&self) -> Result<String, SourceFail> {
+        let body = crate::scrape(&self.addr).map_err(SourceFail::Skip)?;
+        if !crate::has_weir_metrics(&body) {
+            return Err(SourceFail::Skip(format!(
+                "no weir metrics at {}",
+                self.addr
+            )));
+        }
+        Ok(body)
+    }
+
+    fn disk(&self) -> Result<DiskFacts, SourceFail> {
+        crate::offline::scan_disk(&self.wab_dir, now_ms()).map_err(SourceFail::Skip)
+    }
+}
+
+fn field(v: &Value, k: &str) -> String {
+    match v.get(k) {
+        None | Some(Value::Null) => "?".to_string(),
+        Some(Value::String(s)) => s.clone(),
+        Some(other) => other.to_string(),
+    }
+}
+
+/// Critical first; an unknown severity sorts last rather than being hidden.
+fn severity_rank(s: Option<&str>) -> u8 {
+    match s {
+        Some("critical") => 0,
+        Some("warning") => 1,
+        Some("info") => 2,
+        _ => 3,
+    }
+}
+
+fn codes(v: Option<&Value>) -> Vec<String> {
+    v.and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|c| c.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Spec §14 human output, in order: the verdict line, the conditions by
+/// severity, the drain / sink / backlog / shard blocks, the `instance:` line
+/// (admin source only), the `unevaluated:` codes and the `source:` footer.
+pub(crate) fn render_human(o: &StatusOutcome) -> Vec<String> {
+    let d = &o.doc;
+    let mut out = Vec::new();
+    let conds: Vec<&Value> = d
+        .get("conditions")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+
+    if let Some(why) = d.get("identity_error").and_then(Value::as_str) {
+        out.push(format!("IDENTITY MISMATCH: {why}"));
+        out.push("refusing to trust the admin socket; nothing it sent was used".to_string());
+    } else if o.source == SourceKind::None {
+        // Nothing answered and there are no offline facts (README Q9). A
+        // disk-only document falls through to its own NOT READY verdict.
+        out.push("UNREACHABLE".to_string());
+    } else if d.pointer("/verdict/ready").and_then(Value::as_bool) == Some(true) {
+        out.push("READY".to_string());
+    } else {
+        let mut failing = codes(d.pointer("/verdict/readiness_failing"));
+        if failing.is_empty() {
+            failing = conds.iter().map(|c| field(c, "code")).collect();
+        }
+        out.push(format!("NOT READY: {}", failing.join(", ")));
+    }
+
+    let mut sorted = conds.clone();
+    sorted.sort_by_key(|c| severity_rank(c.get("severity").and_then(Value::as_str)));
+    if !sorted.is_empty() {
+        out.push(String::new());
+        for c in sorted {
+            out.push(format!(
+                "  [{}] {} — {}",
+                field(c, "severity"),
+                field(c, "code"),
+                field(c, "summary")
+            ));
+        }
+        out.push(String::new());
+    }
+
+    if let Some(dr) = d.get("drain").filter(|v| v.is_object()) {
+        out.push(format!(
+            "drain:    state {}  paused {}  pending {}  backlog {}  channel {}/{}",
+            field(dr, "state"),
+            field(dr, "paused"),
+            field(dr, "pending_segments"),
+            field(dr, "backlog_segments"),
+            field(dr, "channel_depth"),
+            field(dr, "channel_capacity"),
+        ));
+    }
+    if let Some(s) = d.get("sink").filter(|v| v.is_object()) {
+        out.push(format!(
+            "sink:     {}  health {}  consecutive_failures {}",
+            field(s, "type"),
+            field(s, "health"),
+            field(s, "consecutive_failures"),
+        ));
+    }
+    if let Some(b) = d.get("backlog").filter(|v| v.is_object()) {
+        let bytes = |k: &str| {
+            b.get(k)
+                .and_then(Value::as_u64)
+                .map_or_else(|| "?".to_string(), crate::fmt_bytes)
+        };
+        out.push(format!(
+            "backlog:  {} undelivered segment(s), {} record(s), oldest {}s, dead-letter {}, \
+             quarantine {}",
+            field(b, "undelivered_segments"),
+            field(b, "undelivered_records"),
+            b.get("oldest_undelivered_age_secs")
+                .and_then(Value::as_f64)
+                .map_or_else(|| "?".to_string(), |s| format!("{s:.0}")),
+            bytes("dead_letter_bytes"),
+            bytes("quarantine_bytes"),
+        ));
+    }
+    for s in d
+        .get("shards")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let id = s
+            .get("id")
+            .filter(|v| !v.is_null())
+            .map_or_else(|| field(s, "shard"), |v| v.to_string());
+        let mut parts = vec![format!("shard {id}:")];
+        for k in ["state", "reason", "undelivered_segments", "active_segments"] {
+            if s.get(k).is_some_and(|v| !v.is_null()) {
+                parts.push(format!("{k} {}", field(s, k)));
+            }
+        }
+        out.push(format!("  {}", parts.join("  ")));
+    }
+    if o.source == SourceKind::Admin
+        && let Some(inst) = d.get("instance")
+    {
+        // PR 1's AdminStatusDoc carries `pid` at the top level and an
+        // `InstanceView` without it; fold it in for the instance line.
+        let mut inst = inst.clone();
+        if let (Some(pid), Some(obj)) = (d.get("pid"), inst.as_object_mut()) {
+            obj.entry("pid").or_insert(pid.clone());
+        }
+        out.push(format!("instance: {}", admin_client::instance_line(&inst)));
+    }
+    let unev = codes(d.get("unevaluated"));
+    if !unev.is_empty() {
+        out.push(format!(
+            "unevaluated (not known to be healthy): {}",
+            unev.join(", ")
+        ));
+    }
+    let tried: Vec<String> = o
+        .tried
+        .iter()
+        .map(|a| {
+            if a.ok {
+                format!("{} ok", a.source)
+            } else {
+                format!(
+                    "{} failed: {}",
+                    a.source,
+                    a.reason.as_deref().unwrap_or("?")
+                )
+            }
+        })
+        .collect();
+    out.push(format!(
+        "source: {} (tried: {})",
+        o.source.label(),
+        tried.join("; ")
+    ));
+    out
+}
+
+/// Collects, prints (`--json`: the document; otherwise the human lines) and
+/// returns the shared exit code (weir_status::exit).
+pub(crate) fn status_run(
+    src: &dyn StatusSources,
+    mode: SourceMode,
+    json: bool,
+    now_ms: u64,
+    out: &mut impl Write,
+) -> u8 {
+    let o = collect_status(src, mode, now_ms);
+    if json {
+        crate::write_json_to(out, &o.doc);
+    } else {
+        for l in render_human(&o) {
+            let _ = writeln!(out, "{l}");
+        }
+    }
+    o.exit.code()
+}
+
+pub(crate) fn cmd_status(
+    admin_socket: Option<&Path>,
+    addr: &str,
+    wab_dir: Option<&Path>,
+    mode: SourceMode,
+    json: bool,
+) -> ExitCode {
+    let src = RealSources {
+        admin: admin_client::resolve_admin_target(admin_socket, wab_dir),
+        addr: addr.to_string(),
+        wab_dir: wab_dir
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from(admin_client::DEFAULT_WAB_DIR)),
+    };
+    ExitCode::from(status_run(
+        &src,
+        mode,
+        json,
+        now_ms(),
+        &mut std::io::stdout(),
+    ))
 }
 
 #[cfg(test)]
@@ -873,5 +1170,110 @@ weir_wab_undelivered_segments 4\nweir_wab_undelivered_records 40\n";
                 reason: Some("down".into())
             }
         );
+    }
+
+    fn outcome(doc: serde_json::Value, source: SourceKind) -> StatusOutcome {
+        let exit = daemon_doc_exit(&doc).unwrap_or(StatusExit::Unreachable);
+        finish(doc, source, vec![ok_attempt(source.label())], exit)
+    }
+
+    #[test]
+    fn human_verdict_lines() {
+        let ready = render_human(&outcome(
+            daemon_doc("admin", true, "info"),
+            SourceKind::Admin,
+        ));
+        assert_eq!(ready[0], "READY");
+        let not = render_human(&outcome(
+            daemon_doc("public", false, "info"),
+            SourceKind::Http,
+        ));
+        assert_eq!(not[0], "NOT READY: starting");
+        // Disk facts printed: the offline document is evaluated (README Q9).
+        let off = render_human(&outcome(offline_doc(&facts(1, 0), NOW).0, SourceKind::Disk));
+        assert_eq!(off[0], "NOT READY: daemon_unreachable");
+        // Nothing answered at all: the only UNREACHABLE verdict.
+        let none = render_human(&finish(
+            unreachable_doc(NOW),
+            SourceKind::None,
+            vec![],
+            StatusExit::Unreachable,
+        ));
+        assert_eq!(none[0], "UNREACHABLE");
+        let f = Fake {
+            admin: Err(SourceFail::Identity("ino 9".into())),
+            ..Fake::down()
+        };
+        let id = render_human(&collect_status(&f, SourceMode::Auto, NOW));
+        assert!(id[0].starts_with("IDENTITY MISMATCH: ino 9"), "{id:?}");
+    }
+
+    #[test]
+    fn human_conditions_sorted_by_severity_and_unevaluated_never_healthy() {
+        let mut doc = daemon_doc("admin", true, "info");
+        doc["conditions"] = json!([
+            {"code": "sink_degraded", "severity": "info", "summary": "i"},
+            {"code": "shard_offline", "severity": "critical", "summary": "c"},
+            {"code": "drain_paused", "severity": "warning", "summary": "w"},
+        ]);
+        doc["unevaluated"] = json!(["wab_scan_stale", "delivery_lagging"]);
+        // PR 1's AdminStatusDoc shape: `pid` is top-level, `instance` has none.
+        doc["pid"] = json!(7);
+        doc["instance"] =
+            json!({"wab_dir": "/var/lib/weir/wab", "socket_path": "/run/weir/weir.sock"});
+        let lines = render_human(&outcome(doc.clone(), SourceKind::Admin));
+        let pos = |needle: &str| {
+            lines
+                .iter()
+                .position(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} missing: {lines:?}"))
+        };
+        assert!(
+            pos("shard_offline") < pos("drain_paused")
+                && pos("drain_paused") < pos("sink_degraded")
+        );
+        let unev = &lines[pos("unevaluated")];
+        assert!(
+            unev.contains("wab_scan_stale") && unev.contains("not known to be healthy"),
+            "{unev}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("instance: daemon pid 7"))
+        );
+        assert!(lines.last().unwrap().starts_with("source: admin"));
+        // The public view has no instance line.
+        let pub_lines = render_human(&outcome(doc, SourceKind::Http));
+        assert!(!pub_lines.iter().any(|l| l.starts_with("instance:")));
+    }
+
+    #[test]
+    fn status_run_offline_end_to_end_against_a_temp_wab_dir() {
+        let wab = std::env::temp_dir().join(format!("weir_ctl_status_e2e_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&wab);
+        std::fs::create_dir_all(wab.join("shard_00")).unwrap();
+        // A closed port and an absent admin socket: only the disk answers.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let src = RealSources {
+            admin: crate::admin_client::resolve_admin_target(
+                Some(&wab.join("nope.sock")),
+                Some(&wab),
+            ),
+            addr: format!("127.0.0.1:{port}"),
+            wab_dir: wab.clone(),
+        };
+        let mut out = Vec::new();
+        let code = status_run(&src, SourceMode::Auto, true, NOW, &mut out);
+        // README Q9: the disk answered, so its facts are evaluated: exit 1, not 2.
+        assert_eq!(code, 1);
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["source"], "disk");
+        assert_eq!(v["sources_tried"].as_array().unwrap().len(), 4);
+        std::fs::remove_dir_all(&wab).ok();
     }
 }

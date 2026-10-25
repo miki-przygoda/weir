@@ -100,6 +100,28 @@ enum Command {
     /// detectable, PROVIDED the head was observed off-host (see `attest head`).
     #[command(subcommand)]
     Attest(AttestCommand),
+    /// Can the daemon take ingest, and if not, why: conditions, drain, sink,
+    /// backlog, shards. Tries the admin socket, then GET /status, then
+    /// /metrics plus disk, then disk alone. Exit: 0 ready, 1 not ready
+    /// (including a dead daemon whose wab_dir was read from disk), 2 unreachable
+    /// with no offline facts, or identity mismatch, 3 ready with a critical
+    /// condition.
+    Status {
+        /// The daemon's admin socket. Default: derived from --wab-dir
+        /// (<parent>/<basename>.admin.sock), then /var/lib/weir/wab.admin.sock.
+        #[arg(long, env = "WEIR_ADMIN_SOCKET_PATH")]
+        admin_socket: Option<PathBuf>,
+        /// host:port of the daemon's metrics listener (serves /status and /metrics).
+        #[arg(long, default_value = DEFAULT_METRICS_ADDR)]
+        addr: String,
+        /// The daemon's wab_dir: the disk facts, the derived admin socket, and
+        /// the identity the daemon must prove.
+        #[arg(long, env = "WEIR_WAB_DIR")]
+        wab_dir: Option<PathBuf>,
+        /// Use only this source instead of the first that answers.
+        #[arg(long, value_enum, default_value_t = status::SourceMode::Auto)]
+        source: status::SourceMode,
+    },
 }
 
 /// Subcommands under `weir-ctl attest`.
@@ -334,6 +356,21 @@ fn main() -> ExitCode {
             // express — it returns its own ExitCode directly instead of
             // flowing through `result`.
             return attest::cmd_attest_verify(&wab_dir, shard, metrics_file.as_deref(), json);
+        }
+        Command::Status {
+            admin_socket,
+            addr,
+            wab_dir,
+            source,
+        } => {
+            // Its own exit table (0/1/2/3), like `attest verify`.
+            return status::cmd_status(
+                admin_socket.as_deref(),
+                &addr,
+                wab_dir.as_deref(),
+                source,
+                json,
+            );
         }
     };
     match result {
@@ -3396,6 +3433,41 @@ weir_sink_info{sink_type=\"http\"} 1
             "the error must name the canonical `durable` value and the legacy \
              sync/batched aliases, got: {err}"
         );
+    }
+
+    #[test]
+    fn status_cli_parses_every_source_and_defaults_to_auto() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["weir-ctl", "status"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Status {
+                source: status::SourceMode::Auto,
+                ..
+            }
+        ));
+        for (arg, mode) in [
+            ("admin", status::SourceMode::Admin),
+            ("http", status::SourceMode::Http),
+            ("metrics", status::SourceMode::Metrics),
+            ("disk", status::SourceMode::Disk),
+        ] {
+            let cli = Cli::try_parse_from([
+                "weir-ctl",
+                "--json",
+                "status",
+                "--source",
+                arg,
+                "--wab-dir",
+                "/x",
+            ])
+            .unwrap();
+            assert!(
+                matches!(cli.command, Command::Status { source, .. } if source == mode),
+                "{arg}"
+            );
+        }
+        assert!(Cli::try_parse_from(["weir-ctl", "status", "--source", "carrier-pigeon"]).is_err());
     }
 
     #[test]
