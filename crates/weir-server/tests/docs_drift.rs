@@ -443,6 +443,25 @@ fn every_hostile_runner_row_in_the_trend_is_marked() {
     );
 }
 
+/// The anchor of every `#### ` heading in `doc`, as GitHub and mdBook build
+/// it: lowercased, punctuation dropped except `-` and `_`, spaces to `-`.
+///
+/// mdBook's `normalize_id` and GitHub both keep `_`. No alert anchor has one,
+/// so dropping it never mattered there; every `cond-<code>` anchor has one.
+fn heading_slugs(doc: &str) -> Vec<String> {
+    doc.lines()
+        .filter_map(|l| l.strip_prefix("#### "))
+        .map(|h| {
+            h.trim()
+                .to_ascii_lowercase()
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ' '))
+                .collect::<String>()
+                .replace(' ', "-")
+        })
+        .collect()
+}
+
 /// Every alert's `runbook` annotation must land on a heading that exists.
 ///
 /// The annotation is the operator's entry point: an alert fires at 3am, they
@@ -452,18 +471,7 @@ fn every_hostile_runner_row_in_the_trend_is_marked() {
 /// parse, not that their documentation exists.
 #[test]
 fn every_alert_runbook_anchor_resolves_to_a_heading() {
-    let headings: Vec<String> = MONITORING
-        .lines()
-        .filter_map(|l| l.strip_prefix("#### "))
-        .map(|h| {
-            h.trim()
-                .to_ascii_lowercase()
-                .chars()
-                .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == ' ')
-                .collect::<String>()
-                .replace(' ', "-")
-        })
-        .collect();
+    let headings = heading_slugs(MONITORING);
 
     let mut unresolved = Vec::new();
     let mut count = 0usize;
@@ -1401,4 +1409,120 @@ fn ack_timeout_and_queue_saturation_runbooks_check_the_drain_hand_off_first() {
             }
         }
     }
+}
+
+/// Codes only `weir-ctl status` emits, from offline evidence (spec §9.3).
+const OFFLINE_ONLY_CODES: [&str; 2] = ["daemon_unreachable", "recovery_pending"];
+
+/// `[code, severity, affects, gates]` as the catalogue table must show them.
+fn catalogue_row(c: &weir_status::ConditionCode) -> [String; 4] {
+    // PR 1's catalogue: `entry(code)` carries severity, affects and gates.
+    let e = weir_status::entry(*c).unwrap_or_else(|| panic!("{c:?} has no catalogue entry"));
+    let gates: Vec<String> = e
+        .gates
+        .iter()
+        .map(|g| wire_name(serde_json::to_value(g).expect("serialize a Gate")))
+        .collect();
+    [
+        wire_name(serde_json::to_value(c).expect("serialize a ConditionCode")),
+        wire_name(serde_json::to_value(e.severity).expect("serialize a Severity")),
+        wire_name(serde_json::to_value(e.affects).expect("serialize an Affects")),
+        if gates.is_empty() {
+            "none".to_string()
+        } else {
+            gates.join(", ")
+        },
+    ]
+}
+
+/// Every condition the daemon or weir-ctl can report has a row in the
+/// catalogue table that agrees with the code, and a `#### cond-<code>`
+/// runbook heading; every row names a real code.
+///
+/// The runbook link is printed by `weir-ctl status`, by the readiness script
+/// and by WeirConditionCritical, so a code without a heading sends an operator
+/// to a page that scrolls nowhere. The severity, `affects` and gates columns
+/// are compared with `weir_status` itself, because a table that says a
+/// condition does not gate readiness when it does is worse than no table.
+#[test]
+fn every_condition_has_a_catalogue_row_and_a_runbook_heading() {
+    // The offline-only list is weir_status's, not a copy that can drift.
+    let offline: Vec<String> = weir_status::OFFLINE_ONLY
+        .iter()
+        .map(|e| wire_name(serde_json::to_value(e.code).expect("serialize a ConditionCode")))
+        .collect();
+    assert_eq!(
+        offline, OFFLINE_ONLY_CODES,
+        "weir_status::OFFLINE_ONLY changed; update OFFLINE_ONLY_CODES and the catalogue"
+    );
+
+    let section = MONITORING
+        .split("\n## Conditions\n")
+        .nth(1)
+        .expect("docs/monitoring.md must keep its `## Conditions` section")
+        .split("\n## ")
+        .next()
+        .unwrap();
+    let rows: Vec<Vec<String>> = section
+        .lines()
+        .filter(|l| l.starts_with("| `"))
+        .map(|l| {
+            l.split('|')
+                .map(|cell| cell.trim().trim_matches('`').to_string())
+                .filter(|cell| !cell.is_empty())
+                .collect()
+        })
+        .collect();
+    let slugs = heading_slugs(MONITORING);
+    let daemon_codes = condition_code_names();
+    let mut problems = Vec::new();
+
+    for c in weir_status::ALL {
+        let want = catalogue_row(c);
+        let code = &want[0];
+        if OFFLINE_ONLY_CODES.contains(&code.as_str()) {
+            continue; // checked below; their gates cell carries "(weir-ctl only)"
+        }
+        match rows.iter().find(|r| r.first() == Some(code)) {
+            None => problems.push(format!("{code}: no row in the catalogue table")),
+            Some(r) if r.len() < 4 || r[..4] != want[..] => problems.push(format!(
+                "{code}: the table says {:?}, weir_status says {want:?}",
+                &r[..r.len().min(4)]
+            )),
+            Some(_) => {}
+        }
+        if !slugs.contains(&format!("cond-{code}")) {
+            problems.push(format!("{code}: no `#### cond-{code}` heading"));
+        }
+    }
+    for e in weir_status::OFFLINE_ONLY {
+        let mut want = catalogue_row(&e.code);
+        want[3] = format!("{} (weir-ctl only)", want[3]);
+        let code = &want[0];
+        match rows.iter().find(|r| r.first() == Some(code)) {
+            None => problems.push(format!("{code} (weir-ctl only): no row")),
+            Some(r) if r.len() < 4 || r[..4] != want[..] => problems.push(format!(
+                "{code} (weir-ctl only): the table says {:?}, weir_status says {want:?}",
+                &r[..r.len().min(4)]
+            )),
+            Some(_) => {}
+        }
+        if !slugs.contains(&format!("cond-{code}")) {
+            problems.push(format!(
+                "{code} (weir-ctl only): no `#### cond-{code}` heading"
+            ));
+        }
+    }
+    for r in &rows {
+        let code = &r[0];
+        if !daemon_codes.contains(code) && !OFFLINE_ONLY_CODES.contains(&code.as_str()) {
+            problems.push(format!("{code}: a row for a code nothing emits"));
+        }
+    }
+
+    assert!(
+        problems.is_empty(),
+        "docs/monitoring.md's Conditions catalogue disagrees with weir_status:\n  {}",
+        problems.join("\n  ")
+    );
 }

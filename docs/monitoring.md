@@ -655,6 +655,259 @@ treat `2` as "unknown," not "clean."
 
 ---
 
+## Conditions
+
+The daemon evaluates a fixed catalogue of **conditions** from its own state:
+one pure evaluator (the `weir-status` crate) behind `/status`, `/readyz`,
+`/livez`, the admin `status` verb, the `weir_condition_active{code,severity}`
+gauge, `weir-readiness.sh` and an offline `weir-ctl status`. Each has a code,
+a severity, what it affects (ingest, delivery or durability), and whether it
+gates readiness (`/readyz` 503) or may be selected for liveness
+(`livez_checks`, evaluated only while serving). Missing evidence makes a
+condition *unevaluated*, listed separately on `/status`; never read that as
+healthy.
+
+| Code | Severity | Affects | Gates |
+|---|---|---|---|
+| `starting` | info | ingest | readiness |
+| `shutting_down` | info | ingest | readiness |
+| `listener_down` | critical | ingest | readiness, liveness |
+| `no_live_shard` | critical | ingest | readiness, liveness |
+| `shard_offline` | critical | ingest | none |
+| `worker_exited` | critical | ingest | liveness |
+| `wab_cap_rejecting` | critical | ingest | readiness |
+| `drain_backpressure` | warning | ingest | none |
+| `ack_timeouts_recent` | warning | ingest | none |
+| `wab_scan_stale` | warning | ingest | none |
+| `wab_growing_unbounded` | warning | durability | none |
+| `drain_stopped` | critical | delivery | liveness |
+| `drain_wedged` | critical | delivery | liveness |
+| `drain_paused` | warning | delivery | none |
+| `drain_blocked_dead_letter_full` | critical | delivery | none |
+| `delivery_stalled` | warning | delivery | none |
+| `delivery_lagging` | warning | delivery | none |
+| `segments_stranded` | warning | delivery | none |
+| `sink_down` | warning | delivery | none |
+| `sink_degraded` | info | delivery | none |
+| `sink_failing` | warning | delivery | none |
+| `dead_letter_near_cap` | warning | delivery | none |
+| `noop_sink` | warning | delivery | none |
+| `active_segment_aging` | info | delivery | none |
+| `fsync_failures_recent` | critical | durability | none |
+| `flusher_respawned_recent` | warning | ingest | none |
+| `quarantine_nonempty` | warning | durability | none |
+| `recovery_incomplete` | critical | durability | none |
+| `tls_reload_failed` | warning | ingest | none |
+| `admin_unavailable` | warning | ingest | none |
+| `daemon_unreachable` | critical | ingest | none (weir-ctl only) |
+| `recovery_pending` | info | durability | none (weir-ctl only) |
+
+Sink, drain, pause, lag, dead-letter, quarantine and fsync or panic history
+never gate readiness: weir keeps accepting and buffering durably through all
+of them. A newer daemon may report a code an older `weir-ctl` does not know;
+it is shown verbatim, never dropped.
+
+### Ingest and lifecycle
+
+#### cond-starting
+**Means:** a startup phase (`initializing`, `recovering`, `handoff`,
+`binding`); the producer socket binds once recovery has sealed the open
+segments. Health, metrics and the admin socket already answer.
+**Respond:** nothing while it progresses; `weir-ctl status` shows the phase
+and the replay remaining. A long `recovering` is a large WAB or a slow disk:
+check the log.
+
+#### cond-shutting_down
+**Means:** a graceful shutdown is under way: listeners closed, new
+connections refused, the drain on its `drain_shutdown_budget_secs` budget.
+**Respond:** nothing. If unexpected, find who sent the SIGTERM.
+
+#### cond-listener_down
+**Means:** a configured producer listener (Unix or TCP) failed, or closed
+outside shutdown. Selectable in `livez_checks`.
+**Respond:** read the bind or accept error in the log, then restart; a
+restart re-binds.
+
+#### cond-no_live_shard
+**Means:** no shard can accept: every flusher is offline or its owning worker
+exited. New connections are refused. Selectable in `livez_checks`.
+**Respond:** capture the panic or counter-scan error from the log, then
+restart; recovery re-runs.
+
+#### cond-shard_offline
+**Means:** some shards are offline (respawn budget exhausted, counter scan
+failed, flusher exited). New connections avoid them; connections already
+pinned to them nack until they reconnect.
+**Respond:** capture the log (`grep "flusher panicked"`), then restart.
+
+#### cond-worker_exited
+**Means:** a worker thread exited outside shutdown; the shards it owns cannot
+accept records. Selectable in `livez_checks`.
+**Respond:** capture the log, then restart.
+
+#### cond-wab_cap_rejecting
+**Means:** the WAB reached `wab_max_bytes`; pushes nack until it falls below
+the low-water mark. The root cause is delivery.
+**Respond:** follow the drain and sink conditions. Raising `wab_max_bytes`
+buys time only.
+
+#### cond-drain_backpressure
+**Means:** the drain channel has held 230 or more of its 256 slots for 10 s,
+or a shard has been blocked handing a sealed segment to the drain for over a
+second. Acks wait behind the hand-off, so producers see `ACK_TIMEOUT` for
+durable records.
+**Respond:** a delivery problem, not storage: see
+[WeirDrainBackpressure](#weirdrainbackpressure).
+
+#### cond-ack_timeouts_recent
+**Means:** `weir_ack_timeout_total` rose in the last 5 minutes. The summary
+names the inferred cause: delivery (with `drain_backpressure`), storage
+(fsync failures or slow group commits), or a flusher not completing groups.
+**Respond:** follow the inferred cause; see [WeirAckTimeout](#weiracktimeout).
+
+#### cond-wab_scan_stale
+**Means:** no successful WAB size scan for 30 s (or none yet since start).
+The cap is enforced against the last size, fail-closed, and the lag figures
+are stale.
+**Respond:** look for scan errors in the log (permissions or I/O on
+`wab_dir`).
+
+#### cond-wab_growing_unbounded
+**Means:** the WAB is growing with `wab_max_bytes = 0` while delivery is not
+healthy (including while paused).
+**Respond:** fix delivery, or set `wab_max_bytes` so a full disk becomes
+nacks instead of a crash.
+
+### Delivery
+
+#### cond-drain_stopped
+**Means:** the drain supervisor gave up after repeated panics. Ingest
+continues, nothing is delivered, the WAB grows, and `sink_health` is stale.
+Selectable in `livez_checks`.
+**Respond:** the admin view of `weir-ctl status` shows the last panic
+message; capture it, then restart. See [WeirDrainStopped](#weirdrainstopped).
+
+#### cond-drain_wedged
+**Means:** the drain thread is blocked inside a sink call that does not
+yield (a commit older than `commit_timeout` + 15 s, or no progress for
+`health_poll_interval` + 15 s). Selectable in `livez_checks`.
+**Respond:** restart; the in-flight segment is re-delivered from record 0.
+Investigate the sink.
+
+#### cond-drain_paused
+**Means:** an operator paused delivery (`weir-ctl drain pause`); it stopped
+before the next commit batch, possibly mid-segment (`held`). Ingest keeps
+buffering. If the drain panics and respawns while paused, it stays paused,
+and on resume it continues past the records already committed: nothing in
+the held segment is re-delivered within this run.
+**Respond:** `weir-ctl drain resume` when done. A restart also resumes, but
+replays the held segment from record 0. With `wab_max_bytes = 0` the WAB
+grows without bound meanwhile.
+
+#### cond-drain_blocked_dead_letter_full
+**Means:** `dead_letter/` reached `dead_letter_max_bytes`; all delivery waits.
+**Respond:** `weir-ctl dl requeue` or `weir-ctl dl drop`, or raise the cap.
+See [WeirDrainBlocked](#weirdrainblocked).
+
+#### cond-delivery_stalled
+**Means:** there is undelivered data and no commit has succeeded for 300 s,
+and delivery is not paused.
+**Respond:** check the sink conditions; see
+[WeirDrainNotConfirming](#weirdrainnotconfirming).
+
+#### cond-delivery_lagging
+**Means:** the oldest undelivered data is over 900 s old (an upper bound).
+**Respond:** compare the ingest rate with the commit rate; see
+[WeirOldestUndeliveredAge](#weiroldestundeliveredage).
+
+#### cond-segments_stranded
+**Means:** segments exhausted their retries since the last successful commit.
+They resume automatically once their cool-down has passed and the sink's
+probe no longer reports it down.
+**Respond:** fix the sink, or `weir-ctl drain retry-stranded`. Within this run
+a resumed segment continues past the records already committed (the drain
+keeps a resume cursor pinned to the file); after a restart it replays from
+record 0.
+
+#### cond-sink_down
+**Means:** the sink's health probe reports it unreachable. weir keeps
+buffering durably; this is not a readiness failure.
+**Respond:** fix the sink, and watch the WAB against `wab_max_bytes`. The
+admin view shows the probe's reason.
+
+#### cond-sink_degraded
+**Means:** the sink's health probe reports it degraded.
+**Respond:** watch it; see [WeirSinkDegraded](#weirsinkdegraded).
+
+#### cond-sink_failing
+**Means:** three or more consecutive commits failed while the probe does not
+report the sink down.
+**Respond:** the admin view shows the last error (redacted). Common causes:
+credentials, schema, records the sink rejects.
+
+#### cond-dead_letter_near_cap
+**Means:** `dead_letter/` is at 80% or more of `dead_letter_max_bytes`.
+**Respond:** requeue or drop dead-letters before the drain blocks.
+
+#### cond-noop_sink
+**Means:** `sink_type = "noop"`: records are acked and DISCARDED.
+**Respond:** configure a real sink unless this is deliberate (soak tests).
+
+#### cond-active_segment_aging
+**Means:** an active segment is over an hour old and both seal timers are 0,
+so its records are durable but will not be delivered until it fills.
+**Respond:** set `wab_segment_max_age_secs` or `wab_segment_max_lifetime_secs`.
+
+### Durability
+
+#### cond-fsync_failures_recent
+**Means:** `fdatasync` failed in the last 15 minutes. Windowed: it clears on
+its own, unlike the readiness script's old lifetime-counter gate.
+**Respond:** storage; see [WeirFsyncFailure](#weirfsyncfailure).
+
+#### cond-flusher_respawned_recent
+**Means:** a flusher panicked and was respawned in the last 15 minutes, and
+every shard is up.
+**Respond:** capture the panic from the log and report it.
+
+#### cond-quarantine_nonempty
+**Means:** `quarantine/` holds data.
+**Respond:** `weir-ctl quarantine list`, `inspect`, `requeue`; see
+[quarantine recovery](operations/quarantine-recovery.md), and
+[WeirSegmentQuarantined](#weirsegmentquarantined) for what `requeue` leaves
+behind.
+
+#### cond-recovery_incomplete
+**Means:** in this process, recovery failed a segment or failed to copy one
+into quarantine. The segment was left in place.
+**Respond:** read the recovery errors in the log, fix the cause (space,
+permissions), then restart.
+
+### Config and control surface
+
+#### cond-tls_reload_failed
+**Means:** the last TLS reload failed; the previous certificates are still
+served. Sticky until a reload succeeds.
+**Respond:** fix the files, then `weir-ctl reload` or `kill -HUP`.
+
+#### cond-admin_unavailable
+**Means:** the admin socket is enabled but could not be bound.
+**Respond:** see [WeirAdminUnavailable](#weiradminunavailable).
+
+### Reported by weir-ctl only
+
+#### cond-daemon_unreachable
+**Means:** `weir-ctl status` could not reach the daemon by admin socket or
+HTTP, and built its verdict from the disk alone.
+**Respond:** check the process (`systemctl status weir`, container state).
+
+#### cond-recovery_pending
+**Means:** `weir-ctl status`, reading the disk, found active segments the
+next start must recover.
+**Respond:** nothing; informational.
+
+---
+
 ## Capacity: surviving a sink outage
 
 weir's pitch is "buffer durably while the uplink is down." That's bounded by
@@ -890,7 +1143,7 @@ Added by Foundations. The conditions behind `weir_condition_active` get their ow
 | `weir_drain_shutdown_deadline_seconds` | gauge | Unix time at which the current bounded shutdown abandons the drain's in-flight work; 0 when not shutting down. `weir_drain_shutdown_deadline_seconds - time()` is the budget left. |
 | `weir_records_nack_internal_total{cause}` | counter | Transient `InternalError` nacks by cause: `queue_full`, `write_failed`, `sender_dropped`, `ack_timeout`, `wab_cap`, `coordinate`, `ownership_lost`. The wire reason is the same for all of them; this is how to tell them apart. |
 | `weir_connections_refused_no_live_shard_total` | counter | New connections refused because no shard could accept records. *(written from PR 3)* |
-| `weir_drain_segments_abandoned_total` | counter | Segments left partly delivered when the drain thread exited on a stop: at the shutdown deadline, or while the segment was held by a pause or blocked on a full dead letter. They stay sealed and unconfirmed and are re-delivered from record 0 on the next start. *(written from PR 2)* |
+| `weir_drain_segments_abandoned_total` | counter | Segments left partly delivered when the drain thread exited on a stop: at the shutdown deadline, or while the segment was held by a pause or blocked on a full dead letter. They stay sealed and unconfirmed and are re-delivered from record 0 on the next start. Every such exit counts once, including one where nothing of that segment had been committed yet. A drain that panics and respawns while held does not exit this way: it stays paused and, on resume, continues past the committed prefix ([cond-drain_paused](#cond-drain_paused)). *(written from PR 2)* |
 | `weir_wab_segments_not_handed_off_total{reason}` | counter | Sealed segments a flusher could not hand to the drain, by `reason`: `budget` (shutdown hand-off budget spent) or `disconnected` (drain gone). Durable; delivered on restart. *(written from PR 3)* |
 
 ### Integrity / tamper evidence (weir-attest)
