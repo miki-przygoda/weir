@@ -155,6 +155,216 @@ pub(crate) fn cmd_reload(target: &AdminTarget, json: bool) -> ExitCode {
     ))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DrainVerb {
+    Pause,
+    Resume,
+    RetryStranded,
+}
+
+impl DrainVerb {
+    pub(crate) fn wire(self) -> &'static str {
+        match self {
+            DrainVerb::Pause => "drain.pause",
+            DrainVerb::Resume => "drain.resume",
+            DrainVerb::RetryStranded => "drain.retry_stranded",
+        }
+    }
+    /// The daemon's default `wait_ms` when weir-ctl sends none (spec §11).
+    pub(crate) fn default_wait_ms(self) -> u64 {
+        match self {
+            DrainVerb::Pause | DrainVerb::Resume => 5_000,
+            DrainVerb::RetryStranded => 10_000,
+        }
+    }
+}
+
+/// The admin protocol's `wait_ms` range is 0..=30000.
+pub(crate) const MAX_WAIT_MS: u64 = 30_000;
+pub(crate) const PAUSE_IN_MEMORY: &str = "in-memory only; a daemon restart resumes delivery";
+/// PR 6 review follow-up. A strand holds its segment off for the backoff its
+/// last retry would have served (the ledger's `not_before`, spec §4.6), and
+/// the retry-stranded rescan honours it so a sink's Retry-After is never
+/// violated. Such a segment is not counted as requeued; a later call picks it
+/// up. The cool-down is the strand's backoff: `sink_retry_base_delay_ms`
+/// doubled once per retry, or the sink's Retry-After, capped at 300 s.
+pub(crate) const RETRY_COOL_DOWN_HINT: &str = "segments still inside their cool-down are skipped; \
+     run it again once the cool-down has passed (sink_retry_base_delay_ms × 2^sink_max_retries \
+     after the strand, or the sink's Retry-After, at most 300 s)";
+/// Margin over the daemon-side wait for the reply to arrive.
+const REPLY_MARGIN_MS: u64 = 5_000;
+
+fn wait_ms(wait_secs: u64) -> u64 {
+    wait_secs.saturating_mul(1000).min(MAX_WAIT_MS)
+}
+
+/// The `drain.*` args: `wait_ms` only when `--wait` was given, so the daemon
+/// applies its own default otherwise.
+pub(crate) fn drain_args(wait_secs: Option<u64>) -> Value {
+    match wait_secs {
+        None => json!({}),
+        Some(s) => json!({"wait_ms": wait_ms(s)}),
+    }
+}
+
+/// How long weir-ctl waits for the reply: the daemon-side wait plus a margin.
+pub(crate) fn drain_reply_timeout(verb: DrainVerb, wait_secs: Option<u64>) -> Duration {
+    let wait = wait_secs.map_or(verb.default_wait_ms(), wait_ms);
+    Duration::from_millis(wait + REPLY_MARGIN_MS)
+}
+
+fn flag(v: &Value, k: &str) -> bool {
+    v.get(k).and_then(Value::as_bool).unwrap_or(false)
+}
+
+/// The daemon's own `observed` flag when present. Otherwise the conservative
+/// reading of the verb's result keys: unknown means "not yet" (exit 4).
+pub(crate) fn drain_observed(verb: DrainVerb, result: &Value) -> bool {
+    if let Some(b) = result.get("observed").and_then(Value::as_bool) {
+        return b;
+    }
+    match verb {
+        DrainVerb::Pause => flag(result, "paused") || flag(result, "held"),
+        // PR 6's ResumeResult: `resumed` = observed no longer paused or held.
+        DrainVerb::Resume => flag(result, "resumed"),
+        DrainVerb::RetryStranded => flag(result, "completed"),
+    }
+}
+
+/// The human lines for a `drain.*` result.
+pub(crate) fn drain_lines(verb: DrainVerb, r: &Value, observed: bool) -> Vec<String> {
+    let num = |k: &str| {
+        r.get(k)
+            .filter(|v| !v.is_null())
+            .map_or_else(|| "?".to_string(), Value::to_string)
+    };
+    let mut out = Vec::new();
+    match verb {
+        DrainVerb::Pause => {
+            out.push(if !observed {
+                "drain.pause: requested; not in effect yet (it takes effect before the next commit batch)".to_string()
+            } else if let Some(h) = r.get("held_segment").filter(|v| v.is_object()) {
+                format!(
+                    "drain.pause: paused mid-segment ({} at record {})",
+                    h.get("segment").and_then(Value::as_str).unwrap_or("?"),
+                    h.get("processed_records")
+                        .map_or_else(|| "?".to_string(), Value::to_string)
+                )
+            } else {
+                "drain.pause: paused".to_string()
+            });
+            for w in r
+                .get("warnings")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(w) = w.as_str() {
+                    out.push(format!("⚠ {w}"));
+                }
+            }
+            out.push(PAUSE_IN_MEMORY.to_string());
+        }
+        DrainVerb::Resume => out.push(if !observed {
+            "drain.resume: requested; the drain has not picked it up yet".to_string()
+        } else if r.get("was_paused").and_then(Value::as_bool) == Some(false) {
+            "drain.resume: delivery was not paused".to_string()
+        } else {
+            match r.get("paused_for_secs").and_then(Value::as_f64) {
+                Some(s) => format!("drain.resume: delivery resumed (paused for {s:.0}s)"),
+                None => "drain.resume: delivery resumed".to_string(),
+            }
+        }),
+        DrainVerb::RetryStranded => {
+            if observed {
+                let mut l = format!(
+                    "drain.retry_stranded: requeued {}, already queued {}",
+                    num("requeued"),
+                    num("already_queued")
+                );
+                if flag(r, "backoff_cut") {
+                    l.push_str(", backoff cut");
+                }
+                if flag(r, "coalesced") {
+                    l.push_str(" (coalesced with a retry already running)");
+                }
+                out.push(l);
+                if let Some(e) = r.get("scan_error").and_then(Value::as_str) {
+                    out.push(format!("⚠ the stranded-segment scan failed: {e}"));
+                }
+                if flag(r, "paused") {
+                    out.push(
+                        "⚠ delivery is paused: requeued segments wait for `weir-ctl drain resume`"
+                            .to_string(),
+                    );
+                }
+            } else {
+                out.push(format!(
+                    "drain.retry_stranded: requested (ticket {}); not completed within the wait",
+                    num("ticket")
+                ));
+            }
+            if let Some(n) = r.get("note").and_then(Value::as_str) {
+                out.push(n.to_string());
+            }
+            out.push(RETRY_COOL_DOWN_HINT.to_string());
+        }
+    }
+    if !observed {
+        out.push("re-run `weir-ctl status` to see when it takes effect (exit 4)".to_string());
+    }
+    out
+}
+
+/// One `drain.*` call. Exit 0 observed, 4 requested but not in effect yet,
+/// 1 an error response, 2 unreachable or an identity mismatch. No offline
+/// fallback.
+pub(crate) fn drain_run(
+    verb: DrainVerb,
+    wait_secs: Option<u64>,
+    target: &AdminTarget,
+    json: bool,
+    out: &mut impl Write,
+    err: &mut impl Write,
+) -> u8 {
+    match admin_client::call(
+        target,
+        verb.wire(),
+        drain_args(wait_secs),
+        drain_reply_timeout(verb, wait_secs),
+    ) {
+        Ok(r) => {
+            let observed = drain_observed(verb, &r.result);
+            if json {
+                crate::write_json_to(out, &r.result);
+            } else {
+                for l in drain_lines(verb, &r.result, observed) {
+                    let _ = writeln!(out, "{l}");
+                }
+                let _ = writeln!(out, "{}", instance_line(&r.instance));
+            }
+            if observed { 0 } else { 4 }
+        }
+        Err(e) => report_call_error(verb.wire(), &e, json, err, None),
+    }
+}
+
+pub(crate) fn cmd_drain(
+    verb: DrainVerb,
+    wait_secs: Option<u64>,
+    target: &AdminTarget,
+    json: bool,
+) -> ExitCode {
+    ExitCode::from(drain_run(
+        verb,
+        wait_secs,
+        target,
+        json,
+        &mut std::io::stdout(),
+        &mut std::io::stderr(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,5 +458,232 @@ mod tests {
             assert_eq!(h.join().unwrap()["verb"], "reload");
             std::fs::remove_dir_all(&dir).ok();
         }
+    }
+
+    #[test]
+    fn wait_maps_to_wait_ms_with_the_protocol_cap() {
+        assert_eq!(
+            drain_args(None),
+            json!({}),
+            "absent: the daemon's default applies"
+        );
+        assert_eq!(drain_args(Some(5)), json!({"wait_ms": 5000}));
+        assert_eq!(drain_args(Some(0)), json!({"wait_ms": 0}));
+        assert_eq!(drain_args(Some(99)), json!({"wait_ms": 30000}));
+        assert_eq!(
+            drain_reply_timeout(DrainVerb::RetryStranded, None),
+            Duration::from_millis(15_000)
+        );
+        assert_eq!(
+            drain_reply_timeout(DrainVerb::Pause, Some(99)),
+            Duration::from_millis(35_000)
+        );
+    }
+
+    #[test]
+    fn observed_prefers_the_daemons_flag_and_falls_back_conservatively() {
+        assert!(drain_observed(
+            DrainVerb::Pause,
+            &json!({"observed": true, "paused": false})
+        ));
+        assert!(!drain_observed(
+            DrainVerb::Pause,
+            &json!({"observed": false, "paused": true})
+        ));
+        assert!(drain_observed(
+            DrainVerb::Pause,
+            &json!({"paused": false, "held": true})
+        ));
+        assert!(!drain_observed(
+            DrainVerb::Pause,
+            &json!({"pause_requested": true})
+        ));
+        assert!(
+            !drain_observed(DrainVerb::Resume, &json!({"was_paused": true})),
+            "no observed flag: exit 4, not a guess"
+        );
+        assert!(drain_observed(
+            DrainVerb::Resume,
+            &json!({"was_paused": true, "resumed": true})
+        ));
+        assert!(!drain_observed(
+            DrainVerb::Resume,
+            &json!({"was_paused": true, "resumed": false})
+        ));
+        assert!(drain_observed(
+            DrainVerb::RetryStranded,
+            &json!({"completed": true})
+        ));
+        assert!(!drain_observed(
+            DrainVerb::RetryStranded,
+            &json!({"completed": false, "ticket": 3})
+        ));
+    }
+
+    #[test]
+    fn pause_always_says_it_is_in_memory_only() {
+        for (observed, result) in [
+            (
+                true,
+                json!({"paused": true, "held": true, "held_segment": {"segment": "shard_00/seg_00000007", "processed_records": 1200},
+                          "warnings": ["wab_max_bytes is 0: the WAB grows without bound while paused"]}),
+            ),
+            (
+                false,
+                json!({"pause_requested": true, "paused": false, "held": false, "warnings": []}),
+            ),
+        ] {
+            let l = drain_lines(DrainVerb::Pause, &result, observed);
+            assert!(l.iter().any(|x| x == PAUSE_IN_MEMORY), "{l:?}");
+            if observed {
+                assert!(
+                    l[0].contains("mid-segment") && l[0].contains("1200"),
+                    "{l:?}"
+                );
+                assert!(
+                    l.iter().any(|x| x.starts_with("⚠ wab_max_bytes is 0")),
+                    "{l:?}"
+                );
+            } else {
+                assert!(l[0].contains("not in effect yet"), "{l:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn retry_stranded_lines_report_counts_or_the_pending_ticket() {
+        let done = drain_lines(
+            DrainVerb::RetryStranded,
+            &json!({"ticket": 4, "completed": true, "coalesced": false, "requeued": 3, "already_queued": 1,
+                    "backoff_cut": true, "scan_error": null, "paused": true,
+                    "note": "requeued segments restart from record 0"}),
+            true,
+        );
+        assert!(
+            done[0].contains("requeued 3")
+                && done[0].contains("already queued 1")
+                && done[0].contains("backoff cut"),
+            "{done:?}"
+        );
+        assert!(
+            done.iter().any(|x| x.contains("paused")),
+            "a paused drain will not deliver them yet: {done:?}"
+        );
+        assert!(done.iter().any(|x| x.contains("record 0")), "{done:?}");
+        let pending = drain_lines(
+            DrainVerb::RetryStranded,
+            &json!({"ticket": 5, "completed": false}),
+            false,
+        );
+        assert!(
+            pending[0].contains("ticket 5") && pending[0].contains("not completed"),
+            "{pending:?}"
+        );
+    }
+
+    /// PR 6 review follow-up: a segment still inside its per-segment
+    /// cool-down (its `not_before`, spec §4.6) is skipped by the rescan, so
+    /// the requeued count can be lower than the stranded count. The human
+    /// output says so, and says when a second call can pick it up.
+    #[test]
+    fn retry_stranded_says_cooling_down_segments_are_skipped() {
+        for (observed, result) in [
+            (
+                true,
+                json!({"ticket": 1, "completed": true, "requeued": 0, "already_queued": 0}),
+            ),
+            (false, json!({"ticket": 2, "completed": false})),
+        ] {
+            let l = drain_lines(DrainVerb::RetryStranded, &result, observed);
+            assert!(
+                l.iter().any(|x| x == RETRY_COOL_DOWN_HINT),
+                "observed={observed}: {l:?}"
+            );
+        }
+        assert!(RETRY_COOL_DOWN_HINT.contains("cool-down"));
+        assert!(RETRY_COOL_DOWN_HINT.contains("skipped"));
+        assert!(RETRY_COOL_DOWN_HINT.contains("sink_retry_base_delay_ms"));
+        for verb in [DrainVerb::Pause, DrainVerb::Resume] {
+            let l = drain_lines(verb, &json!({"observed": true}), true);
+            assert!(
+                !l.iter().any(|x| x == RETRY_COOL_DOWN_HINT),
+                "{verb:?}: {l:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drain_run_exit_codes_against_a_daemon() {
+        use crate::admin_client::test_support::*;
+        let cases: [(DrainVerb, Option<u64>, serde_json::Value, u8); 4] = [
+            (
+                DrainVerb::Pause,
+                Some(5),
+                json!({"ok": true, "result": {"observed": true, "paused": true, "held": false, "warnings": []}}),
+                0,
+            ),
+            (
+                DrainVerb::Pause,
+                None,
+                json!({"ok": true, "result": {"observed": false, "paused": false, "held": false, "warnings": []}}),
+                4,
+            ),
+            (
+                DrainVerb::RetryStranded,
+                Some(1),
+                json!({"ok": true, "result": {"ticket": 9, "completed": false}}),
+                4,
+            ),
+            (
+                DrainVerb::Resume,
+                None,
+                json!({"ok": false, "error": {"code": "shutting_down", "message": "shutting down", "retryable": false}}),
+                1,
+            ),
+        ];
+        for (i, (verb, wait, body, code)) in cases.into_iter().enumerate() {
+            let dir = private_dir(&format!("dr{i}"));
+            let wab = dir.join("wab");
+            std::fs::create_dir_all(&wab).unwrap();
+            let inst = instance_for(&wab);
+            let h = fake_admin(&dir.join("a.sock"), move |req| {
+                let mut r = body.clone();
+                r["v"] = json!(1);
+                r["id"] = req["id"].clone();
+                r["instance"] = inst.clone();
+                r
+            });
+            let t =
+                crate::admin_client::resolve_admin_target(Some(&dir.join("a.sock")), Some(&wab));
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            assert_eq!(
+                drain_run(verb, wait, &t, false, &mut out, &mut err),
+                code,
+                "case {i}"
+            );
+            let req = h.join().unwrap();
+            assert_eq!(req["verb"], verb.wire());
+            assert_eq!(req["args"], drain_args(wait));
+            if verb == DrainVerb::Pause {
+                assert!(String::from_utf8(out).unwrap().contains(PAUSE_IN_MEMORY));
+            }
+            if code == 1 {
+                assert!(
+                    String::from_utf8(err)
+                        .unwrap()
+                        .contains("drain.resume failed: shutting_down")
+                );
+            }
+            std::fs::remove_dir_all(&dir).ok();
+        }
+        // No socket: 2, no offline fallback.
+        let t =
+            crate::admin_client::resolve_admin_target(Some(Path::new("/nonexistent/x.sock")), None);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert_eq!(
+            drain_run(DrainVerb::Pause, None, &t, false, &mut out, &mut err),
+            2
+        );
     }
 }

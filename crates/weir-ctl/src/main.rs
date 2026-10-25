@@ -130,6 +130,47 @@ enum Command {
         #[command(flatten)]
         admin: AdminArgs,
     },
+    /// Pause, resume or retry delivery on the running daemon (admin socket).
+    /// Exit: 0 done, 4 requested but not yet in effect, 1 error, 2 unreachable
+    /// or identity mismatch.
+    #[command(subcommand)]
+    Drain(DrainCommand),
+}
+
+/// Subcommands under `weir-ctl drain`.
+#[derive(Subcommand)]
+enum DrainCommand {
+    /// Stop delivery before the next commit batch; ingest keeps buffering.
+    /// In-memory only: a daemon restart resumes delivery.
+    Pause(DrainArgs),
+    /// Restart delivery after a pause.
+    Resume(DrainArgs),
+    /// Requeue segments that exhausted their retries now (each restarts from
+    /// record 0), instead of waiting for a healthy sink probe.
+    ///
+    /// Segments still inside their cool-down are skipped: a strand holds its
+    /// segment off for the backoff it would have served
+    /// (sink_retry_base_delay_ms doubled once per retry, so
+    /// sink_retry_base_delay_ms × 2^sink_max_retries, or the sink's
+    /// Retry-After, at most 300 s). Run it again once that has passed.
+    #[command(name = "retry-stranded")]
+    RetryStranded(DrainArgs),
+}
+
+#[derive(clap::Args)]
+struct DrainArgs {
+    /// Wait up to SECS (default 30, max 30) for the drain to act. Without it
+    /// the daemon's default wait applies. Exit 4 if it has not acted yet.
+    #[arg(
+        long,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "30",
+        value_name = "SECS"
+    )]
+    wait: Option<u64>,
+    #[command(flatten)]
+    admin: AdminArgs,
 }
 
 /// Where the daemon's admin socket is, and which wab_dir it must prove it serves.
@@ -400,6 +441,14 @@ fn main() -> ExitCode {
             );
         }
         Command::Reload { admin } => return admin_cmds::cmd_reload(&admin.target(), json),
+        Command::Drain(d) => {
+            let (verb, a) = match d {
+                DrainCommand::Pause(a) => (admin_cmds::DrainVerb::Pause, a),
+                DrainCommand::Resume(a) => (admin_cmds::DrainVerb::Resume, a),
+                DrainCommand::RetryStranded(a) => (admin_cmds::DrainVerb::RetryStranded, a),
+            };
+            return admin_cmds::cmd_drain(verb, a.wait, &a.admin.target(), json);
+        }
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -3521,6 +3570,56 @@ weir_sink_info{sink_type=\"http\"} 1
         assert_eq!(t.socket, Path::new("/run/weir/a.sock"));
         assert_eq!(t.origin, admin_client::AdminPathOrigin::Explicit);
         assert!(t.wab_dir_strict, "a named --wab-dir is compared strictly");
+    }
+
+    #[test]
+    fn drain_cli_parses_verbs_and_the_optional_wait() {
+        use clap::Parser;
+        let wait_of = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
+            Command::Drain(
+                DrainCommand::Pause(a) | DrainCommand::Resume(a) | DrainCommand::RetryStranded(a),
+            ) => a.wait,
+            _ => panic!("not a drain command"),
+        };
+        assert_eq!(wait_of(&["weir-ctl", "drain", "pause"]), None);
+        assert_eq!(wait_of(&["weir-ctl", "drain", "pause", "--wait"]), Some(30));
+        assert_eq!(
+            wait_of(&["weir-ctl", "drain", "resume", "--wait=5"]),
+            Some(5)
+        );
+        assert_eq!(
+            wait_of(&[
+                "weir-ctl",
+                "--json",
+                "drain",
+                "retry-stranded",
+                "--admin-socket",
+                "/a.sock"
+            ]),
+            None
+        );
+        assert!(
+            Cli::try_parse_from(["weir-ctl", "drain", "retry_stranded"]).is_err(),
+            "the CLI spelling is kebab-case"
+        );
+    }
+
+    /// PR 6 review follow-up: `weir-ctl drain retry-stranded --help` says that
+    /// segments still inside their cool-down are skipped, and when to retry.
+    #[test]
+    fn retry_stranded_help_names_the_cool_down_skip() {
+        use clap::CommandFactory;
+        let mut cli = Cli::command();
+        let help = cli
+            .find_subcommand_mut("drain")
+            .expect("drain subcommand")
+            .find_subcommand_mut("retry-stranded")
+            .expect("retry-stranded subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("cool-down"), "{help}");
+        assert!(help.contains("skipped"), "{help}");
+        assert!(help.contains("sink_retry_base_delay_ms"), "{help}");
     }
 
     #[test]
