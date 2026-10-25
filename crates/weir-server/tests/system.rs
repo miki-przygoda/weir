@@ -2984,6 +2984,180 @@ fn weir_ctl_beside_a_live_daemon_neither_sees_nor_disturbs_the_lock() {
     );
 }
 
+/// Foundations §16 system test 9: `weir-ctl status --json` via the admin
+/// socket, GET /status and offline (disk), and the exit agrees with /readyz:
+/// exit ∈ {0,3} ⇔ /readyz 200.
+#[test]
+fn weir_ctl_status_via_admin_http_and_offline_agrees_with_readyz() {
+    let mut srv = weir_server!("ctl_status").start();
+    let ctl = weir_ctl_binary();
+    let wab = srv.wab_dir.clone();
+    let addr = format!("127.0.0.1:{}", srv.metrics_port);
+    let run = |source: &str| -> (Option<i32>, serde_json::Value) {
+        let out = Command::new(&ctl)
+            .args([
+                "--json",
+                "status",
+                "--source",
+                source,
+                "--addr",
+                &addr,
+                "--wab-dir",
+            ])
+            .arg(&wab)
+            .env_remove("WEIR_ADMIN_SOCKET_PATH")
+            .output()
+            .expect("run weir-ctl");
+        let v = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "status --source {source}: {e}\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+        (out.status.code(), v)
+    };
+    let readyz_200 = || match ureq::get(&format!("http://{addr}/readyz")).call() {
+        Ok(r) => r.status() == 200,
+        Err(ureq::Error::Status(_, _)) => false,
+        Err(e) => panic!("/readyz: {e}"),
+    };
+
+    assert!(readyz_200(), "a started daemon is ready");
+
+    let (code, v) = run("admin");
+    assert_eq!(v["source"], "admin", "{v}");
+    assert_eq!(v["view"], "admin");
+    assert_eq!(v["schema"], "weir.status/v1");
+    assert!(
+        v["instance"]["wab_dir_ino"].is_u64(),
+        "the admin view names its wab_dir: {v}"
+    );
+    assert_eq!(
+        matches!(code, Some(0) | Some(3)),
+        readyz_200(),
+        "parity (admin): exit {code:?}"
+    );
+
+    let (code, v) = run("http");
+    assert_eq!(v["source"], "http");
+    assert_eq!(v["view"], "public");
+    assert!(
+        v.get("instance").is_none(),
+        "the public document carries no instance"
+    );
+    assert_eq!(
+        matches!(code, Some(0) | Some(3)),
+        readyz_200(),
+        "parity (http): exit {code:?}"
+    );
+
+    let (_, v) = run("auto");
+    assert_eq!(v["source"], "admin", "auto prefers the admin socket");
+
+    srv.sigterm();
+    let (code, v) = run("auto");
+    assert_eq!(
+        code,
+        Some(1),
+        "no daemon answers, disk facts printed: exit 1 (README Q9)\n{v}"
+    );
+    assert_eq!(v["source"], "disk");
+    assert_eq!(v["conditions"][0]["code"], "daemon_unreachable");
+    let tried: Vec<&str> = v["sources_tried"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["source"].as_str().unwrap())
+        .collect();
+    assert_eq!(tried, ["admin", "http", "metrics", "disk"]);
+    assert!(v["backlog"]["undelivered_segments"].is_u64());
+}
+
+/// The admin verbs end to end through the CLI against a real daemon: pause is
+/// observed and says it is in-memory only, status shows drain_paused, resume
+/// is observed, retry-stranded returns a ticket, reload on a non-TLS daemon is
+/// a noop (exit 0).
+#[test]
+fn weir_ctl_drain_and_reload_round_trip_over_the_admin_socket() {
+    let srv = weir_server!("ctl_drain").start();
+    let ctl = weir_ctl_binary();
+    let wab = srv.wab_dir.clone();
+    let run = |args: &[&str]| -> (Option<i32>, String, String) {
+        let out = Command::new(&ctl)
+            .args(args)
+            .arg("--wab-dir")
+            .arg(&wab)
+            .env_remove("WEIR_ADMIN_SOCKET_PATH")
+            .output()
+            .expect("run weir-ctl");
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+
+    let (code, out, err) = run(&["drain", "pause", "--wait=10"]);
+    assert_eq!(
+        code,
+        Some(0),
+        "pause observed within 10 s\nstdout: {out}\nstderr: {err}"
+    );
+    assert!(
+        out.contains("in-memory only; a daemon restart resumes delivery"),
+        "{out}"
+    );
+
+    let mut client = srv.client();
+    for i in 0..50 {
+        client
+            .push(format!("paused-{i}").as_bytes(), Durability::Durable)
+            .unwrap();
+    }
+    let (_, out, _) = run(&["--json", "status", "--source", "admin"]);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(
+        v["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["code"] == "drain_paused"),
+        "a paused drain shows drain_paused: {v}"
+    );
+
+    let (code, out, err) = run(&["drain", "resume", "--wait=10"]);
+    assert_eq!(
+        code,
+        Some(0),
+        "resume observed\nstdout: {out}\nstderr: {err}"
+    );
+
+    let (code, out, err) = run(&["drain", "retry-stranded", "--wait=10"]);
+    assert!(
+        matches!(code, Some(0) | Some(4)),
+        "exit {code:?}\nstdout: {out}\nstderr: {err}"
+    );
+    assert!(
+        out.contains("segments still inside their cool-down are skipped"),
+        "the PR 6 follow-up: the human output names the cool-down skip: {out}"
+    );
+
+    let (code, out, _) = run(&["--json", "drain", "retry-stranded", "--wait=10"]);
+    assert!(matches!(code, Some(0) | Some(4)), "exit {code:?}: {out}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(v.get("ticket").is_some(), "{v}");
+
+    let (code, out, err) = run(&["--json", "reload"]);
+    assert_eq!(
+        code,
+        Some(0),
+        "no TLS listener configured: noop, exit 0\nstdout: {out}\nstderr: {err}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["outcome"], "noop", "{v}");
+}
+
 /// Deletes the running daemon's `<wab_dir>/.weir.lock` and starts a second
 /// daemon B on the same `wab_dir` (its own socket, metrics port and log under
 /// a fresh temp dir, returned) until B holds the lock. Returns B still running.

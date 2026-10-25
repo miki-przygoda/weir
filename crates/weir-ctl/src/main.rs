@@ -1,21 +1,29 @@
 //! `weir-ctl` — admin and inspection CLI for the weir daemon.
 //!
-//! A thin operator tool over the daemon's existing surfaces: the Unix socket
-//! (HealthCheck / Push frames, via `weir-client`) and the Prometheus `/metrics`
-//! endpoint. No new daemon-side API is required.
+//! An operator tool over the daemon's surfaces: the producer Unix socket
+//! (HealthCheck / Push frames, via `weir-client`), the metrics listener
+//! (`/metrics`, and `/status` from 4.1), the admin Unix socket (`status`,
+//! `reload`, `drain *`, authenticated client-side before any answer is
+//! trusted), and the `wab_dir` on disk, read-only. weir-ctl never takes,
+//! probes or releases the daemon's `.weir.lock`.
 
-use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use weir_client::WeirClient;
 use weir_core::{Durability, Payload};
 use weir_wab::SegmentReader;
 
+mod admin_client;
+mod admin_cmds;
 mod attest;
+mod deadline;
+mod http;
+mod offline;
+mod status;
 
 /// Default daemon Unix socket. Override with `--socket`.
 const DEFAULT_SOCKET: &str = "/run/weir/weir.sock";
@@ -33,9 +41,9 @@ const DEFAULT_METRICS_ADDR: &str = "127.0.0.1:9185";
 struct Cli {
     /// Emit machine-readable JSON instead of the human table, for the
     /// read/inspect subcommands (health, metrics, segments, dl list,
-    /// quarantine list, quarantine inspect). The human output stays the
-    /// default. Mutating commands (push, dl drop/requeue) emit a small JSON
-    /// result object under --json.
+    /// quarantine list, quarantine inspect, status). The human output stays
+    /// the default. Mutating commands (push, dl drop/requeue, reload, drain)
+    /// emit a small JSON result object under --json.
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
@@ -76,6 +84,9 @@ enum Command {
         /// Path to the daemon's WAB directory (the `wab_dir` config value).
         #[arg(long, env = "WEIR_WAB_DIR")]
         wab_dir: PathBuf,
+        /// Also list every segment file (shard, name, state, bytes).
+        #[arg(long)]
+        files: bool,
     },
     /// Inspect and manage the dead-letter store.
     #[command(subcommand)]
@@ -94,6 +105,96 @@ enum Command {
     /// detectable, PROVIDED the head was observed off-host (see `attest head`).
     #[command(subcommand)]
     Attest(AttestCommand),
+    /// Can the daemon take ingest, and if not, why: conditions, drain, sink,
+    /// backlog, shards. Tries the admin socket, then GET /status, then
+    /// /metrics plus disk, then disk alone. Exit: 0 ready, 1 not ready
+    /// (including a dead daemon whose wab_dir was read from disk), 2 unreachable
+    /// with no offline facts, or identity mismatch, 3 ready with a critical
+    /// condition.
+    Status {
+        /// The daemon's admin socket. Default: derived from --wab-dir
+        /// (<parent>/<basename>.admin.sock), then /var/lib/weir/wab.admin.sock.
+        #[arg(long, env = "WEIR_ADMIN_SOCKET_PATH")]
+        admin_socket: Option<PathBuf>,
+        /// host:port of the daemon's metrics listener (serves /status and /metrics).
+        #[arg(long, default_value = DEFAULT_METRICS_ADDR)]
+        addr: String,
+        /// The daemon's wab_dir: the disk facts, the derived admin socket, and
+        /// the identity the daemon must prove.
+        #[arg(long, env = "WEIR_WAB_DIR")]
+        wab_dir: Option<PathBuf>,
+        /// Use only this source instead of the first that answers.
+        #[arg(long, value_enum, default_value_t = status::SourceMode::Auto)]
+        source: status::SourceMode,
+    },
+    /// Reload TLS certificates on the running daemon over its admin socket
+    /// (the same code path as SIGHUP). Exit: 0 applied or noop, 1 failed,
+    /// 2 no admin socket, no reply (it may have been applied) or identity
+    /// mismatch.
+    Reload {
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+    /// Pause, resume or retry delivery on the running daemon (admin socket).
+    /// Exit: 0 done, 4 requested but not yet in effect, 1 error, 2 unreachable,
+    /// no reply (it may have been applied) or identity mismatch.
+    #[command(subcommand)]
+    Drain(DrainCommand),
+}
+
+/// Subcommands under `weir-ctl drain`.
+#[derive(Subcommand)]
+enum DrainCommand {
+    /// Stop delivery before the next commit batch; ingest keeps buffering.
+    /// In-memory only: a daemon restart resumes delivery.
+    Pause(DrainArgs),
+    /// Restart delivery after a pause.
+    Resume(DrainArgs),
+    /// Requeue segments that exhausted their retries now (each restarts from
+    /// record 0), instead of waiting for a healthy sink probe.
+    ///
+    /// Segments still inside their cool-down are skipped: a strand holds its
+    /// segment off for the backoff it would have served
+    /// (sink_retry_base_delay_ms doubled once per retry, so
+    /// sink_retry_base_delay_ms × 2^sink_max_retries, or the sink's
+    /// Retry-After, at most 300 s). Run it again once that has passed.
+    #[command(name = "retry-stranded")]
+    RetryStranded(DrainArgs),
+}
+
+#[derive(clap::Args)]
+struct DrainArgs {
+    /// Wait up to SECS (default 30, max 30) for the drain to act. Without it
+    /// the daemon's default wait applies. Exit 4 if it has not acted yet.
+    #[arg(
+        long,
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "30",
+        value_name = "SECS"
+    )]
+    wait: Option<u64>,
+    #[command(flatten)]
+    admin: AdminArgs,
+}
+
+/// Where the daemon's admin socket is, and which wab_dir it must prove it serves.
+#[derive(clap::Args)]
+struct AdminArgs {
+    /// The daemon's admin socket. Default: derived from --wab-dir
+    /// (<parent>/<basename>.admin.sock), then /var/lib/weir/wab.admin.sock.
+    #[arg(long, env = "WEIR_ADMIN_SOCKET_PATH")]
+    admin_socket: Option<PathBuf>,
+    /// The daemon's wab_dir: derives the socket path, and the daemon's reply
+    /// must name this directory's inode.
+    #[arg(long, env = "WEIR_WAB_DIR")]
+    wab_dir: Option<PathBuf>,
+}
+
+impl AdminArgs {
+    fn target(&self) -> admin_client::AdminTarget {
+        admin_client::resolve_admin_target(self.admin_socket.as_deref(), self.wab_dir.as_deref())
+    }
 }
 
 /// Subcommands under `weir-ctl attest`.
@@ -290,7 +391,7 @@ fn main() -> ExitCode {
             socket,
         } => cmd_push(&socket, payload.as_bytes(), durability, json),
         Command::Metrics { addr, raw } => cmd_metrics(&addr, raw, json),
-        Command::Segments { wab_dir } => cmd_segments(&wab_dir, json),
+        Command::Segments { wab_dir, files } => cmd_segments(&wab_dir, files, json),
         Command::Dl(dl) => match dl {
             DlCommand::List { wab_dir } => cmd_dl_list(&wab_dir, json),
             DlCommand::Drop { wab_dir, yes } => cmd_dl_drop(&wab_dir, yes, json),
@@ -328,6 +429,30 @@ fn main() -> ExitCode {
             // express — it returns its own ExitCode directly instead of
             // flowing through `result`.
             return attest::cmd_attest_verify(&wab_dir, shard, metrics_file.as_deref(), json);
+        }
+        Command::Status {
+            admin_socket,
+            addr,
+            wab_dir,
+            source,
+        } => {
+            // Its own exit table (0/1/2/3), like `attest verify`.
+            return status::cmd_status(
+                admin_socket.as_deref(),
+                &addr,
+                wab_dir.as_deref(),
+                source,
+                json,
+            );
+        }
+        Command::Reload { admin } => return admin_cmds::cmd_reload(&admin.target(), json),
+        Command::Drain(d) => {
+            let (verb, a) = match d {
+                DrainCommand::Pause(a) => (admin_cmds::DrainVerb::Pause, a),
+                DrainCommand::Resume(a) => (admin_cmds::DrainVerb::Resume, a),
+                DrainCommand::RetryStranded(a) => (admin_cmds::DrainVerb::RetryStranded, a),
+            };
+            return admin_cmds::cmd_drain(verb, a.wait, &a.admin.target(), json);
         }
     };
     match result {
@@ -475,7 +600,8 @@ struct ShardStat {
 /// (`.wab.confirmed` > `.wab.sealed` > `.wab`, longest-suffix first so the bare
 /// `.wab` test can't shadow the others) and rolling up the dead-letter sibling
 /// through the same `dl_segments` filter the `dl` commands use. Returns the
-/// shards (sorted by name) plus the dead-letter `(file_count, bytes)`. Factored
+/// shards (sorted by name) plus the dead-letter `(file_count, bytes)`; any other
+/// non-shard directory (`quarantine/`, see `is_shard_dir_name`) is skipped. Factored
 /// out of `cmd_segments` so this load-bearing accounting is unit-testable
 /// without capturing stdout. Note: `confirmed` markers contribute 0 bytes (only
 /// active + sealed segments hold live data).
@@ -508,6 +634,11 @@ fn scan_segments(wab_dir: &Path) -> Result<(Vec<ShardStat>, u64, u64), String> {
                 dl_files += segs.len() as u64;
                 dl_bytes += segs.iter().map(|(_, s)| *s).sum::<u64>();
             }
+            continue;
+        }
+        // quarantine/ holds forensic copies (see `quarantine list`); counting it
+        // as a shard inflated the shard table and its byte total.
+        if !is_shard_dir_name(&name) {
             continue;
         }
 
@@ -545,11 +676,100 @@ fn scan_segments(wab_dir: &Path) -> Result<(Vec<ShardStat>, u64, u64), String> {
     Ok((shards, dl_files, dl_bytes))
 }
 
-fn cmd_segments(wab_dir: &Path, json: bool) -> Result<(), String> {
+/// Directories under `wab_dir` that are NOT shards: the dead-letter store
+/// (rolled up separately) and quarantine (forensic copies, see `quarantine list`).
+fn is_shard_dir_name(name: &str) -> bool {
+    name != "dead_letter" && name != "quarantine"
+}
+
+/// `.wab.confirmed` > `.wab.sealed` > `.wab`, longest suffix first.
+fn classify_segment_name(name: &str) -> Option<&'static str> {
+    use weir_wab::format::{EXT_ACTIVE, EXT_CONFIRMED, EXT_SEALED};
+    if name.ends_with(EXT_CONFIRMED) {
+        Some("confirmed")
+    } else if name.ends_with(EXT_SEALED) {
+        Some("sealed")
+    } else if name.ends_with(EXT_ACTIVE) {
+        Some("active")
+    } else {
+        None
+    }
+}
+
+/// One segment file for `segments --files`.
+struct SegFile {
+    shard: String,
+    name: String,
+    state: &'static str,
+    bytes: u64,
+}
+
+/// Every segment file in every shard directory, sorted by (shard, name).
+/// Read-only; it never touches `.weir.lock`.
+fn scan_segment_files(wab_dir: &Path) -> Result<Vec<SegFile>, String> {
+    let entries =
+        std::fs::read_dir(wab_dir).map_err(|e| format!("read {}: {e}", wab_dir.display()))?;
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(shard) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        if !path.is_dir() || !is_shard_dir_name(&shard) {
+            continue;
+        }
+        let Ok(files) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        for f in files.flatten() {
+            let Some(name) = f.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let Some(state) = classify_segment_name(&name) else {
+                continue;
+            };
+            let bytes = f.metadata().map(|m| m.len()).unwrap_or(0);
+            out.push(SegFile {
+                shard: shard.clone(),
+                name,
+                state,
+                bytes,
+            });
+        }
+    }
+    out.sort_by(|a, b| {
+        (a.shard.as_str(), a.name.as_str()).cmp(&(b.shard.as_str(), b.name.as_str()))
+    });
+    Ok(out)
+}
+
+/// `segments --json --files`: one `{shard, name, state, bytes}` per file.
+fn segment_files_json(files: &[SegFile]) -> serde_json::Value {
+    serde_json::Value::Array(
+        files
+            .iter()
+            .map(|f| {
+                serde_json::json!({
+                    "shard": f.shard, "name": f.name, "state": f.state, "bytes": f.bytes,
+                })
+            })
+            .collect(),
+    )
+}
+
+fn cmd_segments(wab_dir: &Path, files: bool, json: bool) -> Result<(), String> {
     let (shards, dl_files, dl_bytes) = scan_segments(wab_dir)?;
 
     if json {
-        print_json(&segments_json(wab_dir, &shards, dl_files, dl_bytes));
+        let mut v = segments_json(wab_dir, &shards, dl_files, dl_bytes);
+        if files {
+            v["files"] = segment_files_json(&scan_segment_files(wab_dir)?);
+        }
+        print_json(&v);
         return Ok(());
     }
 
@@ -603,6 +823,18 @@ fn cmd_segments(wab_dir: &Path, json: bool) -> Result<(), String> {
             plural(dl_files, "file", "files"),
             fmt_bytes(dl_bytes)
         );
+    }
+    if files {
+        println!();
+        for f in scan_segment_files(wab_dir)? {
+            println!(
+                "{:<10} {:<34} {:<10} {:>12}",
+                f.shard,
+                f.name,
+                f.state,
+                fmt_bytes(f.bytes)
+            );
+        }
     }
     Ok(())
 }
@@ -2187,21 +2419,7 @@ fn cmd_quarantine_requeue(
 /// Minimal HTTP/1.0 GET of `/metrics` — keeps weir-ctl free of an HTTP client
 /// dependency (the daemon's metrics server speaks plain HTTP/1.0).
 fn scrape(addr: &str) -> Result<String, String> {
-    let mut stream = TcpStream::connect(addr).map_err(|e| format!("connect {addr}: {e}"))?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .map_err(|e| format!("set timeout: {e}"))?;
-    stream
-        .write_all(b"GET /metrics HTTP/1.0\r\nHost: localhost\r\n\r\n")
-        .map_err(|e| format!("write GET: {e}"))?;
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .map_err(|e| format!("read /metrics: {e}"))?;
-    match response.split_once("\r\n\r\n") {
-        Some((_head, body)) => Ok(body.to_string()),
-        None => Ok(response),
-    }
+    http::http_get(addr, "/metrics").map(|r| r.body)
 }
 
 /// Sums every sample whose line starts with `prefix` (handles label sets, e.g.
@@ -2236,6 +2454,14 @@ struct MetricsSummary {
     wab_bytes: u64,
     sink_health: String,
     sink_type: String,
+    /// `weir_drain_state`'s active label (`draining`, `retrying_transient`,
+    /// `blocked_dead_letter_full`, `stopped`), when the family is present.
+    drain_state: Option<String>,
+    /// Ids of shards whose `weir_wab_shard_up` is 0. `None` means a pre-4.1
+    /// daemon (no such family), which is NOT the same as "none offline".
+    offline_shards: Option<Vec<u16>>,
+    /// `weir_ready` (4.1+).
+    ready: Option<bool>,
 }
 
 /// Parses the metric values `print_summary` and `summary_json` both need from a
@@ -2263,6 +2489,22 @@ fn parse_summary(body: &str) -> MetricsSummary {
         // Health flags worth surfacing loudly.
         sink_health: active_label(body, "weir_sink_health", "state").unwrap_or_else(|| "?".into()),
         sink_type: active_label(body, "weir_sink_info", "sink_type").unwrap_or_else(|| "?".into()),
+        drain_state: active_label(body, "weir_drain_state", "state"),
+        offline_shards: {
+            let up = labelled_samples(body, "weir_wab_shard_up");
+            if up.is_empty() {
+                None
+            } else {
+                let mut ids: Vec<u16> = up
+                    .iter()
+                    .filter(|(_, v)| *v == 0.0)
+                    .filter_map(|(l, _)| l.get("shard")?.parse().ok())
+                    .collect();
+                ids.sort_unstable();
+                Some(ids)
+            }
+        },
+        ready: get_metric(body, "weir_ready").map(|v| v == 1.0),
     }
 }
 
@@ -2283,16 +2525,52 @@ fn summary_json(body: &str) -> serde_json::Value {
         "sink_health": s.sink_health,
         "flusher_panics": s.panics,
         "fsync_failures": s.fsync_failures,
+        "drain_state": s.drain_state,
+        "offline_shards": s.offline_shards,
+        "ready": s.ready,
     })
 }
 
 /// The durability-hazard / info warnings for a metrics summary, as printable
 /// lines (in priority order). Pure — no I/O — so this decision logic, the CLI's
 /// primary operator-foolproofing against silent data loss, is unit-testable
-/// without capturing stdout: noop ⇒ acked-then-DISCARDED, flusher panics ⇒ shard
-/// offline, fsync failures ⇒ DURABILITY HAZARD, plus a nacked-records info line.
+/// without capturing stdout. A STOPPED or BLOCKED drain leads (a stopped drain
+/// also makes sink_health stale), then the shards `weir_wab_shard_up` reports
+/// offline, noop ⇒ acked-then-DISCARDED, flusher panics, fsync failures ⇒
+/// DURABILITY HAZARD, plus a nacked-records info line. The panic line is a
+/// warning only against a pre-4.1 daemon (no `weir_wab_shard_up`): there the
+/// lifetime counter is the only offline signal, while a 4.1 daemon respawns
+/// flushers and reports each shard's state directly, so it becomes info.
 fn summary_warnings(s: &MetricsSummary) -> Vec<String> {
     let mut out = Vec::new();
+    // A stopped or blocked drain explains most other symptoms, so it leads.
+    match s.drain_state.as_deref() {
+        Some("stopped") => {
+            out.push(
+                "⚠ drain: STOPPED — nothing is delivered and the WAB grows; restart the \
+                 daemon to resume delivery"
+                    .to_string(),
+            );
+            out.push(
+                "⚠ sink_health is stale while the drain is stopped (no health probe runs)"
+                    .to_string(),
+            );
+        }
+        Some("blocked_dead_letter_full") => out.push(
+            "⚠ drain: BLOCKED — dead_letter/ is full; free space (weir-ctl dl requeue / dl \
+             drop) or raise dead_letter_max_bytes"
+                .to_string(),
+        ),
+        _ => {}
+    }
+    if let Some(off) = &s.offline_shards
+        && !off.is_empty()
+    {
+        out.push(format!(
+            "⚠ shard(s) offline: {} — new connections avoid them; restart to recover",
+            join_ids(off)
+        ));
+    }
     if s.sink_type == "noop" {
         out.push(
             "\n⚠ sink: noop — records are acked then DISCARDED, not delivered downstream. \
@@ -2301,10 +2579,23 @@ fn summary_warnings(s: &MetricsSummary) -> Vec<String> {
         );
     }
     if s.panics > 0 {
-        out.push(format!(
-            "\n⚠ flusher {} — a shard is offline until restart",
-            plural(s.panics, "panic", "panics")
-        ));
+        match &s.offline_shards {
+            // 4.1+: the shard list above is the truth; a panic counter alone is
+            // history (the supervisor respawns flushers).
+            Some(off) if off.is_empty() => out.push(format!(
+                "ℹ flusher {} since start (respawned; every shard is up)",
+                plural(s.panics, "panic", "panics")
+            )),
+            Some(_) => out.push(format!(
+                "ℹ flusher {} since start (see the offline shard list above)",
+                plural(s.panics, "panic", "panics")
+            )),
+            // Pre-4.1 daemon (no `weir_wab_shard_up`): unchanged wording.
+            None => out.push(format!(
+                "\n⚠ flusher {} — a shard is offline until restart",
+                plural(s.panics, "panic", "panics")
+            )),
+        }
     }
     if s.fsync_failures > 0 {
         out.push(format!(
@@ -2340,6 +2631,12 @@ fn print_summary(body: &str) {
     println!(
         "{:<10} type: {}  health: {}",
         "sink", s.sink_type, s.sink_health
+    );
+    println!(
+        "{:<10} state: {}  ready: {}",
+        "drain",
+        s.drain_state.as_deref().unwrap_or("?"),
+        s.ready.map_or("?", |r| if r { "yes" } else { "no" })
     );
     println!(
         "{:<10} {} on disk",
@@ -2379,6 +2676,70 @@ fn active_label(body: &str, metric: &str, label: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Every labelled sample of exactly `metric` as `(labels, value)`. The family
+/// must match exactly: `weir_wab_shard_up{` never matches
+/// `weir_wab_shard_up_extra{`. A trailing OpenMetrics timestamp is ignored.
+fn labelled_samples(body: &str, metric: &str) -> Vec<(BTreeMap<String, String>, f64)> {
+    let needle = format!("{metric}{{");
+    let mut out = Vec::new();
+    for line in body.lines() {
+        let Some(rest) = line.strip_prefix(needle.as_str()) else {
+            continue;
+        };
+        let Some(close) = rest.rfind('}') else {
+            continue;
+        };
+        let (labels, tail) = rest.split_at(close);
+        let Some(value) = tail[1..]
+            .split_whitespace()
+            .next()
+            .and_then(|v| v.parse::<f64>().ok())
+        else {
+            continue;
+        };
+        out.push((parse_label_set(labels), value));
+    }
+    out
+}
+
+/// Parses `k1="v1",k2="v2"` with `\"`, `\\` and `\n` escapes.
+fn parse_label_set(src: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let mut rest = src;
+    while let Some(eq) = rest.find("=\"") {
+        let key = rest[..eq].trim_start_matches(',').trim().to_string();
+        let after = &rest[eq + 2..];
+        let mut val = String::new();
+        let mut end = after.len();
+        let mut chars = after.char_indices();
+        while let Some((i, c)) = chars.next() {
+            match c {
+                '\\' => {
+                    if let Some((_, n)) = chars.next() {
+                        val.push(if n == 'n' { '\n' } else { n });
+                    }
+                }
+                '"' => {
+                    end = i + 1;
+                    break;
+                }
+                _ => val.push(c),
+            }
+        }
+        out.insert(key, val);
+        rest = &after[end..];
+    }
+    out
+}
+
+/// `1, 3, 7`: shard ids for a warning line.
+fn join_ids(ids: &[u16]) -> String {
+    ids.iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[cfg(test)]
@@ -3157,6 +3518,129 @@ weir_sink_info{sink_type=\"http\"} 1
     }
 
     #[test]
+    fn status_cli_parses_every_source_and_defaults_to_auto() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from(["weir-ctl", "status"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Status {
+                source: status::SourceMode::Auto,
+                ..
+            }
+        ));
+        for (arg, mode) in [
+            ("admin", status::SourceMode::Admin),
+            ("http", status::SourceMode::Http),
+            ("metrics", status::SourceMode::Metrics),
+            ("disk", status::SourceMode::Disk),
+        ] {
+            let cli = Cli::try_parse_from([
+                "weir-ctl",
+                "--json",
+                "status",
+                "--source",
+                arg,
+                "--wab-dir",
+                "/x",
+            ])
+            .unwrap();
+            assert!(
+                matches!(cli.command, Command::Status { source, .. } if source == mode),
+                "{arg}"
+            );
+        }
+        assert!(Cli::try_parse_from(["weir-ctl", "status", "--source", "carrier-pigeon"]).is_err());
+    }
+
+    #[test]
+    fn reload_cli_takes_the_admin_socket_and_wab_dir() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "weir-ctl",
+            "reload",
+            "--admin-socket",
+            "/run/weir/a.sock",
+            "--wab-dir",
+            "/srv/wab",
+        ])
+        .unwrap();
+        let Command::Reload { admin } = cli.command else {
+            panic!("not reload");
+        };
+        assert_eq!(
+            admin.admin_socket.as_deref(),
+            Some(Path::new("/run/weir/a.sock"))
+        );
+        let t = admin.target();
+        assert_eq!(t.socket, Path::new("/run/weir/a.sock"));
+        assert_eq!(t.origin, admin_client::AdminPathOrigin::Explicit);
+        assert!(t.wab_dir_strict, "a named --wab-dir is compared strictly");
+    }
+
+    #[test]
+    fn drain_cli_parses_verbs_and_the_optional_wait() {
+        use clap::Parser;
+        let wait_of = |args: &[&str]| match Cli::try_parse_from(args).unwrap().command {
+            Command::Drain(
+                DrainCommand::Pause(a) | DrainCommand::Resume(a) | DrainCommand::RetryStranded(a),
+            ) => a.wait,
+            _ => panic!("not a drain command"),
+        };
+        assert_eq!(wait_of(&["weir-ctl", "drain", "pause"]), None);
+        assert_eq!(wait_of(&["weir-ctl", "drain", "pause", "--wait"]), Some(30));
+        assert_eq!(
+            wait_of(&["weir-ctl", "drain", "resume", "--wait=5"]),
+            Some(5)
+        );
+        assert_eq!(
+            wait_of(&[
+                "weir-ctl",
+                "--json",
+                "drain",
+                "retry-stranded",
+                "--admin-socket",
+                "/a.sock"
+            ]),
+            None
+        );
+        assert!(
+            Cli::try_parse_from(["weir-ctl", "drain", "retry_stranded"]).is_err(),
+            "the CLI spelling is kebab-case"
+        );
+    }
+
+    /// PR 6 review follow-up: `weir-ctl drain retry-stranded --help` says that
+    /// segments still inside their cool-down are skipped, and when to retry.
+    #[test]
+    fn retry_stranded_help_names_the_cool_down_skip() {
+        use clap::CommandFactory;
+        let mut cli = Cli::command();
+        let help = cli
+            .find_subcommand_mut("drain")
+            .expect("drain subcommand")
+            .find_subcommand_mut("retry-stranded")
+            .expect("retry-stranded subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("cool-down"), "{help}");
+        assert!(help.contains("skipped"), "{help}");
+        assert!(help.contains("sink_retry_base_delay_ms"), "{help}");
+    }
+
+    #[test]
+    fn readme_names_every_subcommand() {
+        use clap::CommandFactory;
+        let readme = include_str!("../README.md");
+        for sub in Cli::command().get_subcommands() {
+            let name = sub.get_name();
+            assert!(
+                readme.contains(&format!("`{name}`")),
+                "crates/weir-ctl/README.md must name the `{name}` subcommand"
+            );
+        }
+    }
+
+    #[test]
     fn cli_definition_is_valid() {
         // clap's own structural self-check (catches conflicting flags, bad
         // value_parsers, duplicate names) — a compile-adjacent guard on the CLI.
@@ -3182,6 +3666,9 @@ weir_sink_info{sink_type=\"http\"} 1
             wab_bytes: 0,
             sink_health: "healthy".into(),
             sink_type: sink_type.into(),
+            drain_state: None,
+            offline_shards: None,
+            ready: None,
         }
     }
 
@@ -3212,6 +3699,189 @@ weir_sink_info{sink_type=\"http\"} 1
         // nacked records → the info line.
         let nacked = summary_warnings(&summary_with("http", 5, 0, 0));
         assert!(nacked.iter().any(|w| w.contains("nacked")), "{nacked:?}");
+    }
+
+    #[test]
+    fn labelled_samples_parse_label_sets_and_match_the_family_exactly() {
+        let body = "\
+weir_wab_shard_up{shard=\"0\"} 1
+weir_wab_shard_up{shard=\"1\"} 0
+weir_wab_shard_up_extra{shard=\"9\"} 0
+weir_condition_active{code=\"drain_paused\",severity=\"warning\"} 1
+weir_condition_active{severity=\"critical\",code=\"shard_offline\"} 0 1700000000000
+";
+        let up = labelled_samples(body, "weir_wab_shard_up");
+        assert_eq!(up.len(), 2, "a longer family name must not match: {up:?}");
+        assert_eq!(up[1].0["shard"], "1");
+        assert_eq!(up[1].1, 0.0);
+        let cond = labelled_samples(body, "weir_condition_active");
+        assert_eq!(cond[0].0["code"], "drain_paused");
+        assert_eq!(cond[0].0["severity"], "warning");
+        // Label order is free and a trailing timestamp is ignored.
+        assert_eq!(cond[1].0["code"], "shard_offline");
+        assert_eq!(cond[1].1, 0.0);
+        assert_eq!(
+            parse_label_set(r#"a="x\"y",b="z""#)
+                .get("a")
+                .map(String::as_str),
+            Some("x\"y")
+        );
+    }
+
+    #[test]
+    fn metrics_summary_json_gains_drain_state_offline_shards_and_ready() {
+        let body = "\
+weir_records_accepted_total{tier=\"durable\"} 5
+weir_drain_state{state=\"draining\"} 0
+weir_drain_state{state=\"stopped\"} 1
+weir_wab_shard_up{shard=\"0\"} 1
+weir_wab_shard_up{shard=\"2\"} 0
+weir_wab_shard_up{shard=\"1\"} 0
+weir_ready 1
+";
+        let v = round_trip(&summary_json(body));
+        assert_eq!(v["drain_state"], serde_json::json!("stopped"));
+        assert_eq!(
+            v["offline_shards"],
+            serde_json::json!([1, 2]),
+            "sorted ids of shards at 0"
+        );
+        assert_eq!(v["ready"], serde_json::json!(true));
+        // A pre-4.1 exposition: the new keys exist and are null, not absent.
+        let old = round_trip(&summary_json(
+            "weir_records_accepted_total{tier=\"durable\"} 5\n",
+        ));
+        for key in ["drain_state", "offline_shards", "ready"] {
+            assert!(
+                old.get(key).is_some_and(|x| x.is_null()),
+                "{key} must be null on a 4.0 daemon"
+            );
+        }
+        // Every pre-existing key is still there.
+        for key in [
+            "accepted",
+            "ack",
+            "nack",
+            "fsync_avg_ms",
+            "queue_depth",
+            "wab_bytes_on_disk",
+            "dead_letter_bytes_on_disk",
+            "sink_type",
+            "sink_health",
+            "flusher_panics",
+            "fsync_failures",
+        ] {
+            assert!(old.get(key).is_some(), "existing key {key} must not move");
+        }
+    }
+
+    #[test]
+    fn summary_warnings_put_a_stopped_or_blocked_drain_first() {
+        let mut s = summary_with("noop", 5, 0, 1);
+        s.drain_state = Some("stopped".into());
+        let w = summary_warnings(&s);
+        assert!(w[0].contains("STOPPED"), "{w:?}");
+        assert!(
+            w[1].contains("sink_health is stale while the drain is stopped"),
+            "{w:?}"
+        );
+        assert!(
+            w.iter().any(|l| l.contains("DISCARDED")),
+            "the noop warning still follows: {w:?}"
+        );
+
+        let mut b = summary_with("http", 0, 0, 0);
+        b.drain_state = Some("blocked_dead_letter_full".into());
+        let w = summary_warnings(&b);
+        assert!(w[0].contains("BLOCKED"), "{w:?}");
+        assert!(
+            !w.iter().any(|l| l.contains("stale")),
+            "blocked is not stopped: {w:?}"
+        );
+    }
+
+    #[test]
+    fn summary_warnings_list_offline_shards_and_soften_recovered_panics() {
+        let mut s = summary_with("http", 0, 2, 0);
+        s.offline_shards = Some(vec![1, 3]);
+        let w = summary_warnings(&s);
+        assert!(w.iter().any(|l| l.contains("offline: 1, 3")), "{w:?}");
+
+        // 4.1 daemon, panics recovered, every shard up: info, not "offline".
+        let mut ok = summary_with("http", 0, 2, 0);
+        ok.offline_shards = Some(vec![]);
+        let w = summary_warnings(&ok);
+        assert!(!w.iter().any(|l| l.contains("offline")), "{w:?}");
+        assert!(
+            w.iter()
+                .any(|l| l.contains("2 panics") && l.contains("every shard is up")),
+            "{w:?}"
+        );
+    }
+
+    #[test]
+    fn scan_segments_does_not_count_quarantine_as_a_shard() {
+        let dir = std::env::temp_dir().join(format!("weir_ctl_scan_q_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let shard = dir.join("shard_00");
+        std::fs::create_dir_all(&shard).unwrap();
+        std::fs::write(shard.join("seg_00000001.wab.sealed"), vec![0u8; 10]).unwrap();
+        let q = dir.join("quarantine");
+        std::fs::create_dir_all(&q).unwrap();
+        std::fs::write(q.join("shard_00__seg_00000009.wab.sealed"), vec![0u8; 77]).unwrap();
+
+        let (shards, _, _) = scan_segments(&dir).unwrap();
+        let names: Vec<&str> = shards.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["shard_00"], "quarantine/ is not a shard");
+        assert_eq!(shards[0].bytes, 10, "quarantined bytes are not shard bytes");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn segment_files_lists_each_segment_with_state_and_size() {
+        let dir = std::env::temp_dir().join(format!("weir_ctl_files_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let shard = dir.join("shard_01");
+        std::fs::create_dir_all(&shard).unwrap();
+        std::fs::write(shard.join("seg_00000003.wab"), vec![0u8; 5]).unwrap();
+        std::fs::write(shard.join("seg_00000002.wab.sealed"), vec![0u8; 7]).unwrap();
+        std::fs::write(shard.join("seg_00000001.wab.confirmed"), vec![0u8; 36]).unwrap();
+        std::fs::write(shard.join("seg_00000000.wab.confirmed.tmp"), vec![0u8; 36]).unwrap();
+        std::fs::create_dir_all(dir.join("quarantine")).unwrap();
+        std::fs::create_dir_all(dir.join("dead_letter")).unwrap();
+        std::fs::write(dir.join(".weir.lock"), b"pid=1\n").unwrap();
+
+        let files = scan_segment_files(&dir).unwrap();
+        let rows: Vec<(&str, &str, &str, u64)> = files
+            .iter()
+            .map(|f| (f.shard.as_str(), f.name.as_str(), f.state, f.bytes))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("shard_01", "seg_00000001.wab.confirmed", "confirmed", 36),
+                ("shard_01", "seg_00000002.wab.sealed", "sealed", 7),
+                ("shard_01", "seg_00000003.wab", "active", 5),
+            ],
+            "sorted by shard then name; the .tmp, the lock and non-shard dirs are skipped"
+        );
+        let v = round_trip(&segment_files_json(&files));
+        assert_eq!(v[1]["state"], serde_json::json!("sealed"));
+        assert_eq!(v[1]["bytes"], serde_json::json!(7));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn segments_cli_accepts_files_flag() {
+        use clap::Parser;
+        let cli =
+            Cli::try_parse_from(["weir-ctl", "segments", "--wab-dir", "/x", "--files"]).unwrap();
+        assert!(matches!(cli.command, Command::Segments { files: true, .. }));
+        let cli = Cli::try_parse_from(["weir-ctl", "segments", "--wab-dir", "/x"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Segments { files: false, .. }
+        ));
     }
 
     #[test]
@@ -3275,10 +3945,36 @@ weir_sink_info{sink_type=\"http\"} 1
     /// crate's sources may call flock (or lockf / fcntl record locks).
     #[test]
     fn weir_ctl_never_takes_the_wab_dir_lock() {
-        const SOURCES: [(&str, &str); 2] = [
-            ("main.rs", include_str!("main.rs")),
-            ("attest.rs", include_str!("attest.rs")),
-        ];
+        // Every source file, not a fixed list: a new module must not slip past.
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        let mut stack = vec![src];
+        while let Some(dir) = stack.pop() {
+            for e in std::fs::read_dir(&dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    files.push(p);
+                }
+            }
+        }
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        for required in [
+            "main.rs",
+            "attest.rs",
+            "offline.rs",
+            "admin_client.rs",
+            "status.rs",
+        ] {
+            assert!(
+                names.iter().any(|n| n == required),
+                "the lock guard must see {required}; it saw {names:?}"
+            );
+        }
         // Split so this test's own source does not match itself.
         let needles = [
             ["fl", "ock("].concat(),
@@ -3288,11 +3984,13 @@ weir_sink_info{sink_type=\"http\"} 1
             [".try_", "lock("].concat(),
             [".lock_", "shared("].concat(),
         ];
-        for (name, src) in SOURCES {
+        for path in &files {
+            let text = std::fs::read_to_string(path).unwrap();
             for needle in &needles {
                 assert!(
-                    !src.contains(needle.as_str()),
-                    "weir-ctl {name} contains {needle:?}: weir-ctl must never lock the wab_dir"
+                    !text.contains(needle.as_str()),
+                    "weir-ctl {} contains {needle:?}: weir-ctl must never lock the wab_dir",
+                    path.display()
                 );
             }
         }

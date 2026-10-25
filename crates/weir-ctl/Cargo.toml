@@ -32,6 +32,15 @@ clap = { version = "4", features = ["derive", "env"] }
 # a binary (no public API), so the runtime dep cost is fine; serde_json is
 # already in the workspace lock tree as a transitive dep.
 serde_json = "1"
+# The shared evaluator, status types and admin protocol helpers (spec §5.1);
+# weir-ctl must evaluate offline without depending on weir-server.
+weir-status = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# Peer credentials of the admin socket (SO_PEERCRED / getpeereid) and geteuid,
+# for the client-side identity check (spec §11). std's UnixStream::peer_cred is
+# still unstable at MSRV 1.88; libc is already in the lock tree via weir-server.
+libc = "0.2"
 
 [dev-dependencies]
 # Test-only: the requeue tests hand-build dead-letter segment fixtures and need
