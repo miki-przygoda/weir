@@ -2731,6 +2731,7 @@ dependencies = [
  "weir-attest",
  "weir-client",
  "weir-core",
+ "weir-status",
  "weir-wab",
 ]
 

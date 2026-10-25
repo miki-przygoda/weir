@@ -32,6 +32,9 @@ clap = { version = "4", features = ["derive", "env"] }
 # a binary (no public API), so the runtime dep cost is fine; serde_json is
 # already in the workspace lock tree as a transitive dep.
 serde_json = "1"
+# The shared evaluator, status types and admin protocol helpers (spec §5.1);
+# weir-ctl must evaluate offline without depending on weir-server.
+weir-status = { workspace = true }
 
 [dev-dependencies]
 # Test-only: the requeue tests hand-build dead-letter segment fixtures and need
