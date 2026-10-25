@@ -4,6 +4,7 @@
 //! (HealthCheck / Push frames, via `weir-client`) and the Prometheus `/metrics`
 //! endpoint. No new daemon-side API is required.
 
+use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -2239,6 +2240,14 @@ struct MetricsSummary {
     wab_bytes: u64,
     sink_health: String,
     sink_type: String,
+    /// `weir_drain_state`'s active label (`draining`, `retrying_transient`,
+    /// `blocked_dead_letter_full`, `stopped`), when the family is present.
+    drain_state: Option<String>,
+    /// Ids of shards whose `weir_wab_shard_up` is 0. `None` means a pre-4.1
+    /// daemon (no such family), which is NOT the same as "none offline".
+    offline_shards: Option<Vec<u16>>,
+    /// `weir_ready` (4.1+).
+    ready: Option<bool>,
 }
 
 /// Parses the metric values `print_summary` and `summary_json` both need from a
@@ -2266,6 +2275,22 @@ fn parse_summary(body: &str) -> MetricsSummary {
         // Health flags worth surfacing loudly.
         sink_health: active_label(body, "weir_sink_health", "state").unwrap_or_else(|| "?".into()),
         sink_type: active_label(body, "weir_sink_info", "sink_type").unwrap_or_else(|| "?".into()),
+        drain_state: active_label(body, "weir_drain_state", "state"),
+        offline_shards: {
+            let up = labelled_samples(body, "weir_wab_shard_up");
+            if up.is_empty() {
+                None
+            } else {
+                let mut ids: Vec<u16> = up
+                    .iter()
+                    .filter(|(_, v)| *v == 0.0)
+                    .filter_map(|(l, _)| l.get("shard")?.parse().ok())
+                    .collect();
+                ids.sort_unstable();
+                Some(ids)
+            }
+        },
+        ready: get_metric(body, "weir_ready").map(|v| v == 1.0),
     }
 }
 
@@ -2286,16 +2311,52 @@ fn summary_json(body: &str) -> serde_json::Value {
         "sink_health": s.sink_health,
         "flusher_panics": s.panics,
         "fsync_failures": s.fsync_failures,
+        "drain_state": s.drain_state,
+        "offline_shards": s.offline_shards,
+        "ready": s.ready,
     })
 }
 
 /// The durability-hazard / info warnings for a metrics summary, as printable
 /// lines (in priority order). Pure — no I/O — so this decision logic, the CLI's
 /// primary operator-foolproofing against silent data loss, is unit-testable
-/// without capturing stdout: noop ⇒ acked-then-DISCARDED, flusher panics ⇒ shard
-/// offline, fsync failures ⇒ DURABILITY HAZARD, plus a nacked-records info line.
+/// without capturing stdout. A STOPPED or BLOCKED drain leads (a stopped drain
+/// also makes sink_health stale), then the shards `weir_wab_shard_up` reports
+/// offline, noop ⇒ acked-then-DISCARDED, flusher panics, fsync failures ⇒
+/// DURABILITY HAZARD, plus a nacked-records info line. The panic line is a
+/// warning only against a pre-4.1 daemon (no `weir_wab_shard_up`): there the
+/// lifetime counter is the only offline signal, while a 4.1 daemon respawns
+/// flushers and reports each shard's state directly, so it becomes info.
 fn summary_warnings(s: &MetricsSummary) -> Vec<String> {
     let mut out = Vec::new();
+    // A stopped or blocked drain explains most other symptoms, so it leads.
+    match s.drain_state.as_deref() {
+        Some("stopped") => {
+            out.push(
+                "⚠ drain: STOPPED — nothing is delivered and the WAB grows; restart the \
+                 daemon to resume delivery"
+                    .to_string(),
+            );
+            out.push(
+                "⚠ sink_health is stale while the drain is stopped (no health probe runs)"
+                    .to_string(),
+            );
+        }
+        Some("blocked_dead_letter_full") => out.push(
+            "⚠ drain: BLOCKED — dead_letter/ is full; free space (weir-ctl dl requeue / dl \
+             drop) or raise dead_letter_max_bytes"
+                .to_string(),
+        ),
+        _ => {}
+    }
+    if let Some(off) = &s.offline_shards
+        && !off.is_empty()
+    {
+        out.push(format!(
+            "⚠ shard(s) offline: {} — new connections avoid them; restart to recover",
+            join_ids(off)
+        ));
+    }
     if s.sink_type == "noop" {
         out.push(
             "\n⚠ sink: noop — records are acked then DISCARDED, not delivered downstream. \
@@ -2304,10 +2365,23 @@ fn summary_warnings(s: &MetricsSummary) -> Vec<String> {
         );
     }
     if s.panics > 0 {
-        out.push(format!(
-            "\n⚠ flusher {} — a shard is offline until restart",
-            plural(s.panics, "panic", "panics")
-        ));
+        match &s.offline_shards {
+            // 4.1+: the shard list above is the truth; a panic counter alone is
+            // history (the supervisor respawns flushers).
+            Some(off) if off.is_empty() => out.push(format!(
+                "ℹ flusher {} since start (respawned; every shard is up)",
+                plural(s.panics, "panic", "panics")
+            )),
+            Some(_) => out.push(format!(
+                "ℹ flusher {} since start (see the offline shard list above)",
+                plural(s.panics, "panic", "panics")
+            )),
+            // Pre-4.1 daemon (no `weir_wab_shard_up`): unchanged wording.
+            None => out.push(format!(
+                "\n⚠ flusher {} — a shard is offline until restart",
+                plural(s.panics, "panic", "panics")
+            )),
+        }
     }
     if s.fsync_failures > 0 {
         out.push(format!(
@@ -2343,6 +2417,12 @@ fn print_summary(body: &str) {
     println!(
         "{:<10} type: {}  health: {}",
         "sink", s.sink_type, s.sink_health
+    );
+    println!(
+        "{:<10} state: {}  ready: {}",
+        "drain",
+        s.drain_state.as_deref().unwrap_or("?"),
+        s.ready.map_or("?", |r| if r { "yes" } else { "no" })
     );
     println!(
         "{:<10} {} on disk",
@@ -2382,6 +2462,70 @@ fn active_label(body: &str, metric: &str, label: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Every labelled sample of exactly `metric` as `(labels, value)`. The family
+/// must match exactly: `weir_wab_shard_up{` never matches
+/// `weir_wab_shard_up_extra{`. A trailing OpenMetrics timestamp is ignored.
+fn labelled_samples(body: &str, metric: &str) -> Vec<(BTreeMap<String, String>, f64)> {
+    let needle = format!("{metric}{{");
+    let mut out = Vec::new();
+    for line in body.lines() {
+        let Some(rest) = line.strip_prefix(needle.as_str()) else {
+            continue;
+        };
+        let Some(close) = rest.rfind('}') else {
+            continue;
+        };
+        let (labels, tail) = rest.split_at(close);
+        let Some(value) = tail[1..]
+            .split_whitespace()
+            .next()
+            .and_then(|v| v.parse::<f64>().ok())
+        else {
+            continue;
+        };
+        out.push((parse_label_set(labels), value));
+    }
+    out
+}
+
+/// Parses `k1="v1",k2="v2"` with `\"`, `\\` and `\n` escapes.
+fn parse_label_set(src: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let mut rest = src;
+    while let Some(eq) = rest.find("=\"") {
+        let key = rest[..eq].trim_start_matches(',').trim().to_string();
+        let after = &rest[eq + 2..];
+        let mut val = String::new();
+        let mut end = after.len();
+        let mut chars = after.char_indices();
+        while let Some((i, c)) = chars.next() {
+            match c {
+                '\\' => {
+                    if let Some((_, n)) = chars.next() {
+                        val.push(if n == 'n' { '\n' } else { n });
+                    }
+                }
+                '"' => {
+                    end = i + 1;
+                    break;
+                }
+                _ => val.push(c),
+            }
+        }
+        out.insert(key, val);
+        rest = &after[end..];
+    }
+    out
+}
+
+/// `1, 3, 7`: shard ids for a warning line.
+fn join_ids(ids: &[u16]) -> String {
+    ids.iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 #[cfg(test)]
@@ -3185,6 +3329,9 @@ weir_sink_info{sink_type=\"http\"} 1
             wab_bytes: 0,
             sink_health: "healthy".into(),
             sink_type: sink_type.into(),
+            drain_state: None,
+            offline_shards: None,
+            ready: None,
         }
     }
 
@@ -3215,6 +3362,124 @@ weir_sink_info{sink_type=\"http\"} 1
         // nacked records → the info line.
         let nacked = summary_warnings(&summary_with("http", 5, 0, 0));
         assert!(nacked.iter().any(|w| w.contains("nacked")), "{nacked:?}");
+    }
+
+    #[test]
+    fn labelled_samples_parse_label_sets_and_match_the_family_exactly() {
+        let body = "\
+weir_wab_shard_up{shard=\"0\"} 1
+weir_wab_shard_up{shard=\"1\"} 0
+weir_wab_shard_up_extra{shard=\"9\"} 0
+weir_condition_active{code=\"drain_paused\",severity=\"warning\"} 1
+weir_condition_active{severity=\"critical\",code=\"shard_offline\"} 0 1700000000000
+";
+        let up = labelled_samples(body, "weir_wab_shard_up");
+        assert_eq!(up.len(), 2, "a longer family name must not match: {up:?}");
+        assert_eq!(up[1].0["shard"], "1");
+        assert_eq!(up[1].1, 0.0);
+        let cond = labelled_samples(body, "weir_condition_active");
+        assert_eq!(cond[0].0["code"], "drain_paused");
+        assert_eq!(cond[0].0["severity"], "warning");
+        // Label order is free and a trailing timestamp is ignored.
+        assert_eq!(cond[1].0["code"], "shard_offline");
+        assert_eq!(cond[1].1, 0.0);
+        assert_eq!(
+            parse_label_set(r#"a="x\"y",b="z""#)
+                .get("a")
+                .map(String::as_str),
+            Some("x\"y")
+        );
+    }
+
+    #[test]
+    fn metrics_summary_json_gains_drain_state_offline_shards_and_ready() {
+        let body = "\
+weir_records_accepted_total{tier=\"durable\"} 5
+weir_drain_state{state=\"draining\"} 0
+weir_drain_state{state=\"stopped\"} 1
+weir_wab_shard_up{shard=\"0\"} 1
+weir_wab_shard_up{shard=\"2\"} 0
+weir_wab_shard_up{shard=\"1\"} 0
+weir_ready 1
+";
+        let v = round_trip(&summary_json(body));
+        assert_eq!(v["drain_state"], serde_json::json!("stopped"));
+        assert_eq!(
+            v["offline_shards"],
+            serde_json::json!([1, 2]),
+            "sorted ids of shards at 0"
+        );
+        assert_eq!(v["ready"], serde_json::json!(true));
+        // A pre-4.1 exposition: the new keys exist and are null, not absent.
+        let old = round_trip(&summary_json(
+            "weir_records_accepted_total{tier=\"durable\"} 5\n",
+        ));
+        for key in ["drain_state", "offline_shards", "ready"] {
+            assert!(
+                old.get(key).is_some_and(|x| x.is_null()),
+                "{key} must be null on a 4.0 daemon"
+            );
+        }
+        // Every pre-existing key is still there.
+        for key in [
+            "accepted",
+            "ack",
+            "nack",
+            "fsync_avg_ms",
+            "queue_depth",
+            "wab_bytes_on_disk",
+            "dead_letter_bytes_on_disk",
+            "sink_type",
+            "sink_health",
+            "flusher_panics",
+            "fsync_failures",
+        ] {
+            assert!(old.get(key).is_some(), "existing key {key} must not move");
+        }
+    }
+
+    #[test]
+    fn summary_warnings_put_a_stopped_or_blocked_drain_first() {
+        let mut s = summary_with("noop", 5, 0, 1);
+        s.drain_state = Some("stopped".into());
+        let w = summary_warnings(&s);
+        assert!(w[0].contains("STOPPED"), "{w:?}");
+        assert!(
+            w[1].contains("sink_health is stale while the drain is stopped"),
+            "{w:?}"
+        );
+        assert!(
+            w.iter().any(|l| l.contains("DISCARDED")),
+            "the noop warning still follows: {w:?}"
+        );
+
+        let mut b = summary_with("http", 0, 0, 0);
+        b.drain_state = Some("blocked_dead_letter_full".into());
+        let w = summary_warnings(&b);
+        assert!(w[0].contains("BLOCKED"), "{w:?}");
+        assert!(
+            !w.iter().any(|l| l.contains("stale")),
+            "blocked is not stopped: {w:?}"
+        );
+    }
+
+    #[test]
+    fn summary_warnings_list_offline_shards_and_soften_recovered_panics() {
+        let mut s = summary_with("http", 0, 2, 0);
+        s.offline_shards = Some(vec![1, 3]);
+        let w = summary_warnings(&s);
+        assert!(w.iter().any(|l| l.contains("offline: 1, 3")), "{w:?}");
+
+        // 4.1 daemon, panics recovered, every shard up: info, not "offline".
+        let mut ok = summary_with("http", 0, 2, 0);
+        ok.offline_shards = Some(vec![]);
+        let w = summary_warnings(&ok);
+        assert!(!w.iter().any(|l| l.contains("offline")), "{w:?}");
+        assert!(
+            w.iter()
+                .any(|l| l.contains("2 panics") && l.contains("every shard is up")),
+            "{w:?}"
+        );
     }
 
     #[test]
