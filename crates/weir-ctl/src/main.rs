@@ -15,6 +15,7 @@ use weir_core::{Durability, Payload};
 use weir_wab::SegmentReader;
 
 mod admin_client;
+mod admin_cmds;
 mod attest;
 mod http;
 mod offline;
@@ -122,6 +123,32 @@ enum Command {
         #[arg(long, value_enum, default_value_t = status::SourceMode::Auto)]
         source: status::SourceMode,
     },
+    /// Reload TLS certificates on the running daemon over its admin socket
+    /// (the same code path as SIGHUP). Exit: 0 applied or noop, 1 failed,
+    /// 2 no admin socket or identity mismatch.
+    Reload {
+        #[command(flatten)]
+        admin: AdminArgs,
+    },
+}
+
+/// Where the daemon's admin socket is, and which wab_dir it must prove it serves.
+#[derive(clap::Args)]
+struct AdminArgs {
+    /// The daemon's admin socket. Default: derived from --wab-dir
+    /// (<parent>/<basename>.admin.sock), then /var/lib/weir/wab.admin.sock.
+    #[arg(long, env = "WEIR_ADMIN_SOCKET_PATH")]
+    admin_socket: Option<PathBuf>,
+    /// The daemon's wab_dir: derives the socket path, and the daemon's reply
+    /// must name this directory's inode.
+    #[arg(long, env = "WEIR_WAB_DIR")]
+    wab_dir: Option<PathBuf>,
+}
+
+impl AdminArgs {
+    fn target(&self) -> admin_client::AdminTarget {
+        admin_client::resolve_admin_target(self.admin_socket.as_deref(), self.wab_dir.as_deref())
+    }
 }
 
 /// Subcommands under `weir-ctl attest`.
@@ -372,6 +399,7 @@ fn main() -> ExitCode {
                 json,
             );
         }
+        Command::Reload { admin } => return admin_cmds::cmd_reload(&admin.target(), json),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -3468,6 +3496,31 @@ weir_sink_info{sink_type=\"http\"} 1
             );
         }
         assert!(Cli::try_parse_from(["weir-ctl", "status", "--source", "carrier-pigeon"]).is_err());
+    }
+
+    #[test]
+    fn reload_cli_takes_the_admin_socket_and_wab_dir() {
+        use clap::Parser;
+        let cli = Cli::try_parse_from([
+            "weir-ctl",
+            "reload",
+            "--admin-socket",
+            "/run/weir/a.sock",
+            "--wab-dir",
+            "/srv/wab",
+        ])
+        .unwrap();
+        let Command::Reload { admin } = cli.command else {
+            panic!("not reload");
+        };
+        assert_eq!(
+            admin.admin_socket.as_deref(),
+            Some(Path::new("/run/weir/a.sock"))
+        );
+        let t = admin.target();
+        assert_eq!(t.socket, Path::new("/run/weir/a.sock"));
+        assert_eq!(t.origin, admin_client::AdminPathOrigin::Explicit);
+        assert!(t.wab_dir_strict, "a named --wab-dir is compared strictly");
     }
 
     #[test]
