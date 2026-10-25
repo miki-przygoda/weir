@@ -162,6 +162,28 @@ a daemon that *does* hold the lock: something deleted or replaced the lock file
 (the daemon re-creates and re-locks it), and while it was missing a second
 daemon could have started.
 
+### Readiness and conditions
+
+#### WeirNotReady
+The daemon reached `serving`, but `/readyz` has answered 503 for 5 minutes:
+new connections are refused or pushes nack. Startup and shutdown are
+excluded, because not-ready is their normal state; a daemon stuck in a startup
+phase shows on `weir_startup_phase` and `/startupz` instead.
+**Respond:** `curl -s 127.0.0.1:9185/readyz?verbose` (or `weir-ctl status`)
+names the failing check. `wab_cap_rejecting`: delivery is behind and the WAB
+reached `wab_max_bytes`; follow the drain and sink conditions, because raising
+the cap only buys time. `no_live_shard` or `listener_down`: capture the logs,
+then restart. See [Conditions](#conditions) for each code.
+
+#### WeirConditionCritical
+The daemon's own evaluator reports a critical condition that no dedicated rule
+covers (`drain_stopped`, `drain_blocked_dead_letter_full` and
+`fsync_failures_recent` have their own). The `code` label names it, and one
+alert fires per code.
+**Respond:** open that code's runbook under [Conditions](#conditions)
+(`#cond-<code>`), and run `weir-ctl status` on the host: the admin view adds
+the reason (panic message, error text) that the public `/status` leaves out.
+
 ### Drain / dead-letter
 
 #### WeirDrainNotConfirming

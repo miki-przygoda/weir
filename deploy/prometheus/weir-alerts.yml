@@ -104,6 +104,43 @@ groups:
           description: "This daemon does not hold the exclusive lock on <wab_dir>/.weir.lock (wab_dir_lock = \"best-effort\" on a filesystem that cannot flock). Nothing stops a second weir-server from recovering its live segments, which would turn its Durable acks into false acks. Move wab_dir to a local filesystem that supports flock, or guarantee a single daemon by other means."
           runbook: "docs/monitoring.md#weirwabdirunlocked"
 
+  # ── Readiness and conditions — the daemon's own verdicts ────────────────────
+  - name: weir-health
+    rules:
+      # weir_ready is /readyz as a gauge (1 = ready). It is 0 by design while
+      # starting and while shutting down, so those phases are excluded: a long
+      # recovery shows on weir_startup_phase, and a stop is not an incident.
+      # weir_startup_phase is one-hot with every phase pre-created, so the
+      # inactive phases are PRESENT at 0: the `== 1` inside the `unless` is
+      # load-bearing, without it any instance with the family would be excluded.
+      - alert: WeirNotReady
+        expr: |
+          weir_ready{job=~"weir"} == 0
+          unless on(instance, job)
+          (weir_startup_phase{job=~"weir", phase=~"initializing|recovering|handoff|binding|shutting_down"} == 1)
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "weir on {{ $labels.instance }} is serving but NOT READY for new ingest"
+          description: "/readyz has answered 503 for 5 minutes outside startup and shutdown: new connections are refused or pushes nack. The failing check is in `curl -s <host>:9185/readyz?verbose` or `weir-ctl status`: wab_cap_rejecting (delivery is behind and the WAB hit wab_max_bytes), no_live_shard or listener_down (restart after capturing the logs)."
+          runbook: "docs/monitoring.md#weirnotready"
+
+      # One alert per active critical condition code. The three codes excluded
+      # here have their own rules (WeirDrainStopped, WeirDrainBlocked,
+      # WeirFsyncFailure), so they would otherwise page twice. `max by` drops
+      # the series' own severity label before the rule sets it.
+      - alert: WeirConditionCritical
+        expr: |
+          max by (job, instance, code) (
+            weir_condition_active{job=~"weir", severity="critical", code!~"drain_stopped|drain_blocked_dead_letter_full|fsync_failures_recent"}
+          ) == 1
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "weir on {{ $labels.instance }} reports critical condition {{ $labels.code }}"
+          description: "The daemon's own condition evaluator reports {{ $labels.code }}, a critical condition with no dedicated rule in this file. `weir-ctl status` on the host shows it with its evidence, and the admin view adds the reason. Runbook for this code: docs/monitoring.md#cond-{{ $labels.code }}."
+          runbook: "docs/monitoring.md#weirconditioncritical"
+
   # ── Drain / dead-letter ─────────────────────────────────────────────────────
   - name: weir-drain
     rules:

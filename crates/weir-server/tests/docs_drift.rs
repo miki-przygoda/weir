@@ -1273,3 +1273,65 @@ fn the_deploy_tests_run_in_ci() {
         );
     }
 }
+
+/// The wire name of a serde unit variant (`"shard_offline"`).
+fn wire_name(v: serde_json::Value) -> String {
+    v.as_str()
+        .unwrap_or_else(|| panic!("expected a unit variant serialized as a string, got {v}"))
+        .to_string()
+}
+
+/// Every condition code the daemon can emit, as the `code` label spells it.
+fn condition_code_names() -> Vec<String> {
+    let names: Vec<String> = weir_status::ALL
+        .iter()
+        .map(|c| wire_name(serde_json::to_value(c).expect("serialize a ConditionCode")))
+        .collect();
+    assert!(
+        names.len() >= 30,
+        "weir_status::ALL has {} codes; the catalogue has 30, so this is no longer \n\
+         reading it",
+        names.len()
+    );
+    names
+}
+
+/// Every `code` matcher on `weir_condition_active` in the alert rules names a
+/// code the daemon emits.
+///
+/// A rule selecting `code="sink_unreachable"` when the code is `sink_down`
+/// matches no series and never fires; `promtool test rules` cannot see that,
+/// because its tests feed the series the rule author believed in. Spec §9.3:
+/// "every weir_condition_active{code=...} reference in an alert names a real
+/// code".
+#[test]
+fn every_condition_code_an_alert_names_is_real() {
+    let known = condition_code_names();
+    let mut referenced = Vec::new();
+    for (i, _) in ALERTS.match_indices("weir_condition_active{") {
+        let body = &ALERTS[i + "weir_condition_active{".len()..];
+        let selector = &body[..body.find('}').expect("unterminated selector")];
+        for matcher in selector.split(',') {
+            let m = matcher.trim();
+            let Some(rest) = m.strip_prefix("code") else {
+                continue;
+            };
+            let value = rest
+                .trim_start_matches(['=', '!', '~'])
+                .trim()
+                .trim_matches('"');
+            referenced.extend(value.split('|').map(str::to_string));
+        }
+    }
+    assert!(
+        !referenced.is_empty(),
+        "no rule in weir-alerts.yml selects weir_condition_active by code; \n\
+         WeirConditionCritical and WeirAdminUnavailable both do"
+    );
+    let unknown: Vec<&String> = referenced.iter().filter(|c| !known.contains(c)).collect();
+    assert!(
+        unknown.is_empty(),
+        "weir-alerts.yml selects condition codes the daemon never emits: {unknown:?}\n\
+         known codes: {known:?}"
+    );
+}

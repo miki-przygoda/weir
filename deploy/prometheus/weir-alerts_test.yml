@@ -754,3 +754,108 @@ tests:
       - eval_time: 15m
         alertname: WeirSegmentParked
         exp_alerts: []
+
+  # ── Readiness and conditions: the daemon's own verdicts ─────────────────────
+  #
+  # weir_startup_phase is one-hot with every phase pre-created, so a serving
+  # daemon also exports its inactive phases at 0. The first test feeds all six
+  # so that an `unless` that forgot its `== 1` would exclude it and go quiet.
+
+  - interval: 1m
+    name: serving but not ready fires WeirNotReady - the inactive phases are present at 0
+    input_series:
+      - series: 'weir_ready{job="weir",instance="w:9185"}'
+        values: "0x10"
+      - series: 'weir_startup_phase{job="weir",instance="w:9185",phase="initializing"}'
+        values: "0x10"
+      - series: 'weir_startup_phase{job="weir",instance="w:9185",phase="recovering"}'
+        values: "0x10"
+      - series: 'weir_startup_phase{job="weir",instance="w:9185",phase="handoff"}'
+        values: "0x10"
+      - series: 'weir_startup_phase{job="weir",instance="w:9185",phase="binding"}'
+        values: "0x10"
+      - series: 'weir_startup_phase{job="weir",instance="w:9185",phase="serving"}'
+        values: "1x10"
+      - series: 'weir_startup_phase{job="weir",instance="w:9185",phase="shutting_down"}'
+        values: "0x10"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: WeirNotReady
+        exp_alerts:
+          - exp_labels:
+              instance: "w:9185"
+              job: "weir"
+              severity: "critical"
+            exp_annotations:
+              summary: "weir on w:9185 is serving but NOT READY for new ingest"
+              description: "/readyz has answered 503 for 5 minutes outside startup and shutdown: new connections are refused or pushes nack. The failing check is in `curl -s <host>:9185/readyz?verbose` or `weir-ctl status`: wab_cap_rejecting (delivery is behind and the WAB hit wab_max_bytes), no_live_shard or listener_down (restart after capturing the logs)."
+              runbook: "docs/monitoring.md#weirnotready"
+
+  - interval: 1m
+    name: a long recovery and a shutdown are not-ready by design and do not fire
+    input_series:
+      - series: 'weir_ready{job="weir",instance="r:9185"}'
+        values: "0x10"
+      - series: 'weir_startup_phase{job="weir",instance="r:9185",phase="recovering"}'
+        values: "1x10"
+      - series: 'weir_startup_phase{job="weir",instance="r:9185",phase="serving"}'
+        values: "0x10"
+      - series: 'weir_ready{job="weir",instance="s:9185"}'
+        values: "0x10"
+      - series: 'weir_startup_phase{job="weir",instance="s:9185",phase="shutting_down"}'
+        values: "1x10"
+      - series: 'weir_startup_phase{job="weir",instance="s:9185",phase="serving"}'
+        values: "0x10"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: WeirNotReady
+        exp_alerts: []
+
+  - interval: 1m
+    name: a ready daemon and a short not-ready blip do not fire WeirNotReady
+    input_series:
+      - series: 'weir_ready{job="weir",instance="w:9185"}'
+        values: "1 1 1 0 0 0 1 1 1 1 1"
+      - series: 'weir_startup_phase{job="weir",instance="w:9185",phase="serving"}'
+        values: "1x10"
+      - series: 'weir_startup_phase{job="weir",instance="w:9185",phase="shutting_down"}'
+        values: "0x10"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: WeirNotReady
+        exp_alerts: []
+
+  - interval: 1m
+    name: a critical condition fires per code - not for codes with their own rule, not for warnings
+    input_series:
+      - series: 'weir_condition_active{job="weir",instance="w:9185",code="shard_offline",severity="critical"}'
+        values: "1x10"
+      - series: 'weir_condition_active{job="weir",instance="w:9185",code="drain_stopped",severity="critical"}'
+        values: "1x10"
+      - series: 'weir_condition_active{job="weir",instance="w:9185",code="sink_down",severity="warning"}'
+        values: "1x10"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: WeirConditionCritical
+        exp_alerts:
+          - exp_labels:
+              code: "shard_offline"
+              instance: "w:9185"
+              job: "weir"
+              severity: "critical"
+            exp_annotations:
+              summary: "weir on w:9185 reports critical condition shard_offline"
+              description: "The daemon's own condition evaluator reports shard_offline, a critical condition with no dedicated rule in this file. `weir-ctl status` on the host shows it with its evidence, and the admin view adds the reason. Runbook for this code: docs/monitoring.md#cond-shard_offline."
+              runbook: "docs/monitoring.md#weirconditioncritical"
+
+  - interval: 1m
+    name: no active critical condition does not fire WeirConditionCritical
+    input_series:
+      - series: 'weir_condition_active{job="weir",instance="w:9185",code="shard_offline",severity="critical"}'
+        values: "0x10"
+      - series: 'weir_condition_active{job="weir",instance="w:9185",code="no_live_shard",severity="critical"}'
+        values: "0 0 1 0 0 0 0 0 0 0 0"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: WeirConditionCritical
+        exp_alerts: []
