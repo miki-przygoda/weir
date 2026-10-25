@@ -3698,8 +3698,10 @@ fn metrics_answer_during_recovery_before_the_socket_binds() {
 /// and the sink's delay is a floor: ~3 records per segment is ~300 ms per
 /// segment, so at most ~10 segments can be delivered in those 3 s on any
 /// machine), a live push is acked, and a SIGHUP in that window is served (the
-/// runtime now exists before recovery). Everything is delivered eventually
-/// (~90 s).
+/// runtime now exists before recovery). Everything is delivered eventually:
+/// 141 s when this test ran alone on an i9-9900K, longer beside the rest of
+/// the suite (the old 150 s bound failed there), so the delivery bound is a
+/// generous 5 minutes. Only the 3 s socket bound is the property under test.
 #[test]
 fn a_slow_sink_backlog_does_not_delay_the_producer_socket() {
     const TOTAL: usize = 300;
@@ -3730,11 +3732,11 @@ fn a_slow_sink_backlog_does_not_delay_the_producer_socket() {
         wait_for_sighup_reloads(&srv, "noop", 1) >= 1,
         "a HUP during the backlog must be served as a reload, not dropped"
     );
-    let deadline = Instant::now() + Duration::from_secs(150);
+    let deadline = Instant::now() + Duration::from_secs(300);
     while count_wab_files(&wab, ".wab.sealed") > 0 {
         assert!(
             Instant::now() < deadline,
-            "the backlog was not delivered: {} sealed left",
+            "the backlog was not delivered within 300 s: {} sealed left",
             count_wab_files(&wab, ".wab.sealed")
         );
         thread::sleep(Duration::from_millis(250));
