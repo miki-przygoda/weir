@@ -6,7 +6,11 @@ use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
-/// Connect (per resolved address), read and write deadline.
+use crate::deadline::{DeadlineReader, is_timeout};
+
+/// The connect (per resolved address) and write timeout, and one deadline
+/// for the whole response: a listener that dribbles bytes cannot hold
+/// `weir-ctl status` or `metrics` past it.
 pub(crate) const HTTP_TIMEOUT: Duration = Duration::from_secs(5);
 /// A /status document is bounded at 256 shards and 40 conditions (spec §10),
 /// and a /metrics body is a few MiB at most; anything larger is refused.
@@ -21,6 +25,10 @@ pub(crate) struct HttpResponse {
 }
 
 pub(crate) fn http_get(addr: &str, path: &str) -> Result<HttpResponse, String> {
+    http_get_within(addr, path, HTTP_TIMEOUT)
+}
+
+fn http_get_within(addr: &str, path: &str, timeout: Duration) -> Result<HttpResponse, String> {
     // Try every resolved address in turn, as `TcpStream::connect(addr)` in the
     // old `scrape` did: `localhost` may resolve to ::1 first while the daemon
     // listens on 127.0.0.1 only.
@@ -31,7 +39,7 @@ pub(crate) fn http_get(addr: &str, path: &str) -> Result<HttpResponse, String> {
     let mut last_err: Option<std::io::Error> = None;
     let mut found = None;
     for a in &addrs {
-        match TcpStream::connect_timeout(a, HTTP_TIMEOUT) {
+        match TcpStream::connect_timeout(a, timeout) {
             Ok(s) => {
                 found = Some(s);
                 break;
@@ -44,17 +52,25 @@ pub(crate) fn http_get(addr: &str, path: &str) -> Result<HttpResponse, String> {
         None => format!("connect {addr}: no address"),
     })?;
     stream
-        .set_read_timeout(Some(HTTP_TIMEOUT))
-        .and_then(|()| stream.set_write_timeout(Some(HTTP_TIMEOUT)))
+        .set_write_timeout(Some(timeout))
         .map_err(|e| format!("set timeout: {e}"))?;
     stream
         .write_all(format!("GET {path} HTTP/1.0\r\nHost: localhost\r\n\r\n").as_bytes())
         .map_err(|e| format!("write GET: {e}"))?;
     let mut raw = Vec::new();
-    (&mut stream)
+    DeadlineReader::new(&stream, timeout)
         .take(MAX_RESPONSE_BYTES + 1)
         .read_to_end(&mut raw)
-        .map_err(|e| format!("read {path}: {e}"))?;
+        .map_err(|e| {
+            if is_timeout(&e) {
+                format!(
+                    "read {path}: no complete response within {:.1}s",
+                    timeout.as_secs_f64()
+                )
+            } else {
+                format!("read {path}: {e}")
+            }
+        })?;
     if raw.len() as u64 > MAX_RESPONSE_BYTES {
         return Err(format!(
             "read {path}: response larger than {MAX_RESPONSE_BYTES} bytes"
@@ -170,6 +186,33 @@ mod tests {
         );
         assert_eq!(r.status, Some(503));
         assert_eq!(r.content_type.as_deref(), Some("text/plain"));
+    }
+
+    /// HTTP_TIMEOUT bounds the whole response, not each read: a listener
+    /// that dribbles one byte at a time, each well inside the timeout, cannot
+    /// keep `weir-ctl status` or `metrics` waiting past it.
+    #[test]
+    fn a_dribbled_response_is_bounded_by_one_deadline() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let _h = std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            for _ in 0..100 {
+                if s.write_all(b" ").is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        let deadline = Duration::from_millis(600);
+        let start = std::time::Instant::now();
+        let e = http_get_within(&addr, "/status", deadline).unwrap_err();
+        let took = start.elapsed();
+        assert!(e.contains("no complete response within 0.6s"), "{e}");
+        assert!(
+            took >= deadline && took < Duration::from_secs(2),
+            "the deadline is per response, not per read: {took:?}"
+        );
     }
 
     #[test]

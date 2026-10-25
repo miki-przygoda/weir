@@ -20,6 +20,7 @@ use weir_wab::SegmentReader;
 mod admin_client;
 mod admin_cmds;
 mod attest;
+mod deadline;
 mod http;
 mod offline;
 mod status;

@@ -262,6 +262,7 @@ fn exchange(
     reply_timeout: Duration,
     expected: Option<(u64, u64)>,
 ) -> Result<AdminReply, CallError> {
+    use crate::deadline::{DeadlineReader, is_timeout};
     use std::io::{BufRead, BufReader, Read, Write};
 
     // 5. One request line.
@@ -285,23 +286,20 @@ fn exchange(
     }
 
     // 6. One bounded reply line, within one deadline for the whole reply.
-    let deadline = DeadlineReader {
-        stream,
-        deadline: std::time::Instant::now() + reply_timeout,
-    };
+    let deadline = DeadlineReader::new(stream, reply_timeout);
     let mut reader = BufReader::new(deadline.take(MAX_REPLY_BYTES + 1));
     let mut reply = String::new();
-    let n = reader.read_line(&mut reply).map_err(|e| match e.kind() {
-        std::io::ErrorKind::InvalidData => {
+    let n = reader.read_line(&mut reply).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::InvalidData {
             CallError::Protocol(format!("the {verb} reply is not UTF-8"))
-        }
-        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+        } else if is_timeout(&e) {
             CallError::Unreachable(format!(
                 "no reply to {verb} within {:.1}s",
                 reply_timeout.as_secs_f64()
             ))
+        } else {
+            CallError::Unreachable(format!("read the {verb} reply: {e}"))
         }
-        _ => CallError::Unreachable(format!("read the {verb} reply: {e}")),
     })?;
     if n == 0 {
         return Err(CallError::Unreachable(match sent {
@@ -318,33 +316,6 @@ fn exchange(
         }));
     }
     parse_reply(&reply, expected)
-}
-
-/// Re-arms the socket's read timeout to what is left of one deadline before
-/// every read, so `reply_timeout` bounds the whole reply: a per-read timeout
-/// alone would let a peer that dribbles bytes hold weir-ctl for up to
-/// `MAX_REPLY_BYTES` reads.
-#[cfg(unix)]
-struct DeadlineReader<'a> {
-    stream: &'a std::os::unix::net::UnixStream,
-    deadline: std::time::Instant,
-}
-
-#[cfg(unix)]
-impl std::io::Read for DeadlineReader<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let left = self
-            .deadline
-            .saturating_duration_since(std::time::Instant::now());
-        if left.is_zero() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "the reply deadline passed",
-            ));
-        }
-        self.stream.set_read_timeout(Some(left))?;
-        (&mut &*self.stream).read(buf)
-    }
 }
 
 /// Parses one reply line. An `ok` reply must carry an `instance` that matches
