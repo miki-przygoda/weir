@@ -240,3 +240,179 @@ fn the_image_healthcheck_fails_against_a_port_that_only_accepts() {
          that is exactly what the TCP-connect check it replaced could not tell:\n{out}"
     );
 }
+
+// ── weir-readiness.sh ─────────────────────────────────────────────────────────
+
+const READINESS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../deploy/systemd/weir-readiness.sh"
+);
+
+/// Runs the shipped readiness script against `127.0.0.1:<port>` with no
+/// weir-ctl (`--ctl` points nowhere; a later `--ctl` in `extra` wins). Returns
+/// the exit code and stdout+stderr.
+fn readiness(port: u16, extra: &[&str], env: &[(&str, &str)]) -> (i32, String) {
+    assert!(
+        Command::new("curl")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success()),
+        "these tests need curl on PATH: it is the script's documented dependency"
+    );
+    let mut cmd = Command::new("bash");
+    cmd.arg(READINESS)
+        .arg("--addr")
+        .arg(format!("127.0.0.1:{port}"))
+        .arg("--ctl")
+        .arg("/nonexistent/weir-ctl")
+        .args(extra);
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let (status, out) = run_with_deadline(&mut cmd, Duration::from_secs(20));
+    let status = status.unwrap_or_else(|| panic!("weir-readiness.sh ran past 20 s:\n{out}"));
+    (
+        status
+            .code()
+            .expect("weir-readiness.sh was killed by a signal"),
+        out,
+    )
+}
+
+/// A metrics body with `active` as `(code, severity)` conditions at 1, one
+/// inactive condition at 0, and a sink type.
+fn exposition(active: &[(&str, &str)]) -> String {
+    let mut s = String::from("# TYPE weir_condition_active gauge\n");
+    for (code, severity) in active {
+        s.push_str(&format!(
+            "weir_condition_active{{code=\"{code}\",severity=\"{severity}\"}} 1\n"
+        ));
+    }
+    s.push_str("weir_condition_active{code=\"starting\",severity=\"info\"} 0\n");
+    s.push_str("# TYPE weir_sink_info gauge\nweir_sink_info{sink_type=\"http\"} 1\n# EOF\n");
+    s
+}
+
+/// A daemon whose /readyz says ok, with `active` conditions on /metrics.
+fn ready_daemon(active: &[(&str, &str)]) -> Stub {
+    Stub::start(vec![
+        route("/readyz", 200, TEXT, "ok\n"),
+        route("/metrics", 200, OPENMETRICS, exposition(active)),
+    ])
+}
+
+#[test]
+fn readiness_is_ready_when_readyz_answers_200() {
+    let stub = ready_daemon(&[]);
+    let (code, out) = readiness(stub.port, &[], &[]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("READY: /readyz ok, sink=http"), "{out}");
+}
+
+#[test]
+fn readiness_is_not_ready_exactly_when_readyz_answers_503() {
+    let stub = Stub::start(vec![
+        route(
+            "/readyz",
+            503,
+            TEXT,
+            "not ready: wab_cap_rejecting, no_live_shard\n",
+        ),
+        route("/metrics", 200, OPENMETRICS, exposition(&[])),
+    ]);
+    let (code, out) = readiness(stub.port, &[], &[]);
+    assert_eq!(code, 1, "{out}");
+    assert!(
+        out.contains("NOT READY: wab_cap_rejecting, no_live_shard"),
+        "{out}"
+    );
+}
+
+/// The behaviour change: sink, drain and history conditions are reported, but
+/// a daemon that can take ingest is READY. The old script exited 1 on each of
+/// these, and stayed at 1 forever after one recovered flusher panic.
+#[test]
+fn a_sink_outage_is_a_warning_not_a_readiness_failure() {
+    let stub = ready_daemon(&[
+        ("sink_down", "warning"),
+        ("drain_blocked_dead_letter_full", "critical"),
+        ("flusher_respawned_recent", "warning"),
+    ]);
+    let (code, out) = readiness(stub.port, &[], &[]);
+    assert_eq!(code, 0, "{out}");
+    for c in [
+        "sink_down",
+        "drain_blocked_dead_letter_full",
+        "flusher_respawned_recent",
+    ] {
+        assert!(
+            out.contains(&format!("WARN: {c} (")) && out.contains(&format!("#cond-{c}")),
+            "no WARN line with a runbook link for {c}:\n{out}"
+        );
+    }
+}
+
+#[test]
+fn a_critical_condition_turns_ready_into_exit_3_only_on_request() {
+    let stub = ready_daemon(&[("shard_offline", "critical")]);
+    assert_eq!(readiness(stub.port, &[], &[]).0, 0);
+    let (code, out) = readiness(stub.port, &["--fail-on-critical"], &[]);
+    assert_eq!(code, 3, "{out}");
+
+    let warning_only = ready_daemon(&[("sink_down", "warning")]);
+    let (code, out) = readiness(warning_only.port, &["--fail-on-critical"], &[]);
+    assert_eq!(code, 0, "a warning must never yield exit 3:\n{out}");
+}
+
+#[test]
+fn allow_noop_silences_only_the_noop_warning() {
+    let stub = ready_daemon(&[("noop_sink", "warning"), ("sink_down", "warning")]);
+    let (_, loud) = readiness(stub.port, &[], &[]);
+    assert!(loud.contains("WARN: noop_sink"), "{loud}");
+    let (code, quiet) = readiness(stub.port, &["--allow-noop"], &[]);
+    assert_eq!(code, 0, "{quiet}");
+    assert!(!quiet.contains("noop_sink"), "{quiet}");
+    assert!(quiet.contains("WARN: sink_down"), "{quiet}");
+}
+
+#[test]
+fn readiness_is_dead_when_nothing_listens() {
+    let port = {
+        let l = TcpListener::bind("127.0.0.1:0").expect("bind");
+        l.local_addr().expect("addr").port()
+    };
+    let (code, out) = readiness(port, &[], &[]);
+    assert_eq!(code, 2, "{out}");
+    assert!(out.contains("DEAD"), "{out}");
+}
+
+#[test]
+fn readiness_is_dead_for_an_http_server_that_is_not_weir() {
+    let html = Stub::start(vec![route("*", 200, "text/html", "<html>hello</html>")]);
+    let (code, out) = readiness(html.port, &[], &[]);
+    assert_eq!(code, 2, "{out}");
+
+    // text/plain, but not a /readyz body.
+    let plain = Stub::start(vec![route("*", 200, TEXT, "hello\n")]);
+    let (code, out) = readiness(plain.port, &[], &[]);
+    assert_eq!(code, 2, "{out}");
+}
+
+#[test]
+fn a_daemon_without_readyz_counts_as_ready_when_it_answers_with_weir_metrics() {
+    // Before the health routes, every path returned the metrics.
+    let older = Stub::start(vec![route("*", 200, OPENMETRICS, exposition(&[]))]);
+    let (code, out) = readiness(older.port, &[], &[]);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("has no /readyz"), "{out}");
+
+    let not_weir = Stub::start(vec![route(
+        "*",
+        200,
+        OPENMETRICS,
+        "# TYPE up gauge\nup 1\n# EOF\n",
+    )]);
+    let (code, out) = readiness(not_weir.port, &[], &[]);
+    assert_eq!(code, 2, "{out}");
+}
