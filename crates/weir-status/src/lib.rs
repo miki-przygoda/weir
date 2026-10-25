@@ -15,6 +15,7 @@ pub mod doc;
 pub mod evidence;
 pub mod exit;
 pub mod exposition;
+pub mod offline;
 mod probe;
 mod public;
 mod rules;
