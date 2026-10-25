@@ -35,6 +35,10 @@
 #   --socket PATH is accepted and ignored: readiness no longer round-trips the
 #   producer socket, because /readyz already reports whether it is bound.
 #
+#   On a host with more than one instance, pass --wab-dir (or --admin-socket)
+#   with --addr: without either, weir-ctl asks the default admin socket
+#   (/var/lib/weir/wab.admin.sock), which may be another instance's.
+#
 # For cron + alerting, a systemd timer, or a bare-metal deploy gate. Kubernetes
 # should probe /startupz, /readyz and /livez directly (docs/monitoring.md).
 # Requires bash, curl and awk, which the container image does not ship; its

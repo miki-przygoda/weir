@@ -184,8 +184,13 @@ now? The verdict is the daemon's own `GET /readyz`: recovery done, a producer
 listener bound, not shutting down, the `wab_max_bytes` cap not rejecting, and
 at least one shard up. When a `weir-ctl` with a `status` subcommand is
 installed, the script asks `weir-ctl status` instead, which reads the same
-evaluator through the admin socket and checks that it is talking to the daemon
-that owns this `wab_dir`.
+evaluator through the admin socket and, given `--wab-dir`, checks that it is
+talking to the daemon that owns that `wab_dir`.
+
+On a host with more than one weir instance, pass `--wab-dir` (or
+`--admin-socket`) with `--addr`. Without either, `weir-ctl` asks the default
+admin socket, `/var/lib/weir/wab.admin.sock`, which may belong to a different
+instance from the one `--addr` names.
 
 | Exit | Meaning |
 |---|---|
