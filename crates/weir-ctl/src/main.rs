@@ -80,6 +80,9 @@ enum Command {
         /// Path to the daemon's WAB directory (the `wab_dir` config value).
         #[arg(long, env = "WEIR_WAB_DIR")]
         wab_dir: PathBuf,
+        /// Also list every segment file (shard, name, state, bytes).
+        #[arg(long)]
+        files: bool,
     },
     /// Inspect and manage the dead-letter store.
     #[command(subcommand)]
@@ -294,7 +297,7 @@ fn main() -> ExitCode {
             socket,
         } => cmd_push(&socket, payload.as_bytes(), durability, json),
         Command::Metrics { addr, raw } => cmd_metrics(&addr, raw, json),
-        Command::Segments { wab_dir } => cmd_segments(&wab_dir, json),
+        Command::Segments { wab_dir, files } => cmd_segments(&wab_dir, files, json),
         Command::Dl(dl) => match dl {
             DlCommand::List { wab_dir } => cmd_dl_list(&wab_dir, json),
             DlCommand::Drop { wab_dir, yes } => cmd_dl_drop(&wab_dir, yes, json),
@@ -479,7 +482,8 @@ struct ShardStat {
 /// (`.wab.confirmed` > `.wab.sealed` > `.wab`, longest-suffix first so the bare
 /// `.wab` test can't shadow the others) and rolling up the dead-letter sibling
 /// through the same `dl_segments` filter the `dl` commands use. Returns the
-/// shards (sorted by name) plus the dead-letter `(file_count, bytes)`. Factored
+/// shards (sorted by name) plus the dead-letter `(file_count, bytes)`; any other
+/// non-shard directory (`quarantine/`, see `is_shard_dir_name`) is skipped. Factored
 /// out of `cmd_segments` so this load-bearing accounting is unit-testable
 /// without capturing stdout. Note: `confirmed` markers contribute 0 bytes (only
 /// active + sealed segments hold live data).
@@ -512,6 +516,11 @@ fn scan_segments(wab_dir: &Path) -> Result<(Vec<ShardStat>, u64, u64), String> {
                 dl_files += segs.len() as u64;
                 dl_bytes += segs.iter().map(|(_, s)| *s).sum::<u64>();
             }
+            continue;
+        }
+        // quarantine/ holds forensic copies (see `quarantine list`); counting it
+        // as a shard inflated the shard table and its byte total.
+        if !is_shard_dir_name(&name) {
             continue;
         }
 
@@ -549,11 +558,100 @@ fn scan_segments(wab_dir: &Path) -> Result<(Vec<ShardStat>, u64, u64), String> {
     Ok((shards, dl_files, dl_bytes))
 }
 
-fn cmd_segments(wab_dir: &Path, json: bool) -> Result<(), String> {
+/// Directories under `wab_dir` that are NOT shards: the dead-letter store
+/// (rolled up separately) and quarantine (forensic copies, see `quarantine list`).
+fn is_shard_dir_name(name: &str) -> bool {
+    name != "dead_letter" && name != "quarantine"
+}
+
+/// `.wab.confirmed` > `.wab.sealed` > `.wab`, longest suffix first.
+fn classify_segment_name(name: &str) -> Option<&'static str> {
+    use weir_wab::format::{EXT_ACTIVE, EXT_CONFIRMED, EXT_SEALED};
+    if name.ends_with(EXT_CONFIRMED) {
+        Some("confirmed")
+    } else if name.ends_with(EXT_SEALED) {
+        Some("sealed")
+    } else if name.ends_with(EXT_ACTIVE) {
+        Some("active")
+    } else {
+        None
+    }
+}
+
+/// One segment file for `segments --files`.
+struct SegFile {
+    shard: String,
+    name: String,
+    state: &'static str,
+    bytes: u64,
+}
+
+/// Every segment file in every shard directory, sorted by (shard, name).
+/// Read-only; it never touches `.weir.lock`.
+fn scan_segment_files(wab_dir: &Path) -> Result<Vec<SegFile>, String> {
+    let entries =
+        std::fs::read_dir(wab_dir).map_err(|e| format!("read {}: {e}", wab_dir.display()))?;
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(shard) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        if !path.is_dir() || !is_shard_dir_name(&shard) {
+            continue;
+        }
+        let Ok(files) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        for f in files.flatten() {
+            let Some(name) = f.file_name().to_str().map(str::to_string) else {
+                continue;
+            };
+            let Some(state) = classify_segment_name(&name) else {
+                continue;
+            };
+            let bytes = f.metadata().map(|m| m.len()).unwrap_or(0);
+            out.push(SegFile {
+                shard: shard.clone(),
+                name,
+                state,
+                bytes,
+            });
+        }
+    }
+    out.sort_by(|a, b| {
+        (a.shard.as_str(), a.name.as_str()).cmp(&(b.shard.as_str(), b.name.as_str()))
+    });
+    Ok(out)
+}
+
+/// `segments --json --files`: one `{shard, name, state, bytes}` per file.
+fn segment_files_json(files: &[SegFile]) -> serde_json::Value {
+    serde_json::Value::Array(
+        files
+            .iter()
+            .map(|f| {
+                serde_json::json!({
+                    "shard": f.shard, "name": f.name, "state": f.state, "bytes": f.bytes,
+                })
+            })
+            .collect(),
+    )
+}
+
+fn cmd_segments(wab_dir: &Path, files: bool, json: bool) -> Result<(), String> {
     let (shards, dl_files, dl_bytes) = scan_segments(wab_dir)?;
 
     if json {
-        print_json(&segments_json(wab_dir, &shards, dl_files, dl_bytes));
+        let mut v = segments_json(wab_dir, &shards, dl_files, dl_bytes);
+        if files {
+            v["files"] = segment_files_json(&scan_segment_files(wab_dir)?);
+        }
+        print_json(&v);
         return Ok(());
     }
 
@@ -607,6 +705,18 @@ fn cmd_segments(wab_dir: &Path, json: bool) -> Result<(), String> {
             plural(dl_files, "file", "files"),
             fmt_bytes(dl_bytes)
         );
+    }
+    if files {
+        println!();
+        for f in scan_segment_files(wab_dir)? {
+            println!(
+                "{:<10} {:<34} {:<10} {:>12}",
+                f.shard,
+                f.name,
+                f.state,
+                fmt_bytes(f.bytes)
+            );
+        }
     }
     Ok(())
 }
@@ -3480,6 +3590,71 @@ weir_ready 1
                 .any(|l| l.contains("2 panics") && l.contains("every shard is up")),
             "{w:?}"
         );
+    }
+
+    #[test]
+    fn scan_segments_does_not_count_quarantine_as_a_shard() {
+        let dir = std::env::temp_dir().join(format!("weir_ctl_scan_q_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let shard = dir.join("shard_00");
+        std::fs::create_dir_all(&shard).unwrap();
+        std::fs::write(shard.join("seg_00000001.wab.sealed"), vec![0u8; 10]).unwrap();
+        let q = dir.join("quarantine");
+        std::fs::create_dir_all(&q).unwrap();
+        std::fs::write(q.join("shard_00__seg_00000009.wab.sealed"), vec![0u8; 77]).unwrap();
+
+        let (shards, _, _) = scan_segments(&dir).unwrap();
+        let names: Vec<&str> = shards.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["shard_00"], "quarantine/ is not a shard");
+        assert_eq!(shards[0].bytes, 10, "quarantined bytes are not shard bytes");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn segment_files_lists_each_segment_with_state_and_size() {
+        let dir = std::env::temp_dir().join(format!("weir_ctl_files_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let shard = dir.join("shard_01");
+        std::fs::create_dir_all(&shard).unwrap();
+        std::fs::write(shard.join("seg_00000003.wab"), vec![0u8; 5]).unwrap();
+        std::fs::write(shard.join("seg_00000002.wab.sealed"), vec![0u8; 7]).unwrap();
+        std::fs::write(shard.join("seg_00000001.wab.confirmed"), vec![0u8; 36]).unwrap();
+        std::fs::write(shard.join("seg_00000000.wab.confirmed.tmp"), vec![0u8; 36]).unwrap();
+        std::fs::create_dir_all(dir.join("quarantine")).unwrap();
+        std::fs::create_dir_all(dir.join("dead_letter")).unwrap();
+        std::fs::write(dir.join(".weir.lock"), b"pid=1\n").unwrap();
+
+        let files = scan_segment_files(&dir).unwrap();
+        let rows: Vec<(&str, &str, &str, u64)> = files
+            .iter()
+            .map(|f| (f.shard.as_str(), f.name.as_str(), f.state, f.bytes))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                ("shard_01", "seg_00000001.wab.confirmed", "confirmed", 36),
+                ("shard_01", "seg_00000002.wab.sealed", "sealed", 7),
+                ("shard_01", "seg_00000003.wab", "active", 5),
+            ],
+            "sorted by shard then name; the .tmp, the lock and non-shard dirs are skipped"
+        );
+        let v = round_trip(&segment_files_json(&files));
+        assert_eq!(v[1]["state"], serde_json::json!("sealed"));
+        assert_eq!(v[1]["bytes"], serde_json::json!(7));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn segments_cli_accepts_files_flag() {
+        use clap::Parser;
+        let cli =
+            Cli::try_parse_from(["weir-ctl", "segments", "--wab-dir", "/x", "--files"]).unwrap();
+        assert!(matches!(cli.command, Command::Segments { files: true, .. }));
+        let cli = Cli::try_parse_from(["weir-ctl", "segments", "--wab-dir", "/x"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Segments { files: false, .. }
+        ));
     }
 
     #[test]
