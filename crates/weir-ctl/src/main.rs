@@ -15,7 +15,10 @@ use weir_client::WeirClient;
 use weir_core::{Durability, Payload};
 use weir_wab::SegmentReader;
 
+mod admin_client;
 mod attest;
+mod offline;
+mod status;
 
 /// Default daemon Unix socket. Override with `--socket`.
 const DEFAULT_SOCKET: &str = "/run/weir/weir.sock";
@@ -3275,10 +3278,36 @@ weir_sink_info{sink_type=\"http\"} 1
     /// crate's sources may call flock (or lockf / fcntl record locks).
     #[test]
     fn weir_ctl_never_takes_the_wab_dir_lock() {
-        const SOURCES: [(&str, &str); 2] = [
-            ("main.rs", include_str!("main.rs")),
-            ("attest.rs", include_str!("attest.rs")),
-        ];
+        // Every source file, not a fixed list: a new module must not slip past.
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        let mut stack = vec![src];
+        while let Some(dir) = stack.pop() {
+            for e in std::fs::read_dir(&dir).unwrap().flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().is_some_and(|x| x == "rs") {
+                    files.push(p);
+                }
+            }
+        }
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        for required in [
+            "main.rs",
+            "attest.rs",
+            "offline.rs",
+            "admin_client.rs",
+            "status.rs",
+        ] {
+            assert!(
+                names.iter().any(|n| n == required),
+                "the lock guard must see {required}; it saw {names:?}"
+            );
+        }
         // Split so this test's own source does not match itself.
         let needles = [
             ["fl", "ock("].concat(),
@@ -3288,11 +3317,13 @@ weir_sink_info{sink_type=\"http\"} 1
             [".try_", "lock("].concat(),
             [".lock_", "shared("].concat(),
         ];
-        for (name, src) in SOURCES {
+        for path in &files {
+            let text = std::fs::read_to_string(path).unwrap();
             for needle in &needles {
                 assert!(
-                    !src.contains(needle.as_str()),
-                    "weir-ctl {name} contains {needle:?}: weir-ctl must never lock the wab_dir"
+                    !text.contains(needle.as_str()),
+                    "weir-ctl {} contains {needle:?}: weir-ctl must never lock the wab_dir",
+                    path.display()
                 );
             }
         }
