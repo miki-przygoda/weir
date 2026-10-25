@@ -1,8 +1,11 @@
 //! `weir-ctl` — admin and inspection CLI for the weir daemon.
 //!
-//! A thin operator tool over the daemon's existing surfaces: the Unix socket
-//! (HealthCheck / Push frames, via `weir-client`) and the Prometheus `/metrics`
-//! endpoint. No new daemon-side API is required.
+//! An operator tool over the daemon's surfaces: the producer Unix socket
+//! (HealthCheck / Push frames, via `weir-client`), the metrics listener
+//! (`/metrics`, and `/status` from 4.1), the admin Unix socket (`status`,
+//! `reload`, `drain *`, authenticated client-side before any answer is
+//! trusted), and the `wab_dir` on disk, read-only. weir-ctl never takes,
+//! probes or releases the daemon's `.weir.lock`.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -37,9 +40,9 @@ const DEFAULT_METRICS_ADDR: &str = "127.0.0.1:9185";
 struct Cli {
     /// Emit machine-readable JSON instead of the human table, for the
     /// read/inspect subcommands (health, metrics, segments, dl list,
-    /// quarantine list, quarantine inspect). The human output stays the
-    /// default. Mutating commands (push, dl drop/requeue) emit a small JSON
-    /// result object under --json.
+    /// quarantine list, quarantine inspect, status). The human output stays
+    /// the default. Mutating commands (push, dl drop/requeue, reload, drain)
+    /// emit a small JSON result object under --json.
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
@@ -3620,6 +3623,19 @@ weir_sink_info{sink_type=\"http\"} 1
         assert!(help.contains("cool-down"), "{help}");
         assert!(help.contains("skipped"), "{help}");
         assert!(help.contains("sink_retry_base_delay_ms"), "{help}");
+    }
+
+    #[test]
+    fn readme_names_every_subcommand() {
+        use clap::CommandFactory;
+        let readme = include_str!("../README.md");
+        for sub in Cli::command().get_subcommands() {
+            let name = sub.get_name();
+            assert!(
+                readme.contains(&format!("`{name}`")),
+                "crates/weir-ctl/README.md must name the `{name}` subcommand"
+            );
+        }
     }
 
     #[test]
