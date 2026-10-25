@@ -53,13 +53,19 @@ groups:
           description: "A record's ack never fired within the timeout without a panic — the classic wedged-flusher signature (e.g. a stuck fsync). Check fsync latency and the flusher threads."
           runbook: "docs/monitoring.md#weiracktimeout"
 
+      # On the BYTES in quarantine/, not the per-process counter: a restart
+      # resets weir_recovery_segments_quarantined_total and the counter rule
+      # went quiet while the quarantined files were still there. The gauge
+      # survives restarts and covers every quarantine path (recovery and the
+      # drain). Like WeirAttestVerifyFailed, it keeps firing until the incident
+      # is resolved, not for a window after it began.
       - alert: WeirSegmentQuarantined
-        expr: increase(weir_recovery_segments_quarantined_total{job=~"weir"}[10m]) > 0
+        expr: weir_quarantine_bytes_on_disk{job=~"weir"} > 0
         for: 0m
         labels: { severity: critical }
         annotations:
-          summary: "weir quarantined a corrupt segment on {{ $labels.instance }}"
-          description: "Crash recovery found a segment with bad magic, an unknown format version, or a CRC mismatch and moved it to the quarantine directory. Data-integrity event — inspect the quarantined file."
+          summary: "weir holds quarantined segment data on {{ $labels.instance }}"
+          description: "<wab_dir>/quarantine/ is not empty: recovery or the drain moved a segment there (or, for mid-file corruption, a copy of it) because its bytes are bad (a header it cannot parse, in recovery a newer format too; a CRC mismatch; a truncated footer), a media-class read error outlasted three strand cycles and 10 minutes, or its .confirmed sidecar failed verification. A data-integrity event. The byte gauge survives restarts, so this keeps firing until quarantine/ is empty: `weir-ctl quarantine list` and `inspect`, `requeue --yes` (it deletes each fully recovered segment), then move out what it leaves, desynced or header-corrupt segments and the .wab.confirmed sidecars it ignores (see docs/operations/quarantine-recovery.md)."
           runbook: "docs/monitoring.md#weirsegmentquarantined"
 
       - alert: WeirFsyncLatencyHigh

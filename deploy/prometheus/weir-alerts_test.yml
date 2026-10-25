@@ -210,8 +210,8 @@ tests:
         values: "0 0 1 1 1 1 1 1"
       - series: 'weir_ack_timeout_total{job="weir",instance="w:9185"}'
         values: "0 0 1 1 1 1 1 1"
-      - series: 'weir_recovery_segments_quarantined_total{job="weir",instance="w:9185"}'
-        values: "0 0 1 1 1 1 1 1"
+      - series: 'weir_quarantine_bytes_on_disk{job="weir",instance="w:9185"}'
+        values: "0 0 4096 4096 4096 4096 4096 4096"
     alert_rule_test:
       - eval_time: 5m
         alertname: WeirFsyncFailure
@@ -254,8 +254,8 @@ tests:
               job: "weir"
               severity: "critical"
             exp_annotations:
-              summary: "weir quarantined a corrupt segment on w:9185"
-              description: "Crash recovery found a segment with bad magic, an unknown format version, or a CRC mismatch and moved it to the quarantine directory. Data-integrity event — inspect the quarantined file."
+              summary: "weir holds quarantined segment data on w:9185"
+              description: "<wab_dir>/quarantine/ is not empty: recovery or the drain moved a segment there (or, for mid-file corruption, a copy of it) because its bytes are bad (a header it cannot parse, in recovery a newer format too; a CRC mismatch; a truncated footer), a media-class read error outlasted three strand cycles and 10 minutes, or its .confirmed sidecar failed verification. A data-integrity event. The byte gauge survives restarts, so this keeps firing until quarantine/ is empty: `weir-ctl quarantine list` and `inspect`, `requeue --yes` (it deletes each fully recovered segment), then move out what it leaves, desynced or header-corrupt segments and the .wab.confirmed sidecars it ignores (see docs/operations/quarantine-recovery.md)."
               runbook: "docs/monitoring.md#weirsegmentquarantined"
 
   - interval: 1m
@@ -267,7 +267,7 @@ tests:
         values: "0x15"
       - series: 'weir_ack_timeout_total{job="weir",instance="w:9185"}'
         values: "0x15"
-      - series: 'weir_recovery_segments_quarantined_total{job="weir",instance="w:9185"}'
+      - series: 'weir_quarantine_bytes_on_disk{job="weir",instance="w:9185"}'
         values: "0x15"
       - series: 'up{job="weir",instance="w:9185"}'
         values: "1x15"
@@ -983,3 +983,30 @@ tests:
       - eval_time: 10m
         alertname: WeirAdminUnavailable
         exp_alerts: []
+
+  # ── A quarantine outlives the process that made it ──────────────────────────
+  #
+  # weir_recovery_segments_quarantined_total is per process: a restart resets
+  # it while the quarantined files stay. The rule reads the byte gauge, which
+  # survives the restart, so it keeps firing until quarantine/ is empty.
+
+  - interval: 1m
+    name: a quarantine left on disk keeps firing after a restart reset the counter
+    input_series:
+      # The process restarted: its counter starts again at 0, the files remain.
+      - series: 'weir_recovery_segments_quarantined_total{job="weir",instance="w:9185"}'
+        values: "0x10"
+      - series: 'weir_quarantine_bytes_on_disk{job="weir",instance="w:9185"}'
+        values: "4096x10"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: WeirSegmentQuarantined
+        exp_alerts:
+          - exp_labels:
+              instance: "w:9185"
+              job: "weir"
+              severity: "critical"
+            exp_annotations:
+              summary: "weir holds quarantined segment data on w:9185"
+              description: "<wab_dir>/quarantine/ is not empty: recovery or the drain moved a segment there (or, for mid-file corruption, a copy of it) because its bytes are bad (a header it cannot parse, in recovery a newer format too; a CRC mismatch; a truncated footer), a media-class read error outlasted three strand cycles and 10 minutes, or its .confirmed sidecar failed verification. A data-integrity event. The byte gauge survives restarts, so this keeps firing until quarantine/ is empty: `weir-ctl quarantine list` and `inspect`, `requeue --yes` (it deletes each fully recovered segment), then move out what it leaves, desynced or header-corrupt segments and the .wab.confirmed sidecars it ignores (see docs/operations/quarantine-recovery.md)."
+              runbook: "docs/monitoring.md#weirsegmentquarantined"

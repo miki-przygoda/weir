@@ -106,10 +106,20 @@ fsync latency is spiking, it's storage. If a `WeirFlusherPanic` follows shortly,
 treat it as a flusher panic. A hung daemon may need a restart.
 
 #### WeirSegmentQuarantined
-Crash recovery found a segment with bad magic, an unknown format version, or a
-CRC mismatch and moved it (or, for mid-file corruption, a copy of it) to
-`<wab_dir>/quarantine/`. A data-integrity event. CRC mismatches usually mean
-storage corruption (failing disk / bad RAM).
+`<wab_dir>/quarantine/` holds data. Recovery or the drain moved a segment there
+(or, for mid-file corruption, a copy of it) because its bytes are bad (header,
+CRC, a truncated footer), a media-class read error persisted for three strand
+cycles and 10 minutes, or its `.confirmed` sidecar failed verification. A
+data-integrity event; CRC mismatches usually mean storage corruption (failing
+disk / bad RAM). A *sealed* segment from a newer weir is parked instead
+([WeirSegmentParked](#weirsegmentparked)); crash recovery still quarantines an
+active segment whose header it cannot parse, newer format included.
+The rule reads `weir_quarantine_bytes_on_disk`, which survives a restart and
+sums the size of every file in `quarantine/`, so it fires until the directory
+is empty (a zero-length file holds no records and does not count):
+`requeue --yes` deletes the segments it fully recovers; move out what it
+leaves (desynced or header-corrupt segments, and `.wab.confirmed` sidecars,
+which `weir-ctl quarantine` ignores) once you have kept a copy.
 **Respond:** `weir-ctl quarantine list` shows every quarantined segment;
 `weir-ctl quarantine inspect <segment>` reports how much of it is actually
 recoverable, and `weir-ctl quarantine requeue` re-delivers it. Full procedure —
