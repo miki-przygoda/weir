@@ -449,9 +449,12 @@ impl StatusSources for RealSources {
     fn admin(&self) -> Result<Value, SourceFail> {
         match admin_client::call(&self.admin, "status", json!({}), STATUS_REPLY_TIMEOUT) {
             Ok(r) => {
+                // The envelope's instance is the one check_instance compared
+                // with --wab-dir; the document's own copy was never checked,
+                // so the verified one replaces it.
                 let mut doc = r.result;
                 if let Some(o) = doc.as_object_mut() {
-                    o.entry("instance").or_insert(r.instance);
+                    o.insert("instance".into(), r.instance);
                 }
                 Ok(doc)
             }
@@ -636,8 +639,9 @@ pub(crate) fn render_human(o: &StatusOutcome) -> Vec<String> {
     if o.source == SourceKind::Admin
         && let Some(inst) = d.get("instance")
     {
-        // PR 1's AdminStatusDoc carries `pid` at the top level and an
-        // `InstanceView` without it; fold it in for the instance line.
+        // The verified envelope instance carries `pid`. PR 1's AdminStatusDoc
+        // carries it at the top level and an `InstanceView` without it, so an
+        // instance that lacks it gets it folded in for the instance line.
         let mut inst = inst.clone();
         if let (Some(pid), Some(obj)) = (d.get("pid"), inst.as_object_mut()) {
             obj.entry("pid").or_insert(pid.clone());
@@ -1246,6 +1250,50 @@ weir_wab_undelivered_segments 4\nweir_wab_undelivered_records 40\n";
         // The public view has no instance line.
         let pub_lines = render_human(&outcome(doc, SourceKind::Http));
         assert!(!pub_lines.iter().any(|l| l.starts_with("instance:")));
+    }
+
+    /// The printed instance is the one `check_instance` verified: the reply
+    /// envelope's, not the copy inside the status document, which nothing
+    /// compared against --wab-dir.
+    #[cfg(unix)]
+    #[test]
+    fn the_admin_instance_is_the_verified_envelope_instance() {
+        use crate::admin_client::test_support::*;
+        let dir = private_dir("stinst");
+        let wab = dir.join("wab");
+        std::fs::create_dir_all(&wab).unwrap();
+        let envelope = instance_for(&wab);
+        let env2 = envelope.clone();
+        let _h = fake_admin(&dir.join("a.sock"), move |req| {
+            let mut doc = daemon_doc("admin", true, "info");
+            doc["pid"] = json!(7);
+            doc["instance"] = json!({"wab_dir": "/elsewhere/wab", "socket_path": "/elsewhere/weir.sock",
+                                     "wab_dir_dev": 1, "wab_dir_ino": 2});
+            json!({"v": 1, "id": req["id"].clone(), "instance": env2.clone(), "ok": true, "result": doc})
+        });
+        let src = RealSources {
+            admin: crate::admin_client::resolve_admin_target(Some(&dir.join("a.sock")), Some(&wab)),
+            addr: "127.0.0.1:1".into(),
+            wab_dir: wab.clone(),
+        };
+        let o = collect_status(&src, SourceMode::Admin, NOW);
+        assert_eq!(o.source, SourceKind::Admin);
+        assert_eq!(
+            o.doc["instance"], envelope,
+            "--json carries the verified instance"
+        );
+        let line = render_human(&o)
+            .into_iter()
+            .find(|l| l.starts_with("instance:"))
+            .unwrap();
+        assert_eq!(
+            line,
+            format!(
+                "instance: daemon pid 4242, wab_dir {}, socket /run/weir/weir.sock",
+                wab.display()
+            )
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
