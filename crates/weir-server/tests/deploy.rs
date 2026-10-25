@@ -16,7 +16,7 @@
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -419,10 +419,29 @@ fn a_daemon_without_readyz_counts_as_ready_when_it_answers_with_weir_metrics() {
     assert_eq!(code, 2, "{out}");
 }
 
+/// A fake `weir-ctl` in its own temp directory, removed on drop.
+struct StubCtl {
+    dir: PathBuf,
+    path: PathBuf,
+}
+
+impl std::ops::Deref for StubCtl {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for StubCtl {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 /// A fake `weir-ctl` that echoes its argv and then prints `$STUB_OUT` and
 /// exits `$STUB_RC` for `status`. `has_status: false` imitates a weir-ctl
 /// from before the subcommand existed: clap exits 2 on `status --help`.
-fn stub_ctl(tag: &str, has_status: bool) -> PathBuf {
+fn stub_ctl(tag: &str, has_status: bool) -> StubCtl {
     let dir = std::env::temp_dir().join(format!("weir-deploy-{}-{tag}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("stub dir");
     let path = dir.join("weir-ctl");
@@ -438,7 +457,7 @@ fn stub_ctl(tag: &str, has_status: bool) -> PathBuf {
     )
     .expect("write stub weir-ctl");
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-    path
+    StubCtl { dir, path }
 }
 
 #[test]

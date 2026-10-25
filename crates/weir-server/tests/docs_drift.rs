@@ -1049,6 +1049,20 @@ fn config_default(key: &str) -> u64 {
     })
 }
 
+/// The `[default: N]` that `--help` prints for `flag` (src/config/cli.rs HELP;
+/// the default may sit on the flag's continuation line).
+fn help_default(flag: &str) -> Option<u64> {
+    let text = CONFIG_CLI_SRC
+        .lines()
+        .skip_while(|l| !l.trim_start().starts_with(flag))
+        .take(3)
+        .collect::<String>();
+    text.split("[default: ")
+        .nth(1)
+        .and_then(|s| s.split(']').next())
+        .and_then(|n| n.trim().parse().ok())
+}
+
 /// `key = <integer>` on an uncommented line of one of the flat `[server]`
 /// TOML files this repository ships.
 fn toml_int(toml: &str, key: &str) -> Option<u64> {
@@ -1091,6 +1105,24 @@ fn the_shutdown_grace_formula_holds_in_every_deploy_file() {
     };
 
     let mut problems = Vec::new();
+
+    // `weir-server --help` states the same defaults the resolver applies.
+    for (key, flag, default) in [
+        ("shutdown_timeout_secs", "--shutdown-timeout-secs", shutdown),
+        (
+            "drain_shutdown_budget_secs",
+            "--drain-shutdown-budget-secs",
+            budget,
+        ),
+    ] {
+        if help_default(flag) != Some(default) {
+            problems.push(format!(
+                "src/config/cli.rs HELP: {flag} needs `[default: {default}]` \
+                 (what Config::resolve applies to {key}), found {:?}",
+                help_default(flag)
+            ));
+        }
+    }
 
     // weir.service runs with deploy/systemd/weir.toml.
     let unit = grace_for(SYSTEMD_TOML);
