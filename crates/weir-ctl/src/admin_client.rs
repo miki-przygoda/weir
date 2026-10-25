@@ -154,8 +154,12 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 pub(crate) enum CallError {
-    /// Nothing usable at the path: absent, refused, permission denied, timed out.
+    /// Nothing usable at the path: absent, refused, permission denied, timed
+    /// out, or the request could not be sent.
     Unreachable(String),
+    /// The whole request was sent to an authenticated daemon but no reply was
+    /// read (timed out, reset, or closed): the daemon may have acted on it.
+    NoReply(String),
     /// The socket or the daemon failed a client-side identity check (exit 2).
     Identity(String),
     /// The daemon answered `ok: false`.
@@ -309,23 +313,31 @@ fn exchange(
     let deadline = DeadlineReader::new(stream, reply_timeout);
     let mut reader = BufReader::new(deadline.take(MAX_REPLY_BYTES + 1));
     let mut reply = String::new();
+    // Once the whole request is sent, a missing reply does not mean nothing
+    // happened: the daemon may have applied it (NoReply, not Unreachable).
+    let no_reply = |why: String| match sent {
+        Ok(()) => CallError::NoReply(why),
+        Err(_) => CallError::Unreachable(why),
+    };
     let n = reader.read_line(&mut reply).map_err(|e| {
         if e.kind() == std::io::ErrorKind::InvalidData {
             CallError::Protocol(format!("the {verb} reply is not UTF-8"))
         } else if is_timeout(&e) {
-            CallError::Unreachable(format!(
+            no_reply(format!(
                 "no reply to {verb} within {:.1}s",
                 reply_timeout.as_secs_f64()
             ))
         } else {
-            CallError::Unreachable(format!("read the {verb} reply: {e}"))
+            no_reply(format!("read the {verb} reply: {e}"))
         }
     })?;
     if n == 0 {
-        return Err(CallError::Unreachable(match sent {
-            Err(e) => format!("send {verb}: {e}"),
-            Ok(()) => format!("the daemon closed the admin connection without answering {verb}"),
-        }));
+        return Err(match &sent {
+            Err(e) => CallError::Unreachable(format!("send {verb}: {e}")),
+            Ok(()) => no_reply(format!(
+                "the daemon closed the admin connection without answering {verb}"
+            )),
+        });
     }
     if !reply.ends_with('\n') {
         // Never parsed: a cut-off line may still be valid JSON.
@@ -883,8 +895,8 @@ mod tests {
             .unwrap_err();
             let took = start.elapsed();
             assert!(
-                matches!(e, CallError::Unreachable(ref w) if w.contains("no reply")),
-                "{e:?}"
+                matches!(e, CallError::NoReply(ref w) if w.contains("no reply")),
+                "the request was sent: {e:?}"
             );
             assert!(
                 took < Duration::from_secs(2),
@@ -916,8 +928,8 @@ mod tests {
 
             // A complete JSON object without its newline (the daemon died
             // mid-write) is never parsed. The request is read first: Linux
-            // resets a peer that closes with unread data, which would be an
-            // Unreachable, not this case.
+            // resets a peer that closes with unread data, which would be a
+            // NoReply, not this case.
             let inst = instance_for(&wab);
             let _h = raw_admin(&dir.join("a.sock"), move |mut s| {
                 let mut req = String::new();
@@ -988,6 +1000,26 @@ mod tests {
             let e = exchange(&a, "status", json!({}), Duration::from_secs(5), None).unwrap_err();
             assert!(
                 matches!(e, CallError::Unreachable(ref w) if w.contains("send status")),
+                "{e:?}"
+            );
+        }
+
+        /// A request that was sent and then met a closed connection is
+        /// NoReply (the daemon may have acted on it); one that could not be
+        /// sent is Unreachable (the case above).
+        #[test]
+        fn a_sent_request_then_a_close_is_no_reply() {
+            let (a, b) = UnixStream::pair().unwrap();
+            let h = std::thread::spawn(move || {
+                let mut req = String::new();
+                std::io::BufRead::read_line(&mut std::io::BufReader::new(&b), &mut req).unwrap();
+                req
+            });
+            let e =
+                exchange(&a, "drain.resume", json!({}), Duration::from_secs(5), None).unwrap_err();
+            assert!(h.join().unwrap().contains("drain.resume"));
+            assert!(
+                matches!(e, CallError::NoReply(ref w) if w.contains("without answering drain.resume")),
                 "{e:?}"
             );
         }

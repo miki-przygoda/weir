@@ -129,14 +129,15 @@ enum Command {
     },
     /// Reload TLS certificates on the running daemon over its admin socket
     /// (the same code path as SIGHUP). Exit: 0 applied or noop, 1 failed,
-    /// 2 no admin socket or identity mismatch.
+    /// 2 no admin socket, no reply (it may have been applied) or identity
+    /// mismatch.
     Reload {
         #[command(flatten)]
         admin: AdminArgs,
     },
     /// Pause, resume or retry delivery on the running daemon (admin socket).
-    /// Exit: 0 done, 4 requested but not yet in effect, 1 error, 2 unreachable
-    /// or identity mismatch.
+    /// Exit: 0 done, 4 requested but not yet in effect, 1 error, 2 unreachable,
+    /// no reply (it may have been applied) or identity mismatch.
     #[command(subcommand)]
     Drain(DrainCommand),
 }

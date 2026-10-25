@@ -80,9 +80,10 @@ pub(crate) fn reload_item_lines(r: &Value) -> Vec<String> {
 }
 
 /// Prints a failed admin call to `err` (under `--json` as the shared
-/// `error_json` object) and returns its exit: 2 unreachable, identity
-/// mismatch or unusable reply; 1 an error response from an authenticated
-/// daemon.
+/// `error_json` object) and returns its exit: 2 unreachable, no reply to a
+/// sent request, identity mismatch or unusable reply; 1 an error response
+/// from an authenticated daemon. A sent request without a reply is not
+/// called unreachable: the daemon may have applied it.
 pub(crate) fn report_call_error(
     verb: &str,
     e: &CallError,
@@ -97,6 +98,13 @@ pub(crate) fn report_call_error(
                 Some(h) => format!("{verb}: admin socket unreachable: {w}\n  hint: {h}"),
                 None => format!("{verb}: admin socket unreachable: {w}"),
             },
+        ),
+        CallError::NoReply(w) => (
+            2,
+            format!(
+                "{verb}: {w}, but the request was sent: it may have been applied; check \
+                 `weir-ctl status`"
+            ),
         ),
         CallError::Identity(w) => (2, format!("{verb}: identity mismatch: {w}")),
         CallError::Protocol(w) => (2, format!("{verb}: unusable reply: {w}")),
@@ -122,7 +130,7 @@ pub(crate) fn report_call_error(
 
 /// `weir-ctl reload`: one admin `reload` call. Exit 0 applied or noop, 1
 /// failed (or an outcome weir-ctl does not recognise), 2 no usable admin
-/// socket, with the SIGHUP hint.
+/// socket (with the SIGHUP hint) or no reply to the sent request.
 pub(crate) fn reload_run(
     target: &AdminTarget,
     json: bool,
@@ -317,8 +325,8 @@ pub(crate) fn drain_lines(verb: DrainVerb, r: &Value, observed: bool) -> Vec<Str
 }
 
 /// One `drain.*` call. Exit 0 observed, 4 requested but not in effect yet,
-/// 1 an error response, 2 unreachable or an identity mismatch. No offline
-/// fallback.
+/// 1 an error response, 2 unreachable, no reply or an identity mismatch. No
+/// offline fallback.
 pub(crate) fn drain_run(
     verb: DrainVerb,
     wait_secs: Option<u64>,
@@ -434,6 +442,69 @@ mod tests {
             e["error"].as_str().unwrap().contains("unreachable"),
             "--json keeps error_json"
         );
+    }
+
+    /// A mutation whose request reached the daemon but whose reply did not
+    /// come back may have been applied: the report says so and points at
+    /// `weir-ctl status` instead of calling the socket unreachable. Same exit.
+    #[cfg(unix)]
+    #[test]
+    fn a_sent_request_without_a_reply_may_have_been_applied() {
+        use crate::admin_client::test_support::*;
+        use std::io::BufRead;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = private_dir("noreply");
+        let wab = dir.join("wab");
+        std::fs::create_dir_all(&wab).unwrap();
+        let sock = dir.join("a.sock");
+        let l = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)).unwrap();
+        // Reads each request and never answers, holding every connection open.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let h = std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for _ in 0..3 {
+                let (s, _) = l.accept().unwrap();
+                let mut req = String::new();
+                std::io::BufReader::new(&s).read_line(&mut req).unwrap();
+                held.push(s);
+            }
+            let _ = done_rx.recv();
+        });
+        let t = crate::admin_client::resolve_admin_target(Some(&sock), Some(&wab));
+        for verb in ["drain.pause", "drain.resume", "reload"] {
+            let e = crate::admin_client::call(&t, verb, json!({}), Duration::from_millis(300))
+                .unwrap_err();
+            let hint = (verb == "reload").then_some(SIGHUP_HINT);
+            let mut err = Vec::new();
+            assert_eq!(
+                report_call_error(verb, &e, false, &mut err, hint),
+                2,
+                "{verb}"
+            );
+            let err = String::from_utf8(err).unwrap();
+            assert!(
+                err.contains("the request was sent")
+                    && err.contains("may have been applied")
+                    && err.contains("`weir-ctl status`"),
+                "{verb}: {err}"
+            );
+            assert!(!err.contains("unreachable"), "{verb}: {err}");
+            assert!(!err.contains("kill -HUP"), "{verb}: {err}");
+            let mut err = Vec::new();
+            assert_eq!(report_call_error(verb, &e, true, &mut err, hint), 2);
+            let v: serde_json::Value = serde_json::from_slice(&err).unwrap();
+            assert!(
+                v["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("may have been applied"),
+                "--json keeps error_json: {v}"
+            );
+        }
+        done_tx.send(()).unwrap();
+        h.join().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[cfg(unix)]

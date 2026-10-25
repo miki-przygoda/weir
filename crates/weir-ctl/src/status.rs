@@ -459,7 +459,9 @@ impl StatusSources for RealSources {
                 Ok(doc)
             }
             Err(CallError::Identity(w)) => Err(SourceFail::Identity(w)),
-            Err(CallError::Unreachable(w) | CallError::Protocol(w)) => Err(SourceFail::Skip(w)),
+            Err(CallError::Unreachable(w) | CallError::NoReply(w) | CallError::Protocol(w)) => {
+                Err(SourceFail::Skip(w))
+            }
             // An authenticated daemon refused the verb (busy, shutting down):
             // the next source may still answer. The reason keeps whether a
             // retry could help, in the words `reload` and `drain` use.
