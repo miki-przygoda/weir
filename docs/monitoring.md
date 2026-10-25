@@ -64,6 +64,103 @@ your scrape config.
 
 ---
 
+## Health and status endpoints
+
+The metrics listener (`metrics_bind:metrics_port`, default `127.0.0.1:9185`)
+serves four more paths. They match exactly (case-sensitive, no trailing-slash
+folding) and accept `GET` and `HEAD`; any other method gets `405`. Every other
+path still returns the metrics, byte for byte as before. None of these routes
+reads a body or changes anything, and their responses carry
+`Cache-Control: no-store`.
+
+| Path | `200` when | `503` when |
+|---|---|---|
+| `/livez` | always with the default `livez_checks = []`, or no selected check is active | a check selected in `livez_checks` is active: `not live: <codes>` |
+| `/readyz` | serving, not shutting down, the `wab_max_bytes` cap not rejecting, at least one shard up, no listener down | any of those fails: `not ready: <codes>` |
+| `/startupz` | the daemon has reached `serving` once (sticky) | still starting: `starting: phase=<p> since=<s>s replay=<n>` |
+| `/status` | always: the public `weir.status/v1` JSON document | never (`500` with an empty body on a serialization error) |
+
+`?verbose` on `/livez` and `/readyz` prints one line per check before the
+verdict: `[+]<code> ok`, or `[-]<code> failed: <summary>` with the public
+summary. Probes and scrapes use separate connection pools, and a client must
+send its request head within 1 s.
+
+### Probe recipe
+
+Kubernetes (fragments of a pod spec; the manifests themselves are future work):
+
+```yaml
+terminationGracePeriodSeconds: 45   # shutdown_timeout_secs + drain_shutdown_budget_secs + 5
+containers:
+  - name: weir
+    startupProbe:
+      httpGet: { path: /startupz, port: 9185 }
+      periodSeconds: 5
+      timeoutSeconds: 2
+      failureThreshold: 120   # 10 minutes: size it to your longest recovery
+    readinessProbe:
+      httpGet: { path: /readyz, port: 9185 }
+      periodSeconds: 5
+      timeoutSeconds: 2
+      failureThreshold: 2
+    livenessProbe:
+      httpGet: { path: /livez, port: 9185 }
+      periodSeconds: 10
+      timeoutSeconds: 2
+      failureThreshold: 6     # a minute of probe-pool pressure before a restart
+```
+
+Set `metrics_bind = "0.0.0.0"` so kubelet can reach the port, and restrict
+9185 to kubelet and Prometheus with a NetworkPolicy: the listener is
+unauthenticated. Liveness is opt-in. With `livez_checks = []`, `/livez` fails
+only when the process stops answering. The recommended set restarts only on
+states that leave ingest dead and that a restart fixes:
+`livez_checks = ["no_live_shard", "listener_down", "worker_exited"]`.
+`drain_stopped` and `drain_wedged` are deliberate opt-ins.
+
+Docker: the image's `HEALTHCHECK` probes `/livez` with bash alone; see
+[container.md](security/container.md#healthcheck).
+
+Bare metal and cron: `deploy/systemd/weir-readiness.sh` exits `1` exactly when
+`/readyz` answers 503, with the exit codes of `weir-ctl status`.
+
+### The `/status` document
+
+`GET /status` returns `weir.status/v1` as JSON with `"view": "public"`. The
+admin socket's `status` verb (and so `weir-ctl status`) returns the same
+document with `"view": "admin"`, which adds the keys marked admin-only below
+and free-text detail inside the shared ones (error messages, panic payloads,
+paths, uids). The public view cannot carry free text: it is a separate type
+with no field that could hold it. Times are unix milliseconds, ages are
+seconds, and an unknown value is `null`. Keys are only ever added within v1.
+
+| Key | Views | Contents |
+|---|---|---|
+| `schema` | public, admin | `"weir.status/v1"` |
+| `view` | public, admin | `"public"` or `"admin"` |
+| `version` | public, admin | the weir version |
+| `wire_version` | public, admin | the wire protocol version |
+| `generated_at_ms` | public, admin | when this document was built |
+| `started_at_ms` | public, admin | process start |
+| `uptime_secs` | public, admin | seconds since start |
+| `pid` | admin | process id |
+| `instance` | admin | `wab_dir`, `socket_path`, and the `wab_dir` (dev, ino) `weir-ctl` checks |
+| `verdict` | public, admin | `ready`, `live`, `startup_complete`, the selected `livez_checks`, the failing codes |
+| `conditions` | public, admin | the active conditions (see [Conditions](#conditions)) |
+| `unevaluated` | public, admin | codes whose evidence is missing; never healthy by default |
+| `startup` | public, admin | phase, since when, replay total and remaining |
+| `lifecycle` | public, admin | shutting down, since when, forced, the drain deadline |
+| `ingest` | public, admin | listener states, queue depth, the `wab_max_bytes` cap |
+| `shards` | public, admin | per shard: state, reason, respawns, worker, hand-off blocked since, active segment age |
+| `drain` | public, admin | state, pause, in-flight segment, queues, channel depth, heartbeat age, last requeue, exit |
+| `sink` | public, admin | type, probe health, last success and failure, consecutive failures |
+| `backlog` | public, admin | undelivered segments and records, oldest undelivered age (an upper bound), dead-letter and quarantine bytes |
+| `reload` | public, admin | the last reload report |
+| `admin` | public, admin | admin protocol version, verbs, socket state and reason code |
+| `config` | public, admin | effective numeric settings; the admin view has the full redacted configuration |
+
+---
+
 ## Alerts & runbook
 
 Severity convention: **critical** = page-worthy (durability or total-stall);

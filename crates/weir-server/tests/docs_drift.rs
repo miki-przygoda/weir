@@ -49,6 +49,11 @@ const MONITORING_COMPOSE: &str = include_str!("../../../deploy/monitoring/docker
 /// 200 status line.
 const LIVEZ_HEALTHCHECK: &str = "exec 3<>/dev/tcp/127.0.0.1/9185 && printf 'GET /livez HTTP/1.0\\r\\n\\r\\n' >&3 && read -r l <&3 && [[ $l == *' 200 '* ]]";
 
+const STATUS_GOLDEN_PUBLIC: &str =
+    include_str!("../../weir-status/tests/golden/status_v1_public.json");
+const STATUS_GOLDEN_ADMIN: &str =
+    include_str!("../../weir-status/tests/golden/status_v1_admin.json");
+
 /// `Version: 2.1.0  ` → `2.1.0`.
 fn latest_md_version() -> &'static str {
     LATEST
@@ -1525,4 +1530,70 @@ fn every_condition_has_a_catalogue_row_and_a_runbook_heading() {
         "docs/monitoring.md's Conditions catalogue disagrees with weir_status:\n  {}",
         problems.join("\n  ")
     );
+}
+
+fn top_level_keys(doc: &str) -> std::collections::BTreeSet<String> {
+    serde_json::from_str::<serde_json::Value>(doc)
+        .expect("a golden status document is valid JSON")
+        .as_object()
+        .expect("a status document is a JSON object")
+        .keys()
+        .cloned()
+        .collect()
+}
+
+/// docs/monitoring.md's `/status` reference has one row per top-level key of
+/// the document, marked with the views that carry it, and no row for a key
+/// the document does not have.
+///
+/// `weir.status/v1` is additive-only and `weir-ctl status --json` pins its
+/// shape, so its keys are a contract operators script against. The goldens
+/// are the serialized types (the weir-status tests pin them), so this follows
+/// the code, not a copy of it.
+#[test]
+fn the_status_reference_lists_every_top_level_key() {
+    let section = MONITORING
+        .split("\n### The `/status` document\n")
+        .nth(1)
+        .expect("docs/monitoring.md must keep its \"The `/status` document\" heading");
+    let section = ["\n## ", "\n### "]
+        .iter()
+        .filter_map(|m| section.find(m))
+        .min()
+        .map_or(section, |end| &section[..end]);
+
+    let mut documented_admin = std::collections::BTreeSet::new();
+    let mut documented_public = std::collections::BTreeSet::new();
+    for line in section.lines().filter(|l| l.starts_with("| `")) {
+        let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+        let key = cells[1].trim_matches('`').to_string();
+        documented_admin.insert(key.clone());
+        if cells[2].contains("public") {
+            documented_public.insert(key);
+        }
+    }
+
+    for (golden, view) in [
+        (STATUS_GOLDEN_PUBLIC, "public"),
+        (STATUS_GOLDEN_ADMIN, "admin"),
+    ] {
+        let v: serde_json::Value = serde_json::from_str(golden).expect("golden JSON");
+        assert_eq!(v["schema"], "weir.status/v1", "the {view} golden's schema");
+        assert_eq!(v["view"], view, "the {view} golden's view");
+    }
+    assert_eq!(
+        documented_admin,
+        top_level_keys(STATUS_GOLDEN_ADMIN),
+        "the `/status` reference rows (left) differ from the admin document's \n\
+         top-level keys (right)"
+    );
+    assert_eq!(
+        documented_public,
+        top_level_keys(STATUS_GOLDEN_PUBLIC),
+        "the rows marked `public` (left) differ from the public document's \n\
+         top-level keys (right); an admin-only key marked public tells operators \n\
+         a field is on the unauthenticated listener when it is not, and the \n\
+         reverse hides one that is"
+    );
+    assert!(MONITORING.contains("`\"weir.status/v1\"`"));
 }
