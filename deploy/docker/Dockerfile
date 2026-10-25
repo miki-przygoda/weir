@@ -12,6 +12,7 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/weir-core/Cargo.toml     crates/weir-core/Cargo.toml
 COPY crates/weir-wab/Cargo.toml      crates/weir-wab/Cargo.toml
+COPY crates/weir-status/Cargo.toml   crates/weir-status/Cargo.toml
 COPY crates/weir-server/Cargo.toml   crates/weir-server/Cargo.toml
 COPY crates/weir-client/Cargo.toml   crates/weir-client/Cargo.toml
 # weir-sink-sdk is a real dependency of weir-server (the Sink trait contract);
@@ -33,6 +34,7 @@ COPY crates/weir-attest/Cargo.toml   crates/weir-attest/Cargo.toml
 RUN mkdir -p \
         crates/weir-core/src \
         crates/weir-wab/src \
+        crates/weir-status/src \
         crates/weir-server/src \
         crates/weir-client/src \
         crates/weir-sink-sdk/src \
@@ -46,6 +48,7 @@ RUN mkdir -p \
     touch \
         crates/weir-core/src/lib.rs \
         crates/weir-wab/src/lib.rs \
+        crates/weir-status/src/lib.rs \
         crates/weir-client/src/lib.rs \
         crates/weir-sink-sdk/src/lib.rs \
         crates/weir-sink-s3/src/lib.rs \
@@ -107,25 +110,37 @@ EXPOSE 9185
 # Note: /run/weir is mounted as a volume so the socket path is accessible
 # to sidecars or host bind-mounts; in a single-container deployment, a
 # tmpfs would be cleaner. The bind hardening (bind_hardened) handles any
-# stale socket from a previous run on the same volume.
+# stale socket from a previous run on the same volume; a socket another
+# daemon is still listening on is never removed (the start refuses instead).
+# One WAB volume = one running daemon: the daemon flocks
+# /var/lib/weir/wab/.weir.lock before reading the WAB, so a second container
+# on the same volume refuses to start ("locked by"). Never delete that file.
 VOLUME ["/var/lib/weir/wab", "/run/weir"]
 
-# Weir's signal handlers expect SIGTERM for graceful shutdown. Make this
-# explicit so orchestrators that override Docker's default still get the
-# clean shutdown path. SIGTERM unwinds the pipeline in dependency order
-# and waits for in-flight connections to drain (shutdown_timeout_secs).
+# Weir shuts down on SIGTERM, within a bound: listeners close at once, an idle
+# connection is closed at once and a connection in the middle of a frame
+# finishes it and gets its ack (for at most shutdown_timeout_secs), active
+# segments are sealed, and the drain gets drain_shutdown_budget_secs to deliver
+# before the rest is left sealed for replay. Give it at least
+#   shutdown_timeout_secs + drain_shutdown_budget_secs + 5
+# seconds (45 s at the defaults): `docker stop -t 45`, compose
+# `stop_grace_period: 45s`, Kubernetes `terminationGracePeriodSeconds: 45`.
+# (The formula must stay on one line: a docs_drift test searches for it.)
+# SIGHUP never stops it: `docker kill --signal=HUP` reloads TLS material when
+# tcp_bind is set and is a counted no-op otherwise.
 STOPSIGNAL SIGTERM
 
-# Lightweight LIVENESS check using bash's /dev/tcp magic (no extra packages
-# needed). Opens a TCP connection to the metrics port; succeeds iff the
-# daemon is alive and the metrics server has bound. Adjust the cadence via the
-# HEALTHCHECK --interval/--timeout/--retries options below (there are no weir
-# "--health-*" CLI flags). This is liveness only — it does not check sink
-# health or drain progress; the image ships only weir-server (no curl/awk/
-# weir-ctl), so a readiness gate must be an external probe over /metrics
-# (see deploy/systemd/weir-readiness.sh for the logic).
-HEALTHCHECK --interval=10s --timeout=3s --start-period=5s --retries=3 \
-    CMD ["/bin/bash", "-c", "exec 3</dev/tcp/127.0.0.1/9185 || exit 1"]
+# LIVENESS: GET /livez over bash's /dev/tcp (the image has no curl or wget).
+# /livez answers 200 whenever the runtime serves HTTP: from a few milliseconds
+# after start, through WAB recovery, and while shutting down. It fails only on
+# the checks selected in `livez_checks` (default none), each a state a restart
+# fixes. It never fails on sink health, a paused, retrying or blocked drain, or
+# a long recovery, so Docker never restarts weir for a slow sink. Readiness
+# ("can it take ingest now?") is GET /readyz; probe it from outside
+# (deploy/systemd/weir-readiness.sh, or a Kubernetes readinessProbe). The port
+# is the default metrics_port: change 9185 here if you change it.
+HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
+    CMD ["/bin/bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9185 && printf 'GET /livez HTTP/1.0\\r\\n\\r\\n' >&3 && read -r l <&3 && [[ $l == *' 200 '* ]]"]
 
 USER weir
 

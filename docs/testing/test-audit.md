@@ -281,12 +281,26 @@ count of refused connects is logged as diagnostics but not asserted on,
 because the kernel listen backlog absorbs connects on most Linux configs
 even while `accept()` is returning EMFILE.
 
-### `socket_takeover_does_not_corrupt_wab_data`
-A second server B launched at server A's socket path calls `bind_cleanup`
-and takes the socket, but A's WAB files must remain byte-identical with
-all 20 payloads still present. The socket file and the WAB are
-independent resources; this models a misconfigured second-instance
-launch.
+### `second_daemon_refuses_a_live_socket`
+A second server B (its own `wab_dir` and metrics port) launched at server
+A's socket path must refuse to start, because the connect-only liveness
+probe finds A listening: B exits 1 with `in use by a running process`, A's
+socket file is the same inode, A's WAB tree is byte-identical, and A still
+acks a Durable push on a new connection. It replaced
+`socket_takeover_does_not_corrupt_wab_data`, which asserted the old
+behaviour (B unlinked A's live socket and took the path over).
+
+### `shutdown_leaves_a_successor_socket_alone`
+While A runs, the test unlinks A's socket and binds its own listener at
+the same path. A's SIGTERM must leave that socket in place (same inode,
+still accepting) and log that another instance replaced it: shutdown
+removes only the inode it bound.
+
+### `starts_cleanly_over_a_stale_socket_left_by_sigkill`
+A daemon delivering to a recording HTTP sink is SIGKILLed, leaving its
+socket file behind with nobody listening (ECONNREFUSED). Restarted on the
+same paths, it must log `removed stale socket`, bind, recover, and deliver
+every record acked before the kill and after the restart.
 
 ## Write-error handling (EFBIG / ENOSPC)
 

@@ -52,9 +52,11 @@ max_payload_bytes            = 1048576   # 1 MiB
 metrics_port = 9185
 metrics_bind = "127.0.0.1"
 
-# Graceful-shutdown budget. Keep this BELOW the unit's TimeoutStopSec (35s) so
-# the daemon finishes its own drain before systemd SIGKILLs it.
-shutdown_timeout_secs = 30
+# Graceful-shutdown budgets. The unit's TimeoutStopSec must be at least
+# shutdown_timeout_secs + drain_shutdown_budget_secs + 5 (45 s with these
+# values); raise it whenever you raise either key.
+shutdown_timeout_secs      = 30
+drain_shutdown_budget_secs = 10
 
 # Dead-letter cap. At the cap the drain BLOCKS all delivery, surfaced as
 # weir_drain_state{state="blocked_dead_letter_full"} = 1 (the WeirDrainBlocked alert).

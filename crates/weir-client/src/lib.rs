@@ -37,7 +37,10 @@
 //! To go faster, **fan out across connections**: create one `WeirClient` per
 //! producer thread (they're independent and the daemon handles many
 //! concurrently). Ordering is only guaranteed within a single connection's
-//! sequential pushes, not across connections.
+//! sequential pushes, not across connections, and it is the order records are
+//! written to the daemon's WAB, not the order the sink receives them: strands,
+//! retry cool-downs, parked segments, `weir-ctl` requeues and the HTTP sink's
+//! concurrent POSTs can all reorder delivery.
 //!
 //! **A pooled client needs no protocol change at all** — the wire protocol
 //! already permits several frames in flight on one connection, and fanning out

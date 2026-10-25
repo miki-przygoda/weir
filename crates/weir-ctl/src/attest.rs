@@ -1050,6 +1050,29 @@ mod tests {
         );
     }
 
+    /// A stale `seg_X.wab.confirmed.tmp` (the daemon's transient sidecar file)
+    /// is not a sealed segment and must never be chained.
+    #[test]
+    fn sealed_segments_in_ignores_a_confirmed_tmp_file() {
+        let scratch = Scratch::new("sealed_ignores_tmp");
+        let shard = scratch.path().join("shard_00");
+        write_segment(&shard.join("seg_00000002.wab.sealed"), 0, &[b"r"]);
+        std::fs::write(shard.join("seg_00000001.wab.confirmed.tmp"), b"half").unwrap();
+        assert_eq!(
+            sealed_segments_in(&shard).unwrap(),
+            vec![shard.join("seg_00000002.wab.sealed")]
+        );
+    }
+
+    #[test]
+    fn shard_dirs_ignores_the_wab_dir_lock_file() {
+        let scratch = Scratch::new("shard_dirs_lock");
+        std::fs::create_dir_all(scratch.path().join("shard_00")).unwrap();
+        std::fs::write(scratch.path().join(".weir.lock"), b"pid=1\n").unwrap();
+        let dirs = shard_dirs(scratch.path(), None).unwrap();
+        assert_eq!(dirs, vec![scratch.path().join("shard_00")]);
+    }
+
     #[test]
     fn shard_dirs_sorts_numerically_not_lexicographically() {
         // P2-F3: `shard_{id:02}` is a MINIMUM width, so past shard_99 a plain

@@ -1,9 +1,10 @@
 //! TCP accept loop with mutual TLS (feature = "tls").
 //!
-//! Mirrors the Unix accept loop ([`super::run`]): shares a global connection-limit
+//! Mirrors the Unix accept loop ([`super::serve`]): shares a global connection-limit
 //! semaphore (passed in by the caller; the same `Arc<Semaphore>` is also given to
 //! the Unix loop so the combined cap across both transports is exactly
-//! `max_connections`), round-robin shard assignment, and a graceful-shutdown watch
+//! `max_connections`), shard assignment through the shared
+//! [`ShardRouter`](super::route::ShardRouter), and a graceful-shutdown watch
 //! channel managed entirely inside `run`. The difference is the transport: this
 //! loop accepts TCP and requires a mutual-TLS handshake (a CA-signed client
 //! certificate) — completed under a handshake timeout — before the shared
@@ -15,8 +16,9 @@
 //! therefore read `local_addr()` before handing the listener over. This serves
 //! both consumers cleanly:
 //!
-//! * production `main.rs` binds `config.tcp_bind` (a concrete address) and logs
-//!   the bound address, then passes the listener in; and
+//! * production `main.rs` binds `config.tcp_bind` (a concrete address) through
+//!   [`super::bind_all`], together with the Unix socket and before either
+//!   accept loop serves, then passes the listener in; and
 //! * integration tests configure the daemon with a fixed loopback port (chosen
 //!   via the testkit's `free_port()` under the process lock), so the test
 //!   already knows the address it will connect to.
@@ -34,7 +36,7 @@ use std::{
 
 use tokio::{
     net::TcpListener,
-    sync::{Semaphore, oneshot, watch},
+    sync::{Semaphore, watch},
     task::JoinSet,
     time,
 };
@@ -64,8 +66,9 @@ pub struct TcpConfig {
     pub max_payload_bytes: usize,
     /// Ceiling on records in one `PushBatch`; see `SocketConfig`.
     pub max_batch_records: usize,
-    /// Total number of WAB shards; new connections are assigned a shard_id
-    /// round-robin (counter % shard_count).
+    /// Total number of WAB shards. Informational; routing is the
+    /// [`ShardRouter`](super::route::ShardRouter)'s, which `run` is handed.
+    #[allow(dead_code, reason = "informational; routing is the ShardRouter's")]
     pub shard_count: usize,
     /// How long to wait for in-flight connections to finish after the shutdown
     /// signal before aborting them.
@@ -84,6 +87,9 @@ pub struct TcpConfig {
     /// Whether the cap is currently rejecting — the SAME `Arc` the Unix listener
     /// gets, so the hysteresis low-water mark is daemon-wide.
     pub wab_cap_rejecting: Arc<AtomicBool>,
+    /// Set once another instance provably owns the `wab_dir` — the SAME `Arc`
+    /// the Unix listener gets, so neither transport acks after the loss.
+    pub wab_ownership_lost: Arc<AtomicBool>,
 }
 
 /// Binds nothing — accepts on the already-bound `listener` (see module docs for
@@ -97,18 +103,35 @@ pub struct TcpConfig {
 /// `handler_shutdown_tx.send(true)` fires BEFORE the drain so idle handlers exit
 /// promptly without waiting out `connection_read_timeout_secs`.
 ///
-/// Returns when `shutdown_rx` fires or is dropped, after draining in-flight
-/// connections within `shutdown_timeout_secs`.
+/// Each accepted connection is pinned to the shard `router` picks; with no
+/// shard able to take ingest the connection is dropped before the TLS
+/// handshake and counted. Pass a clone of the Unix loop's router so both
+/// transports share one refusal limiter.
+///
+/// Returns once the shutdown level leaves `Running` (a dropped level sender
+/// counts as Graceful) and the connection drain has ended. Lame duck
+/// (Foundations §5.7, §7): the listener is closed and marked `Closed` on
+/// `board` BEFORE the drain, so new connects are refused at once; the drain
+/// is bounded by `shutdown_timeout_secs`, and `Forced` aborts it at once
+/// ([`super::drain_connections`]). `run` is the TCP listener's only writer
+/// after the bind (README Q6): `Closed` at the lame duck, `Failed` on its
+/// one `Err` return.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     config: TcpConfig,
     listener: TcpListener,
     tls: ReloadableServerConfig,
     queue_tx: QueueSender<WorkUnit>,
     sem: Arc<Semaphore>,
-    shutdown_rx: oneshot::Receiver<()>,
+    mut level_rx: watch::Receiver<crate::lifecycle::ShutdownLevel>,
     metrics: Arc<Metrics>,
+    router: crate::socket::route::ShardRouter,
+    board: Arc<crate::status::StatusBoard>,
 ) -> std::io::Result<()> {
-    let local_addr = listener.local_addr()?;
+    // The only `?` in `run`: a later one must mark `Failed` the same way.
+    let local_addr = listener.local_addr().inspect_err(|_| {
+        board.listeners.tcp.set(weir_status::ListenerState::Failed);
+    })?;
     info!(addr = %local_addr, "TCP+mTLS listener accepting");
 
     let effective_cap = config
@@ -125,6 +148,7 @@ pub async fn run(
         wab_max_bytes: config.wab_max_bytes,
         wab_bytes_now: Arc::clone(&config.wab_bytes_now),
         wab_cap_rejecting: Arc::clone(&config.wab_cap_rejecting),
+        wab_ownership_lost: Arc::clone(&config.wab_ownership_lost),
     };
     let handshake_timeout = Duration::from_secs(config.handshake_timeout_secs);
 
@@ -137,21 +161,17 @@ pub async fn run(
     let (handler_shutdown_tx, handler_shutdown_rx) = watch::channel(false);
 
     let mut join_set: JoinSet<()> = JoinSet::new();
-    let mut shutdown = std::pin::pin!(shutdown_rx);
 
-    // Round-robin connection counter for shard_id assignment. Same wrap-via-
-    // modulo story as the Unix loop; the counter can grow without bound for
-    // centuries at any realistic accept rate.
+    // Connection counter the router assigns shards from (the n-th accepted
+    // connection); it can grow without bound for centuries at any realistic
+    // accept rate.
     let conn_counter = AtomicU64::new(0);
-    // Config validation enforces shard_count >= 1; the local guard documents
-    // the invariant and keeps the modulo safe.
-    let shard_count = config.shard_count.max(1) as u64;
 
     loop {
         tokio::select! {
             biased;
-            _ = &mut shutdown => {
-                info!("TCP manager: shutdown signal received, stopping accept loop");
+            _ = crate::lifecycle::shutdown_requested(&mut level_rx) => {
+                info!("TCP manager: shutdown requested, stopping accept loop");
                 break;
             }
             res = listener.accept() => {
@@ -162,6 +182,14 @@ pub async fn run(
                         // doesn't grow one node per lifetime connection — it is
                         // otherwise only drained at shutdown. Non-blocking (F1).
                         while join_set.try_join_next().is_some() {}
+                        // Pin the connection to a shard that can take ingest
+                        // (spec §5.7); none live drops it before the handshake.
+                        let n = conn_counter.fetch_add(1, Ordering::Relaxed);
+                        let Some(shard_id) = router.pick(n) else {
+                            router.refuse(&metrics, "tcp");
+                            drop(stream);
+                            continue;
+                        };
                         // Acquire a permit from the shared semaphore. This is the
                         // same Arc<Semaphore> as the Unix listener — the combined
                         // cap across both transports is config.max_connections.
@@ -188,8 +216,7 @@ pub async fn run(
                             tokio_rustls::TlsAcceptor::from(tls.current());
                         let tx = queue_tx.clone();
                         let mut cfg = conn_cfg_template.clone();
-                        let n = conn_counter.fetch_add(1, Ordering::Relaxed);
-                        cfg.shard_id = (n % shard_count) as u32;
+                        cfg.shard_id = shard_id;
                         let m = Arc::clone(&metrics);
                         let mut handler_shutdown = handler_shutdown_rx.clone();
 
@@ -277,40 +304,26 @@ pub async fn run(
         }
     }
 
-    // Broadcast shutdown to every in-flight handler so they exit at the top of
-    // their next read-loop iteration (after acking any push they were
-    // processing). Doing this BEFORE the drain timeout means most handlers
-    // complete naturally; abort_all becomes the emergency fallback.
+    // Lame duck (Foundations §7): close the TCP listener before the connection
+    // drain, so new connects are refused at once instead of queueing in the
+    // backlog for up to shutdown_timeout_secs.
+    drop(listener);
+    board.listeners.tcp.set(weir_status::ListenerState::Closed);
+    info!(addr = %local_addr, "TCP manager: lame duck: listener closed; draining connections");
+
+    // Handlers exit between frames (after acking a push they already read).
+    // Sent BEFORE the bounded drain, so idle handlers exit at once and the
+    // abort in drain_connections is the fallback.
     let _ = handler_shutdown_tx.send(true);
-
-    // Drain in-flight connections within the configured timeout. With
-    // handler_shutdown signalling, idle handlers exit immediately on the next
-    // loop check; active handlers exit after their current push completes
-    // (ack/nack capped by ACK_TIMEOUT). The timeout should be >= ACK_TIMEOUT +
-    // buffer so legitimate in-flight work completes before abort_all is reached.
-    let timeout = Duration::from_secs(config.shutdown_timeout_secs);
-    match time::timeout(timeout, drain_join_set(&mut join_set)).await {
-        Ok(()) => {
-            info!("TCP manager: all connections drained cleanly");
-        }
-        Err(_elapsed) => {
-            error!(
-                remaining = join_set.len(),
-                timeout_secs = config.shutdown_timeout_secs,
-                "TCP manager: shutdown timeout reached; aborting remaining connections"
-            );
-            metrics
-                .connections_aborted_at_shutdown
-                .inc_by(join_set.len() as u64);
-            join_set.abort_all();
-        }
-    }
-
+    super::drain_connections(
+        &mut join_set,
+        Duration::from_secs(config.shutdown_timeout_secs),
+        &mut level_rx,
+        &metrics,
+        "TCP manager",
+    )
+    .await;
     Ok(())
-}
-
-async fn drain_join_set(join_set: &mut JoinSet<()>) {
-    while join_set.join_next().await.is_some() {}
 }
 
 /// Maps a rustls handshake error to a metric reason. rustls surfaces handshake
@@ -434,5 +447,115 @@ mod tests {
             classify_handshake_error(&e),
             TlsHandshakeFailureReason::other
         );
+    }
+
+    /// Lame duck on the TCP side (Foundations §5.7, §7): on Graceful the
+    /// listener is closed and marked `Closed` at once, BEFORE the connection
+    /// drain, which is still waiting on an in-flight Durable push; Forced then
+    /// cuts that 30 s drain short. Mirrors the Unix
+    /// `lame_duck_unlinks_before_the_connection_drain_and_forced_cuts_it_short`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn tcp_lame_duck_closes_the_listener_before_the_connection_drain() {
+        use crate::lifecycle::ShutdownLevel;
+
+        let fx = weir_testkit::tls::TlsFixture::generate("tcp_lame_duck");
+        let tls = ReloadableServerConfig::load(
+            fx.server_cert_path.clone(),
+            fx.server_key_path.clone(),
+            fx.ca_cert_path.clone(),
+        )
+        .expect("load the fixture's TLS material");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let board = crate::status::StatusBoard::for_test_with(1, 1);
+        let (m, _reg) = Metrics::new();
+        let metrics = Arc::new(m);
+        let (queue_tx, queue_rx) = crate::queue::new::<WorkUnit>(1);
+        // Kept alive and never consumed: the push waits for an ack that never
+        // comes, so one handler (and therefore the drain) stays busy.
+        let held = queue_rx.get(0);
+        let config = TcpConfig {
+            max_connections: 4,
+            max_payload_bytes: 1 << 20,
+            max_batch_records: 64,
+            shard_count: 1,
+            shutdown_timeout_secs: 30, // the drain is NOT what closes the listener
+            connection_read_timeout_secs: 30,
+            handshake_timeout_secs: 5,
+            wab_max_bytes: 0,
+            wab_bytes_now: Arc::new(AtomicU64::new(0)),
+            wab_cap_rejecting: Arc::new(AtomicBool::new(false)),
+            wab_ownership_lost: Arc::new(AtomicBool::new(false)),
+        };
+        let (level_tx, level_rx) = watch::channel(ShutdownLevel::Running);
+        let handle = tokio::spawn(run(
+            config,
+            listener,
+            tls,
+            queue_tx,
+            Arc::new(Semaphore::new(4)),
+            level_rx,
+            Arc::clone(&metrics),
+            crate::socket::route::ShardRouter::round_robin(1),
+            Arc::clone(&board),
+        ));
+
+        let (ca, cert, key) = (
+            fx.ca_cert_path.clone(),
+            fx.client_cert_path.clone(),
+            fx.client_key_path.clone(),
+        );
+        let pusher = tokio::task::spawn_blocking(move || {
+            let mut c = weir_client::WeirClient::connect_tls(
+                addr,
+                weir_client::ClientTlsConfig {
+                    client_cert: &cert,
+                    client_key: &key,
+                    ca_cert: &ca,
+                    server_name: "weir-server",
+                    default_durability: None,
+                },
+            )
+            .expect("mTLS connect");
+            c.push(b"in-flight", weir_core::Durability::Durable)
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while held.is_empty() {
+            assert!(
+                Instant::now() < deadline,
+                "the push never reached the queue"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        level_tx.send_replace(ShutdownLevel::Graceful);
+        let t0 = Instant::now();
+        while tokio::net::TcpStream::connect(addr).await.is_ok() {
+            assert!(
+                t0.elapsed() < Duration::from_millis(200),
+                "lame duck: the TCP listener must refuse new connects within 200 ms"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        while board.listeners.tcp.get() != weir_status::ListenerState::Closed {
+            assert!(
+                t0.elapsed() < Duration::from_millis(200),
+                "the TCP listener was never marked Closed"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            !handle.is_finished(),
+            "the connection drain must still be waiting on the in-flight push"
+        );
+
+        level_tx.send_replace(ShutdownLevel::Forced);
+        time::timeout(Duration::from_millis(500), handle)
+            .await
+            .expect("Forced must end the 30 s drain at once")
+            .expect("task should not panic")
+            .expect("run() should return Ok");
+        assert_eq!(metrics.connections_aborted_at_shutdown.get(), 1);
+        let _ = pusher.await; // the aborted connection fails the push
     }
 }

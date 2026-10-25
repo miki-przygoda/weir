@@ -8,6 +8,8 @@ mod cli;
 mod env;
 mod file;
 
+pub(crate) use cli::ConfigPath;
+
 use std::{
     fmt,
     net::{IpAddr, SocketAddr},
@@ -200,6 +202,49 @@ fn parse_postgres_insert_mode(s: &str) -> Result<crate::sink::postgres::InsertMo
     }
 }
 
+/// Parses `wab_dir_lock`. Only the two documented spellings: a typo must not
+/// silently pick a policy, and `best-effort` removes a safety guard.
+fn parse_wab_dir_lock(s: &str) -> Result<crate::wab::lock::LockPolicy, ConfigError> {
+    use crate::wab::lock::LockPolicy;
+    match s {
+        "required" => Ok(LockPolicy::Required),
+        "best-effort" => Ok(LockPolicy::BestEffort),
+        other => Err(ConfigError::InvalidValue {
+            field: "wab_dir_lock",
+            reason: format!("wab_dir_lock must be \"required\" or \"best-effort\", got {other:?}"),
+        }),
+    }
+}
+
+/// Parses `livez_checks`: a comma-separated subset of the five liveness
+/// checks a restart can fix (spec §12). Empty, the default, means `/livez`
+/// answers 200 whenever the runtime answers. Duplicates fold, and the result
+/// is in catalogue order so the rendered list is stable.
+fn parse_livez_checks(s: &str) -> Result<Vec<weir_status::LivezCheck>, ConfigError> {
+    use weir_status::LivezCheck;
+    let mut out: Vec<LivezCheck> = Vec::new();
+    for raw in s.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        let Some(check) = LivezCheck::parse(raw) else {
+            return Err(ConfigError::InvalidValue {
+                field: "livez_checks",
+                reason: format!(
+                    "{raw:?} is not a liveness check; expected a subset of {}",
+                    LivezCheck::ALL
+                        .iter()
+                        .map(|c| c.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            });
+        };
+        if !out.contains(&check) {
+            out.push(check);
+        }
+    }
+    out.sort_by_key(|c| LivezCheck::ALL.iter().position(|a| a == c));
+    Ok(out)
+}
+
 // ── Partial config (one layer) ────────────────────────────────────────────────
 
 #[derive(Default)]
@@ -216,14 +261,19 @@ pub(crate) struct PartialConfig {
     pub wab_max_bytes: Option<u64>,
     pub wab_compression: Option<String>,
     pub wab_compression_level: Option<i32>,
+    pub wab_dir_lock: Option<String>,
     pub max_connections: Option<usize>,
     pub max_payload_bytes: Option<usize>,
     pub max_batch_records: Option<usize>,
     pub metrics_port: Option<u16>,
     pub metrics_bind: Option<String>,
     pub metrics_max_connections: Option<usize>,
+    pub livez_checks: Option<String>,
     pub peer_uid_check: Option<bool>,
+    pub admin_socket_enabled: Option<bool>,
+    pub admin_socket_path: Option<PathBuf>,
     pub shutdown_timeout_secs: Option<u64>,
+    pub drain_shutdown_budget_secs: Option<u64>,
     pub connection_read_timeout_secs: Option<u64>,
     pub sink_type: Option<String>,
     pub sink_url: Option<String>,
@@ -403,6 +453,12 @@ pub struct Config {
     /// "ultra" tier, which needs materially more memory to both compress and
     /// decompress.
     pub wab_compression_level: i32,
+    /// What to do when the filesystem under `wab_dir` cannot take an exclusive
+    /// `flock` on `<wab_dir>/.weir.lock`: `"required"` (default) refuses to
+    /// start, `"best-effort"` WARNs and runs with no guard against a second
+    /// daemon on the same `wab_dir`. Contention (another weir-server holds the
+    /// lock) is refused under both.
+    pub wab_dir_lock: crate::wab::lock::LockPolicy,
     pub max_connections: usize,
     pub max_payload_bytes: usize,
     pub max_batch_records: usize,
@@ -420,6 +476,10 @@ pub struct Config {
     /// fork-bomb surface so a misconfigured (or hostile) client can't spawn
     /// unbounded tokio tasks against the endpoint.
     pub metrics_max_connections: usize,
+    /// Liveness checks `/livez` fails on (spec §12). Empty (default): `/livez`
+    /// is 200 whenever the runtime answers. Only states a restart fixes are
+    /// selectable; every check is evaluated only while the phase is `serving`.
+    pub livez_checks: Vec<weir_status::LivezCheck>,
     /// When true (default), the accept loop reads the peer's effective uid
     /// via SO_PEERCRED (Linux) / getpeereid (macOS) and refuses connections
     /// whose uid does not match the daemon's effective uid. Defense-in-depth
@@ -431,7 +491,17 @@ pub struct Config {
     /// under a different uid than the daemon AND the socket directory's
     /// permissions are the chosen trust boundary.
     pub peer_uid_check: bool,
+    /// Serve the admin Unix socket (Foundations spec §11). Default `true`.
+    pub admin_socket_enabled: bool,
+    /// The operator-set admin socket path, already validated. `None` means
+    /// the path derived from `wab_dir`; resolve with [`Config::admin_socket`].
+    pub admin_socket_path: Option<PathBuf>,
     pub shutdown_timeout_secs: u64,
+    /// How long the drain may keep delivering after every flusher has joined
+    /// (spec §7 T2). At the deadline the in-flight segment is abandoned without
+    /// a `.confirmed` and everything left replays on the next start. 0 =
+    /// abandon at once. Default 10.
+    pub drain_shutdown_budget_secs: u64,
     pub connection_read_timeout_secs: u64,
     pub sink_type: SinkType,
     // These fields are read by the non-noop sink arms in main.rs (http / mysql /
@@ -579,20 +649,191 @@ pub struct Config {
     pub tls_handshake_timeout_secs: u64,
 }
 
+/// The WARN for a config file that does not exist (spec §3.4, D10).
+///
+/// Not an error in this release: the Docker image's CMD always passes
+/// `--config /etc/weir/weir.toml`, so env-only container users would all fail
+/// to start. The hard error for an explicit `--config` waits for the minor
+/// release that also changes that CMD. When nothing else configured a sink,
+/// `sink_type` resolves to `noop`, which acks and drops every record, so the
+/// wording escalates: that is the case where a mistyped path silently turns
+/// a durable pipeline into a discard.
+fn missing_config_file_warning(source: &ConfigSource, sink_type: &SinkType) -> String {
+    let path = source.path.display();
+    let mut msg = if source.explicit {
+        format!(
+            "config file {path} (passed with --config) does not exist; running on \
+             command-line flags, WEIR_* environment variables and built-in defaults only. \
+             A missing --config file will become a startup error in a future minor release"
+        )
+    } else {
+        format!(
+            "no config file at the default path {path}; running on command-line flags, \
+             WEIR_* environment variables and built-in defaults only"
+        )
+    };
+    if matches!(sink_type, SinkType::Noop) {
+        msg = format!(
+            "NOOP SINK: {msg}. sink_type resolved to \"noop\": every record is \
+             acknowledged and then DISCARDED, and nothing reaches a downstream system. \
+             If a config file was meant to set the sink, check the path"
+        );
+    }
+    msg
+}
+
+/// Where the config came from, for the startup INFO line (spec §3.4).
+///
+/// `Config::load` runs before the tracing subscriber exists, so it returns
+/// this rather than logging it; `main` logs it once the subscriber is up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigSource {
+    /// The config file path that was read (or looked for).
+    pub path: PathBuf,
+    /// `true` when the operator passed `--config`; `false` for the default.
+    pub explicit: bool,
+    /// `true` when the file existed and was parsed.
+    pub found: bool,
+}
+
+// ── Admin socket path (Foundations spec §11) ─────────────────────────────────
+
+/// Where (and whether) the admin socket binds. Resolved once at startup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AdminSocketSetting {
+    /// `admin_socket_enabled = false`.
+    Disabled,
+    /// `admin_socket_path` was set: any bind failure is fatal.
+    Explicit(PathBuf),
+    /// `<parent(wab_dir)>/<basename(wab_dir)>.admin.sock`: a bind failure
+    /// disables admin with `admin_unavailable` instead.
+    Derived(PathBuf),
+    /// The derived default breaks a static rule (`reason_code` is one of
+    /// `no_parent`, `path_too_long`, `under_wab_dir`,
+    /// `collides_with_socket_path`).
+    DerivedUnusable {
+        reason_code: &'static str,
+        path: Option<PathBuf>,
+    },
+}
+
+/// A static rule an admin socket path breaks (see [`admin_path_problem`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdminPathProblem {
+    TooLong,
+    UnderWabDir,
+    SameAsSocketPath,
+}
+
+impl AdminPathProblem {
+    /// Public-safe reason code (spec §9.1: codes, never free text).
+    pub(crate) fn reason_code(self) -> &'static str {
+        match self {
+            AdminPathProblem::TooLong => "path_too_long",
+            AdminPathProblem::UnderWabDir => "under_wab_dir",
+            AdminPathProblem::SameAsSocketPath => "collides_with_socket_path",
+        }
+    }
+
+    fn message(self, p: &Path) -> String {
+        match self {
+            AdminPathProblem::TooLong => format!(
+                "'{}' is longer than {} bytes, the longest Unix socket path every \
+                 supported platform can bind",
+                p.display(),
+                weir_status::admin::MAX_SOCKET_PATH_BYTES
+            ),
+            AdminPathProblem::UnderWabDir => format!(
+                "'{}' is inside wab_dir; put the admin socket outside the WAB",
+                p.display()
+            ),
+            AdminPathProblem::SameAsSocketPath => format!(
+                "'{}' is the same path as socket_path; the admin socket needs its own path",
+                p.display()
+            ),
+        }
+    }
+}
+
+/// The static (no-I/O) rules every admin socket path must pass, explicit or
+/// derived (spec §11). The (dev, ino) collision check is done at bind time.
+///
+/// `wab_dir` is compared component-wise (`/x/wab2.sock` is not under
+/// `/x/wab`), and both comparisons use [`weir_status::admin::lexical_normalize`]
+/// so `/run/weir/./weir.sock` collides with `/run/weir/weir.sock`.
+pub(crate) fn admin_path_problem(
+    p: &Path,
+    wab_dir: &Path,
+    socket_path: &Path,
+) -> Option<AdminPathProblem> {
+    use weir_status::admin::{MAX_SOCKET_PATH_BYTES, lexical_normalize};
+    if p.as_os_str().as_encoded_bytes().len() > MAX_SOCKET_PATH_BYTES {
+        return Some(AdminPathProblem::TooLong);
+    }
+    let n = lexical_normalize(p);
+    if n.starts_with(lexical_normalize(wab_dir)) {
+        return Some(AdminPathProblem::UnderWabDir);
+    }
+    if n == lexical_normalize(socket_path) {
+        return Some(AdminPathProblem::SameAsSocketPath);
+    }
+    None
+}
+
 impl Config {
     /// Loads config from all three layers (CLI > env > file > defaults) and
     /// validates.
     ///
     /// Returns the validated config plus any **advisory warnings** collected
     /// during loading (unknown TOML keys, feature-gated keys, the small
-    /// dead-letter-cap advisory). The caller is expected to replay them through
-    /// `tracing` *after* the subscriber is initialised — `load()` runs before
-    /// the subscriber exists, so emitting them here would silently drop them and
-    /// a TOML typo would take defaults unnoticed (F54).
-    pub fn load() -> Result<(Self, Vec<String>), ConfigError> {
+    /// dead-letter-cap advisory, a missing config file). The caller is expected
+    /// to replay them through `tracing` *after* the subscriber is initialised —
+    /// `load()` runs before the subscriber exists, so emitting them here would
+    /// silently drop them and a TOML typo would take defaults unnoticed (F54).
+    /// The [`ConfigSource`] is returned for the same reason: the caller logs it.
+    pub fn load() -> Result<(Self, Vec<String>, ConfigSource), ConfigError> {
         let (cli, config_path) = cli::parse()?;
-        let (file, mut warnings) = file::read(&config_path)?;
-        let env = env::read()?;
+        Self::load_from(cli, config_path, env::read)
+    }
+
+    /// The body of [`Config::load`] with the CLI layer already parsed and the
+    /// env layer behind a closure, so tests can drive it without touching the
+    /// real argv or environment. `env` runs after the file is read, keeping the
+    /// error precedence `load` always had (a bad file is reported before a bad
+    /// env var).
+    pub(crate) fn load_from(
+        cli: PartialConfig,
+        config_path: ConfigPath,
+        env: impl FnOnce() -> Result<PartialConfig, ConfigError>,
+    ) -> Result<(Self, Vec<String>, ConfigSource), ConfigError> {
+        let (file, warnings, found) = match file::read(&config_path.path)? {
+            Some((file, warnings)) => (file, warnings, true),
+            None => (PartialConfig::empty(), Vec::new(), false),
+        };
+        let env = env()?;
+        let (config, mut warnings) = Self::from_layers_with_warnings(cli, env, file, warnings)?;
+        let source = ConfigSource {
+            path: config_path.path,
+            explicit: config_path.explicit,
+            found,
+        };
+        if !found {
+            warnings.push(missing_config_file_warning(&source, &config.sink_type));
+        }
+        Ok((config, warnings, source))
+    }
+
+    /// [`Config::from_layers`] plus the post-validation advisories, appended to
+    /// the `warnings` already collected while reading the file. It is split out
+    /// so tests can assert a warning really reaches the caller, not just that
+    /// it is computed; [`Config::load_from`] adds the config-source warning on
+    /// top.
+    pub(crate) fn from_layers_with_warnings(
+        cli: PartialConfig,
+        env: PartialConfig,
+        file: PartialConfig,
+        mut warnings: Vec<String>,
+    ) -> Result<(Self, Vec<String>), ConfigError> {
         let config = Self::from_layers(cli, env, file)?;
 
         // Post-validation advisory: a tiny dead-letter cap causes frequent
@@ -606,6 +847,7 @@ impl Config {
                 config.dead_letter_max_bytes
             ));
         }
+        warnings.extend(config.advisory_warnings());
 
         Ok((config, warnings))
     }
@@ -631,6 +873,20 @@ impl Config {
 
         let wab_dir_raw = merge!(wab_dir).unwrap_or_else(|| PathBuf::from("/var/lib/weir/wab"));
         let wab_dir = validate_path("wab_dir", &wab_dir_raw)?;
+
+        // Admin socket (Foundations spec §11). The static rules run here; the
+        // (dev, ino) collision check with socket_path runs at bind time.
+        let admin_socket_enabled = merge!(admin_socket_enabled).unwrap_or(true);
+        let admin_socket_path = merge!(admin_socket_path);
+        if let Some(p) = &admin_socket_path {
+            validate_path_format("admin_socket_path", p)?;
+            if let Some(problem) = admin_path_problem(p, &wab_dir, &socket_path) {
+                return Err(ConfigError::InvalidValue {
+                    field: "admin_socket_path",
+                    reason: problem.message(p),
+                });
+            }
+        }
 
         // ── Integer fields with bounds ────────────────────────────────────────
 
@@ -669,6 +925,8 @@ impl Config {
         }
         let wab_compression_level = merge!(wab_compression_level).unwrap_or(1);
         check_range("wab_compression_level", wab_compression_level, 1, 19)?;
+        let wab_dir_lock =
+            parse_wab_dir_lock(&merge!(wab_dir_lock).unwrap_or_else(|| "required".to_string()))?;
         let wab_segment_max_bytes = merge!(wab_segment_max_bytes).unwrap_or(256 * 1024 * 1024);
         if !(4096..=4 * 1024 * 1024 * 1024).contains(&wab_segment_max_bytes) {
             return Err(ConfigError::InvalidValue {
@@ -793,6 +1051,7 @@ impl Config {
 
         let metrics_max_connections = merge!(metrics_max_connections).unwrap_or(8);
         check_range("metrics_max_connections", metrics_max_connections, 1, 1024)?;
+        let livez_checks = parse_livez_checks(&merge!(livez_checks).unwrap_or_default())?;
 
         let peer_uid_check = merge!(peer_uid_check).unwrap_or(true);
 
@@ -803,6 +1062,18 @@ impl Config {
                 reason: "must be at least 1".into(),
             });
         }
+
+        // Bounded shutdown (Foundations §7): the drain's budget after the
+        // flusher joins. 0 is legal (seal, hand off, abandon what is in
+        // flight); the hour cap keeps a typo from turning SIGTERM back into
+        // "deliver the whole backlog".
+        let drain_shutdown_budget_secs = merge!(drain_shutdown_budget_secs).unwrap_or(10);
+        check_range(
+            "drain_shutdown_budget_secs",
+            drain_shutdown_budget_secs,
+            0,
+            3600,
+        )?;
 
         // Per-connection read timeout. Caps how long a connection handler can
         // sit in read_exact waiting for the next byte. Without this a slow or
@@ -1117,14 +1388,19 @@ impl Config {
             wab_max_bytes,
             wab_compression,
             wab_compression_level,
+            wab_dir_lock,
             max_connections,
             max_payload_bytes,
             max_batch_records,
             metrics_port,
             metrics_bind,
             metrics_max_connections,
+            livez_checks,
             peer_uid_check,
+            admin_socket_enabled,
+            admin_socket_path,
             shutdown_timeout_secs,
+            drain_shutdown_budget_secs,
             connection_read_timeout_secs,
             sink_type,
             sink_url: RedactedUrl(sink_url),
@@ -1184,6 +1460,87 @@ impl Config {
 }
 
 // ── Path validation ───────────────────────────────────────────────────────────
+
+impl Config {
+    /// The drain's backstop commit timeout: at least 60 s and at least twice
+    /// the sink's own timeout, so it fires only when a sink ignores its own.
+    pub(crate) fn commit_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.sink_timeout_secs.saturating_mul(2).max(60))
+    }
+
+    /// Resolves the admin socket setting (Foundations spec §11, §6 step 7):
+    /// disabled, the operator's explicit path (already validated by
+    /// `from_layers`), or the path derived from `wab_dir`, which is
+    /// `DerivedUnusable` when it breaks a static rule so admin is disabled
+    /// rather than startup failing.
+    pub(crate) fn admin_socket(&self) -> AdminSocketSetting {
+        if !self.admin_socket_enabled {
+            return AdminSocketSetting::Disabled;
+        }
+        if let Some(p) = &self.admin_socket_path {
+            return AdminSocketSetting::Explicit(p.clone());
+        }
+        let Some(p) = weir_status::admin::default_socket_path(&self.wab_dir) else {
+            return AdminSocketSetting::DerivedUnusable {
+                reason_code: "no_parent",
+                path: None,
+            };
+        };
+        match admin_path_problem(&p, &self.wab_dir, &self.socket_path) {
+            None => AdminSocketSetting::Derived(p),
+            Some(problem) => AdminSocketSetting::DerivedUnusable {
+                reason_code: problem.reason_code(),
+                path: Some(p),
+            },
+        }
+    }
+
+    /// Post-validation advisories about a valid but risky configuration,
+    /// replayed through `tracing` by the caller like the other load warnings.
+    ///
+    /// Plain insert mode without an `id_column` (spec §4.7, D6): a duplicate
+    /// key can then only be resolved by bisecting the batch, and every
+    /// duplicate row is dead-lettered because it is not provably the record
+    /// already stored. That is lossless but fills the DL, and an all-duplicate
+    /// batch whose 2N−1 statements outrun `sink_timeout_secs` never completes.
+    /// With an `id_column` a duplicate is recognised as the same record and
+    /// counts as committed.
+    pub(crate) fn advisory_warnings(&self) -> Vec<String> {
+        match self.sink_type {
+            #[cfg(feature = "mysql-sink")]
+            SinkType::Mysql
+                if self.sink_mysql_insert_mode == crate::sink::mysql::InsertMode::Plain
+                    && self.sink_mysql_id_column.is_none() =>
+            {
+                vec![plain_without_id_column("mysql", "ignore")]
+            }
+            #[cfg(feature = "postgres-sink")]
+            SinkType::Postgres
+                if self.sink_postgres_insert_mode == crate::sink::postgres::InsertMode::Plain
+                    && self.sink_postgres_id_column.is_none() =>
+            {
+                vec![plain_without_id_column(
+                    "postgres",
+                    "on_conflict_do_nothing",
+                )]
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// The advisory for [`Config::advisory_warnings`]: names the setting, the cost
+/// and both fixes.
+#[cfg(any(feature = "mysql-sink", feature = "postgres-sink"))]
+fn plain_without_id_column(sink: &str, idempotent_mode: &str) -> String {
+    format!(
+        "sink_{sink}_insert_mode = \"plain\" without sink_{sink}_id_column: every \
+         duplicate-key row will be dead-lettered (it cannot be proven to be the \
+         record already stored), and an all-duplicate batch can exceed \
+         sink_timeout_secs and be retried indefinitely; set sink_{sink}_id_column \
+         to a UNIQUE column, or use insert_mode = \"{idempotent_mode}\""
+    )
+}
 
 /// Validates a directory path that must already exist.
 /// Returns the canonicalized path.
@@ -1822,6 +2179,83 @@ mod tests {
         }
     }
 
+    /// Spec §4.7 (D6): plain mode without an `id_column` dead-letters every
+    /// duplicate row, and an all-duplicate batch can outrun the sink timeout.
+    /// The operator hears about it at startup, not from a full DL.
+    #[cfg(all(feature = "mysql-sink", feature = "postgres-sink"))]
+    #[test]
+    fn plain_mode_without_an_id_column_warns_at_config_load() {
+        let load = |sink: &str, mode: Option<&str>, id: Option<&str>| {
+            let dir = tmp_dir(&format!("plain_warn_{sink}_{mode:?}_{id:?}"));
+            let mut cli = PartialConfig {
+                wab_dir: Some(dir.clone()),
+                sink_type: Some(sink.into()),
+                sink_url: Some(format!("{sink}://u:p@h/d")),
+                ..PartialConfig::empty()
+            };
+            match sink {
+                "mysql" => {
+                    cli.sink_mysql_insert_mode = mode.map(Into::into);
+                    cli.sink_mysql_id_column = id.map(Into::into);
+                }
+                _ => {
+                    cli.sink_postgres_insert_mode = mode.map(Into::into);
+                    cli.sink_postgres_id_column = id.map(Into::into);
+                }
+            }
+            // Through the same assembly `load()` returns, so a WARN that
+            // never reaches the operator fails here too.
+            let (_, w) = Config::from_layers_with_warnings(
+                cli,
+                PartialConfig::empty(),
+                PartialConfig::empty(),
+                Vec::new(),
+            )
+            .unwrap();
+            fs::remove_dir_all(dir).ok();
+            w
+        };
+
+        for sink in ["mysql", "postgres"] {
+            let w = load(sink, Some("plain"), None);
+            assert_eq!(w.len(), 1, "{sink}: {w:?}");
+            assert!(
+                w[0].contains(&format!("sink_{sink}_insert_mode = \"plain\""))
+                    && w[0].contains(&format!("sink_{sink}_id_column"))
+                    && w[0].contains("dead-letter"),
+                "{sink}: the warning must name the setting, the fix and the cost: {}",
+                w[0]
+            );
+            assert!(
+                load(sink, Some("plain"), Some("record_id")).is_empty(),
+                "{sink}"
+            );
+            assert!(
+                load(sink, None, None).is_empty(),
+                "{sink}: the default mode is idempotent"
+            );
+        }
+        // The idempotent alternatives are named in the advice.
+        assert!(load("mysql", Some("plain"), None)[0].contains("\"ignore\""));
+        assert!(load("postgres", Some("plain"), None)[0].contains("\"on_conflict_do_nothing\""));
+        // A mysql setting is irrelevant to a postgres sink and vice versa.
+        let dir = tmp_dir("plain_warn_other_sink");
+        let c = Config::from_layers(
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                sink_type: Some("postgres".into()),
+                sink_url: Some("postgres://u:p@h/d".into()),
+                sink_mysql_insert_mode: Some("plain".into()),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+        )
+        .unwrap();
+        fs::remove_dir_all(dir).ok();
+        assert!(c.advisory_warnings().is_empty());
+    }
+
     #[cfg(feature = "mysql-sink")]
     #[test]
     fn sink_mysql_insert_mode_rejects_garbage() {
@@ -1973,12 +2407,163 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn missing_config_file_returns_empty_partial() {
-        let (result, warnings) =
+    fn missing_config_file_reads_as_absent_not_an_error() {
+        // The file layer reports "absent" (not an error, not an empty layer that
+        // looks like a real file): Config::load turns it into a WARN (§3.4).
+        let read =
             file::read(Path::new("/weir_test_no_such_config_file_xyzzy_12345.toml")).unwrap();
-        assert!(result.shard_count.is_none());
-        assert!(result.wab_dir.is_none());
-        assert!(warnings.is_empty(), "a missing file yields no warnings");
+        assert!(read.is_none(), "a missing file must read as absent");
+    }
+
+    // ── §3.4 (D10): a missing config file is no longer silent ────────────────
+
+    /// Drives `Config::load_from` with a CLI layer that only sets `wab_dir`
+    /// (plus `extra`), the given config path, and an empty env layer.
+    fn load_missing(
+        label: &str,
+        explicit: bool,
+        extra: PartialConfig,
+    ) -> (Config, Vec<String>, ConfigSource, PathBuf) {
+        let dir = tmp_dir(label);
+        let path = dir.join("no-such-weir.toml");
+        let cli = PartialConfig {
+            wab_dir: Some(dir.clone()),
+            ..extra
+        };
+        let (config, warnings, source) = Config::load_from(
+            cli,
+            ConfigPath {
+                path: path.clone(),
+                explicit,
+            },
+            || Ok(PartialConfig::empty()),
+        )
+        .map_err(|e| e.to_string())
+        .expect("a missing config file must not be an error (D10)");
+        (config, warnings, source, path)
+    }
+
+    fn missing_warnings<'a>(warnings: &'a [String], path: &Path) -> Vec<&'a String> {
+        let p = path.display().to_string();
+        warnings.iter().filter(|w| w.contains(&p)).collect()
+    }
+
+    #[cfg(feature = "http-sink")]
+    fn http_sink() -> PartialConfig {
+        PartialConfig {
+            sink_type: Some("http".to_string()),
+            sink_url: Some("http://127.0.0.1:9/ingest".to_string()),
+            ..PartialConfig::empty()
+        }
+    }
+
+    /// An operator's `--config <path>` that does not exist still loads (the
+    /// Docker image always passes `--config`, so env-only users would break),
+    /// but now WARNs, naming the path and that it was passed explicitly.
+    #[test]
+    fn missing_explicit_config_warns_naming_path() {
+        let (_, warnings, source, path) =
+            load_missing("missing_explicit", true, PartialConfig::empty());
+        let hits = missing_warnings(&warnings, &path);
+        assert_eq!(
+            hits.len(),
+            1,
+            "exactly one missing-file warning: {warnings:?}"
+        );
+        assert!(hits[0].contains("--config"), "{hits:?}");
+        assert!(hits[0].contains("does not exist"), "{hits:?}");
+        assert_eq!(
+            source,
+            ConfigSource {
+                path: path.clone(),
+                explicit: true,
+                found: false
+            }
+        );
+
+        // Same wording without a noop sink: the path and --config still named.
+        #[cfg(feature = "http-sink")]
+        {
+            let (_, warnings, _, path) = load_missing("missing_explicit_http", true, http_sink());
+            let hits = missing_warnings(&warnings, &path);
+            assert_eq!(hits.len(), 1, "{warnings:?}");
+            assert!(hits[0].contains("--config"), "{hits:?}");
+        }
+    }
+
+    /// The implicit default path missing also WARNs, naming the path, and does
+    /// not claim the operator passed `--config`.
+    #[test]
+    fn missing_default_config_warns() {
+        let (_, warnings, source, path) =
+            load_missing("missing_default", false, PartialConfig::empty());
+        let hits = missing_warnings(&warnings, &path);
+        assert_eq!(
+            hits.len(),
+            1,
+            "exactly one missing-file warning: {warnings:?}"
+        );
+        assert!(hits[0].contains("default"), "{hits:?}");
+        assert!(
+            !hits[0].contains("passed with --config"),
+            "the default path was not passed explicitly: {hits:?}"
+        );
+        assert!(!source.explicit && !source.found, "{source:?}");
+    }
+
+    /// With the file missing and nothing else configuring a sink, `sink_type`
+    /// resolves to `noop`, which acks and discards every record. The warning
+    /// escalates to say exactly that. A real sink keeps the plain wording.
+    #[test]
+    fn missing_config_with_noop_sink_warns_loudly() {
+        for explicit in [true, false] {
+            let (config, warnings, _, path) =
+                load_missing("missing_noop", explicit, PartialConfig::empty());
+            assert!(matches!(config.sink_type, SinkType::Noop));
+            let hits = missing_warnings(&warnings, &path);
+            assert_eq!(hits.len(), 1, "{warnings:?}");
+            assert!(hits[0].contains("noop"), "{hits:?}");
+            assert!(hits[0].contains("DISCARDED"), "{hits:?}");
+        }
+
+        #[cfg(feature = "http-sink")]
+        for explicit in [true, false] {
+            let (_, warnings, _, path) = load_missing("missing_not_noop", explicit, http_sink());
+            let hits = missing_warnings(&warnings, &path);
+            assert_eq!(hits.len(), 1, "{warnings:?}");
+            assert!(
+                !hits[0].contains("DISCARDED"),
+                "a configured sink must not get the noop wording: {hits:?}"
+            );
+        }
+    }
+
+    /// A config file that exists produces no missing-file warning and reports
+    /// itself as found.
+    #[test]
+    fn present_config_file_does_not_warn_missing() {
+        let dir = tmp_dir("present_cfg");
+        let path = dir.join("weir.toml");
+        fs::write(&path, "[server]\nshard_count = 2\n").unwrap();
+        let (config, warnings, source) = Config::load_from(
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                ..PartialConfig::empty()
+            },
+            ConfigPath {
+                path: path.clone(),
+                explicit: true,
+            },
+            || Ok(PartialConfig::empty()),
+        )
+        .map_err(|e| e.to_string())
+        .unwrap();
+        assert_eq!(config.shard_count, 2);
+        assert!(
+            missing_warnings(&warnings, &path).is_empty(),
+            "an existing file must not warn: {warnings:?}"
+        );
+        assert!(source.found && source.explicit, "{source:?}");
     }
 
     // ── TCP + TLS config ──────────────────────────────────────────────────────
@@ -2317,6 +2902,131 @@ mod tests {
     }
 
     #[test]
+    fn livez_checks_defaults_to_empty() {
+        let dir = tmp_dir("livez_default");
+        let c = layers_with_wab(dir.clone()).unwrap();
+        assert!(c.livez_checks.is_empty(), "liveness is opt-in (spec §12)");
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn livez_checks_parse_dedup_and_catalogue_order() {
+        use weir_status::LivezCheck;
+        let dir = tmp_dir("livez_parse");
+        let c = Config::from_layers(
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                livez_checks: Some(" worker_exited,no_live_shard , worker_exited,".into()),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+        )
+        .unwrap();
+        assert_eq!(
+            c.livez_checks,
+            vec![LivezCheck::NoLiveShard, LivezCheck::WorkerExited]
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn livez_checks_rejects_an_unselectable_code() {
+        let dir = tmp_dir("livez_bad");
+        // `sink_down` is a real condition but never a liveness check: a restart
+        // does not fix a down sink (spec §12).
+        for bad in ["sink_down", "No_Live_Shard", "starting"] {
+            let err = Config::from_layers(
+                PartialConfig {
+                    wab_dir: Some(dir.clone()),
+                    livez_checks: Some(bad.into()),
+                    ..PartialConfig::empty()
+                },
+                PartialConfig::empty(),
+                PartialConfig::empty(),
+            )
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("livez_checks"), "{err}");
+            assert!(
+                err.contains("no_live_shard"),
+                "the error lists the valid checks: {err}"
+            );
+        }
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn wab_dir_lock_defaults_to_required() {
+        use crate::wab::lock::LockPolicy;
+        let dir = tmp_dir("wab_dir_lock_default");
+        let c = layers_with_wab(dir.clone()).unwrap();
+        assert_eq!(c.wab_dir_lock, LockPolicy::Required);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn wab_dir_lock_best_effort_accepted_and_cli_overrides_file() {
+        use crate::wab::lock::LockPolicy;
+        let dir = tmp_dir("wab_dir_lock_best_effort");
+        let c = Config::from_layers(
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                wab_dir_lock: Some("best-effort".into()),
+                ..PartialConfig::empty()
+            },
+        )
+        .unwrap();
+        assert_eq!(c.wab_dir_lock, LockPolicy::BestEffort);
+
+        let c = Config::from_layers(
+            PartialConfig {
+                wab_dir_lock: Some("required".into()),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                wab_dir_lock: Some("best-effort".into()),
+                ..PartialConfig::empty()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            c.wab_dir_lock,
+            LockPolicy::Required,
+            "CLI wins over the file"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn invalid_wab_dir_lock_rejected() {
+        let dir = tmp_dir("bad_wab_dir_lock");
+        // `best_effort` (underscore) is a plausible typo; it must not silently
+        // select either policy.
+        for bad in ["best_effort", "off", ""] {
+            let err = Config::from_layers(
+                PartialConfig {
+                    wab_dir: Some(dir.clone()),
+                    wab_dir_lock: Some(bad.into()),
+                    ..PartialConfig::empty()
+                },
+                PartialConfig::empty(),
+                PartialConfig::empty(),
+            )
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("wab_dir_lock"), "{msg}");
+            assert!(msg.contains("best-effort"), "{msg}");
+        }
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn wab_compression_level_range_is_enforced() {
         // 1..=19. Above 19 is zstd's "ultra" tier, which needs materially more
         // memory to both compress and decompress.
@@ -2477,5 +3187,180 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("wab_max_bytes"), "{err}");
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn drain_shutdown_budget_defaults_to_ten_seconds() {
+        let dir = tmp_dir("budget_default");
+        let c = layers_with_wab(dir.clone()).unwrap();
+        // Spec §13: 10 s, counted from the flusher joins (owner decision).
+        assert_eq!(c.drain_shutdown_budget_secs, 10);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn drain_shutdown_budget_accepts_zero_and_an_hour_and_rejects_more() {
+        for ok in [0u64, 3600] {
+            let dir = tmp_dir(&format!("budget_ok_{ok}"));
+            let c = Config::from_layers(
+                PartialConfig {
+                    wab_dir: Some(dir.clone()),
+                    drain_shutdown_budget_secs: Some(ok),
+                    ..PartialConfig::empty()
+                },
+                PartialConfig::empty(),
+                PartialConfig::empty(),
+            )
+            .unwrap();
+            // 0 is legal: "seal, hand off, abandon whatever is in flight".
+            assert_eq!(c.drain_shutdown_budget_secs, ok);
+            fs::remove_dir_all(dir).ok();
+        }
+        assert_knob_rejected("rng_drain_budget", "drain_shutdown_budget_secs", |p| {
+            p.drain_shutdown_budget_secs = Some(3601)
+        });
+    }
+
+    // ── admin socket (Foundations spec §11, Task 6.2) ─────────────────────────
+
+    #[test]
+    fn admin_socket_defaults_to_enabled_and_derived() {
+        let dir = tmp_dir("admin_default");
+        let c = layers_with_wab(dir.clone()).unwrap();
+        assert!(c.admin_socket_enabled);
+        assert_eq!(c.admin_socket_path, None);
+        let want = weir_status::admin::default_socket_path(&c.wab_dir).unwrap();
+        assert_eq!(c.admin_socket(), AdminSocketSetting::Derived(want));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn admin_socket_can_be_disabled_from_the_file() {
+        let dir = tmp_dir("admin_disabled");
+        let c = Config::from_layers(
+            PartialConfig::empty(),
+            PartialConfig::empty(),
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                admin_socket_enabled: Some(false),
+                admin_socket_path: Some(PathBuf::from("/run/weir-admin/a.sock")),
+                ..PartialConfig::empty()
+            },
+        )
+        .unwrap();
+        assert_eq!(c.admin_socket(), AdminSocketSetting::Disabled);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn an_explicit_admin_path_is_used_verbatim() {
+        let dir = tmp_dir("admin_explicit");
+        let c = Config::from_layers(
+            PartialConfig {
+                admin_socket_path: Some(PathBuf::from("/run/weir-admin/a.sock")),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                ..PartialConfig::empty()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            c.admin_socket(),
+            AdminSocketSetting::Explicit(PathBuf::from("/run/weir-admin/a.sock"))
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn invalid_explicit_admin_paths_are_rejected() {
+        let dir = tmp_dir("admin_invalid");
+        // wab_dir is canonicalized by `validate_path` (/var -> /private/var on
+        // macOS), so the "inside wab_dir" case must use the canonical form.
+        let under_wab = std::fs::canonicalize(&dir).unwrap().join("admin.sock");
+        let long = PathBuf::from(format!("/{}", "a".repeat(103)));
+        let cases: Vec<(PathBuf, &str)> = vec![
+            (PathBuf::from("relative.sock"), "not absolute"),
+            (PathBuf::from("/run/../weir/a.sock"), "'..'"),
+            (long, "103"),
+            (under_wab, "inside wab_dir"),
+            (
+                PathBuf::from("/run/weir//./weir.sock"),
+                "same path as socket_path",
+            ),
+        ];
+        for (p, needle) in cases {
+            let err = Config::from_layers(
+                PartialConfig {
+                    admin_socket_path: Some(p.clone()),
+                    ..PartialConfig::empty()
+                },
+                PartialConfig::empty(),
+                PartialConfig {
+                    wab_dir: Some(dir.clone()),
+                    ..PartialConfig::empty()
+                },
+            )
+            .expect_err(&format!("{} must be rejected", p.display()))
+            .to_string();
+            assert!(err.contains("admin_socket_path"), "{err}");
+            assert!(err.contains(needle), "{}: {err}", p.display());
+        }
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// A derived default that breaks a static rule disables admin; it never
+    /// fails startup (spec §6 step 7).
+    #[test]
+    fn a_derived_default_that_collides_is_unusable_not_fatal() {
+        let dir = tmp_dir("adm_dc"); // short: the derived path must stay <= 103 bytes on macOS
+        let canonical = std::fs::canonicalize(&dir).unwrap();
+        let derived = weir_status::admin::default_socket_path(&canonical).unwrap();
+        let c = Config::from_layers(
+            PartialConfig {
+                socket_path: Some(derived.clone()),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                ..PartialConfig::empty()
+            },
+        )
+        .expect("the producer socket_path itself is valid");
+        assert_eq!(
+            c.admin_socket(),
+            AdminSocketSetting::DerivedUnusable {
+                reason_code: "collides_with_socket_path",
+                path: Some(derived),
+            }
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn admin_path_problem_table() {
+        let wab = Path::new("/var/lib/weir/wab");
+        let sock = Path::new("/run/weir/weir.sock");
+        assert_eq!(
+            admin_path_problem(Path::new("/var/lib/weir/wab.admin.sock"), wab, sock),
+            None
+        );
+        assert_eq!(
+            admin_path_problem(Path::new("/var/lib/weir/wab/x.sock"), wab, sock),
+            Some(AdminPathProblem::UnderWabDir)
+        );
+        assert_eq!(
+            admin_path_problem(Path::new("/var/lib/weir/wab2.sock"), wab, sock),
+            None,
+            "component-wise, not string prefix"
+        );
+        assert_eq!(
+            admin_path_problem(Path::new("/run/weir/./weir.sock"), wab, sock),
+            Some(AdminPathProblem::SameAsSocketPath)
+        );
+        assert_eq!(AdminPathProblem::TooLong.reason_code(), "path_too_long");
     }
 }

@@ -32,6 +32,10 @@ OPTIONS:
                                                cannot read
     --wab-compression-level <n>              zstd level 1-19 (default: 3), ignored
                                                unless --wab-compression=zstd
+    --wab-dir-lock <required|best-effort>    On a filesystem that cannot flock the
+                                               wab_dir lock: refuse to start, or warn
+                                               and run unguarded [default: required].
+                                               A held lock always refuses
     --max-connections <n>                    Connection cap (1-512) [default: 256]
     --max-payload-bytes <n>                  Payload cap in bytes [default: 16777216]
     --connection-read-timeout-secs <n>       Slowloris guard (1-600) [default: 30]
@@ -40,9 +44,18 @@ OPTIONS:
                                                on the network) [default: 127.0.0.1]
     --metrics-max-connections <n>            Concurrent metrics scrapes cap
                                                (1-1024) [default: 8]
+    --livez-checks <a,b>                     /livez fails on these (listener_down,
+                                               no_live_shard, worker_exited,
+                                               drain_stopped, drain_wedged)
+                                               [default: none]
     --peer-uid-check <bool>                  Refuse connections from uids other
                                                than the daemon's [default: true]
+    --admin-socket-path <path>               Admin Unix socket path (ABSOLUTE, <= 103 bytes)
+                                               [default: <wab_dir parent>/<wab_dir name>.admin.sock]
+                                               [env: WEIR_ADMIN_SOCKET_PATH]
     --shutdown-timeout-secs <secs>           Graceful shutdown timeout (1+) [default: 30]
+    --drain-shutdown-budget-secs <secs>      Drain delivery budget after SIGTERM, once
+                                               ingest is sealed (0-3600) [default: 10]
     --sink-type <type>                       Sink: noop | http | mysql | postgres |
                                                clickhouse [default: noop]
     --sink-url <url>                         Sink URL (required for http/mysql/postgres/
@@ -104,15 +117,33 @@ NOTES:
     clickhouse-sink). On a binary built without a feature, passing its flag
     is rejected with a message naming the feature to rebuild with.
     Boolean flags accept true/false, 1/0, yes/no, or on/off.
+    The admin socket is on by default; turn it off with
+    WEIR_ADMIN_SOCKET_ENABLED=false or admin_socket_enabled = false in the
+    config file (there is no flag for it).
 ";
 
-pub(super) fn parse() -> Result<(PartialConfig, PathBuf), ConfigError> {
+/// The config file path used when `--config` is not passed.
+pub(super) const DEFAULT_CONFIG_PATH: &str = "/etc/weir/weir.toml";
+
+/// Which config file to read, and whether the operator named it.
+///
+/// `--config` defaults to [`DEFAULT_CONFIG_PATH`], so the path alone cannot tell
+/// an operator's explicit `--config /etc/weir/weir.toml` (the Docker image's
+/// CMD) from the implicit default. `explicit` keeps that distinction for the
+/// missing-file warning (spec §3.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfigPath {
+    pub(crate) path: PathBuf,
+    pub(crate) explicit: bool,
+}
+
+pub(super) fn parse() -> Result<(PartialConfig, ConfigPath), ConfigError> {
     parse_from(pico_args::Arguments::from_env())
 }
 
 pub(super) fn parse_from(
     mut pargs: pico_args::Arguments,
-) -> Result<(PartialConfig, PathBuf), ConfigError> {
+) -> Result<(PartialConfig, ConfigPath), ConfigError> {
     if pargs.contains(["-h", "--help"]) {
         print!("{HELP}");
         std::process::exit(0);
@@ -125,10 +156,19 @@ pub(super) fn parse_from(
         std::process::exit(0);
     }
 
-    let config_path: PathBuf = pargs
-        .opt_value_from_str("--config")
+    let config_path = match pargs
+        .opt_value_from_str::<_, PathBuf>("--config")
         .map_err(pico_err)?
-        .unwrap_or_else(|| PathBuf::from("/etc/weir/weir.toml"));
+    {
+        Some(path) => ConfigPath {
+            path,
+            explicit: true,
+        },
+        None => ConfigPath {
+            path: PathBuf::from(DEFAULT_CONFIG_PATH),
+            explicit: false,
+        },
+    };
 
     let partial = PartialConfig {
         socket_path: pargs
@@ -175,9 +215,19 @@ pub(super) fn parse_from(
         metrics_max_connections: pargs
             .opt_value_from_str("--metrics-max-connections")
             .map_err(pico_err)?,
+        livez_checks: pargs
+            .opt_value_from_str("--livez-checks")
+            .map_err(pico_err)?,
         peer_uid_check: opt_bool(&mut pargs, "--peer-uid-check")?,
+        admin_socket_enabled: None, // env/TOML only (spec §13)
+        admin_socket_path: pargs
+            .opt_value_from_str("--admin-socket-path")
+            .map_err(pico_err)?,
         shutdown_timeout_secs: pargs
             .opt_value_from_str("--shutdown-timeout-secs")
+            .map_err(pico_err)?,
+        drain_shutdown_budget_secs: pargs
+            .opt_value_from_str("--drain-shutdown-budget-secs")
             .map_err(pico_err)?,
         connection_read_timeout_secs: pargs
             .opt_value_from_str("--connection-read-timeout-secs")
@@ -199,6 +249,9 @@ pub(super) fn parse_from(
             .map_err(pico_err)?,
         wab_compression_level: pargs
             .opt_value_from_str("--wab-compression-level")
+            .map_err(pico_err)?,
+        wab_dir_lock: pargs
+            .opt_value_from_str("--wab-dir-lock")
             .map_err(pico_err)?,
         sink_http_batch: pargs
             .opt_value_from_str("--sink-http-batch")
@@ -374,6 +427,55 @@ mod tests {
         pico_args::Arguments::from_vec(parts.iter().map(OsString::from).collect())
     }
 
+    #[test]
+    fn livez_checks_flag_is_parsed() {
+        let (partial, _) =
+            parse_from(args(&["--livez-checks", "no_live_shard,listener_down"])).unwrap();
+        assert_eq!(
+            partial.livez_checks.as_deref(),
+            Some("no_live_shard,listener_down")
+        );
+        assert!(
+            HELP.contains("--livez-checks"),
+            "the flag must be in --help"
+        );
+    }
+
+    #[test]
+    fn wab_dir_lock_flag_is_parsed() {
+        let (partial, _) = parse_from(args(&["--wab-dir-lock", "best-effort"])).unwrap();
+        assert_eq!(partial.wab_dir_lock.as_deref(), Some("best-effort"));
+        assert!(
+            HELP.contains("--wab-dir-lock"),
+            "the flag must be in --help"
+        );
+    }
+
+    /// `--config` is tracked as explicit, and its absence as the default path,
+    /// so a missing file can be reported for what it is (spec §3.4).
+    #[test]
+    fn config_flag_is_tracked_as_explicit() {
+        let (_, given) = parse_from(args(&["--config", "/tmp/x.toml"])).unwrap();
+        assert_eq!(
+            given,
+            ConfigPath {
+                path: PathBuf::from("/tmp/x.toml"),
+                explicit: true
+            }
+        );
+        // Explicit even when it names the default path (the Docker CMD does).
+        let (_, docker) = parse_from(args(&["--config", DEFAULT_CONFIG_PATH])).unwrap();
+        assert!(docker.explicit);
+        let (_, implicit) = parse_from(args(&[])).unwrap();
+        assert_eq!(
+            implicit,
+            ConfigPath {
+                path: PathBuf::from(DEFAULT_CONFIG_PATH),
+                explicit: false
+            }
+        );
+    }
+
     // ── F57: lenient boolean flags ────────────────────────────────────────────
 
     #[test]
@@ -439,5 +541,29 @@ mod tests {
                 "{flag} names an unknown feature {feature}"
             );
         }
+    }
+
+    #[test]
+    fn drain_shutdown_budget_flag_is_parsed() {
+        let (partial, _) = parse_from(args(&["--drain-shutdown-budget-secs", "42"])).unwrap();
+        assert_eq!(partial.drain_shutdown_budget_secs, Some(42));
+        assert!(
+            HELP.contains("--drain-shutdown-budget-secs"),
+            "the flag must be in --help"
+        );
+    }
+
+    #[test]
+    fn admin_socket_path_flag_is_parsed() {
+        let (partial, _) =
+            parse_from(args(&["--admin-socket-path", "/run/weir-admin/a.sock"])).unwrap();
+        assert_eq!(
+            partial.admin_socket_path,
+            Some(PathBuf::from("/run/weir-admin/a.sock"))
+        );
+        assert!(
+            HELP.contains("--admin-socket-path"),
+            "the flag must be in --help"
+        );
     }
 }

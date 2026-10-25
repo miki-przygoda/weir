@@ -4,10 +4,24 @@ services:
       context: ../..
       dockerfile: deploy/docker/Dockerfile
     image: weir-server:local
+    # Do not scale this service (--scale weir=2) on the shared volumes below.
+    # The fixed host port already stops a second replica; without it, the
+    # replica would refuse to start because the first one holds the wab_dir lock
+    # ("locked by"), and this restart policy would restart it in a loop. Give
+    # each instance its own WAB volume. Exit status 1 = refused to start; 3 = WAB
+    # ownership lost to another instance at runtime.
     restart: unless-stopped
 
+    # weir's shutdown is bounded at
+    #   shutdown_timeout_secs + drain_shutdown_budget_secs + 5
+    # (30 + 10 + 5 = 45 s with weir.toml.example). Docker's own default is 10 s,
+    # after which it SIGKILLs: crash-safe, but the drain then gets no budget and
+    # every active segment waits for recovery. Raise this with either key.
+    stop_grace_period: 45s
+
     volumes:
-      # WAB segments persist across restarts.
+      # WAB segments persist across restarts. The daemon keeps an exclusive
+      # flock on .weir.lock in this volume while it runs: never delete it.
       - wab_data:/var/lib/weir/wab
       # Unix socket shared with producer containers on the same host.
       - weir_socket:/run/weir
@@ -36,21 +50,18 @@ services:
     user: weir
 
     healthcheck:
-      # The metrics endpoint doubles as a liveness probe — it only binds after
-      # the socket is bound and the pipeline is running.
-      #
-      # The runtime image (debian:bookworm-slim) ships ONLY ca-certificates —
-      # there is NO wget or curl — so an HTTP-client probe would always fail with
-      # "wget: not found", marking a healthy container unhealthy and (under
-      # restart: unless-stopped) triggering a restart loop. Mirror the
-      # Dockerfile's HEALTHCHECK instead: bash's /dev/tcp opens a TCP connection
-      # to the metrics port (9185) with no extra packages. Succeeds iff the
-      # daemon is alive and the metrics server has bound.
-      test: ["CMD", "/bin/bash", "-c", "exec 3</dev/tcp/127.0.0.1/9185 || exit 1"]
+      # Liveness: GET /livez, the same command as the Dockerfile's HEALTHCHECK.
+      # The image ships ONLY ca-certificates (no curl or wget), so the request is
+      # written by hand over bash's /dev/tcp. `$$l` is compose's escape for the
+      # shell's `$l`; a bare `$l` would be interpolated by compose as an empty
+      # variable and the container would never become healthy. /livez fails
+      # only on the `livez_checks` you select (default none), never on sink
+      # health or a slow recovery.
+      test: ["CMD", "/bin/bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9185 && printf 'GET /livez HTTP/1.0\\r\\n\\r\\n' >&3 && read -r l <&3 && [[ $$l == *' 200 '* ]]"]
       interval: 10s
       timeout: 3s
       retries: 3
-      start_period: 5s
+      start_period: 10s
 
 volumes:
   wab_data:

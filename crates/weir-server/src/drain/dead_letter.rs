@@ -19,7 +19,7 @@ use weir_core::Payload;
 use crate::wab::{
     create_dir_private,
     format::{Compression, SEGMENT_FOOTER_LEN, SEGMENT_HEADER_LEN, SENTINEL},
-    segment::WabSegment,
+    segment::{WabSegment, fsync_parent_dir},
 };
 
 /// Bytes a sealed dead-letter segment occupies for `records`: the header +
@@ -43,6 +43,12 @@ pub(crate) struct DeadLetterWriter {
     /// Running total of all file bytes in the dead-letter directory. Accurate
     /// once `open` has scanned the directory; updated after every successful write.
     total_bytes: u64,
+    /// True once `wab_dir` has been fsynced since the directory was last
+    /// (re)created, so its entry there is durable. No record is written while
+    /// it is false: a dead-lettered record counts as handled and its source
+    /// segment is then confirmed and deleted, so the record must not live in a
+    /// directory a power loss could unlink (conf-durability-4).
+    dir_entry_durable: bool,
 }
 
 impl DeadLetterWriter {
@@ -52,10 +58,14 @@ impl DeadLetterWriter {
         let dir = wab_dir.join("dead_letter");
         create_dir_private(dir.clone())?;
         let (total_bytes, max_counter) = scan_dir(&dir)?;
+        // The fsync of `wab_dir` is left to the first write: an existing
+        // directory from an earlier run needs none, and a failure here would
+        // stop the drain from starting over a sync no record depends on yet.
         Ok(Self {
             dir,
             next_counter: max_counter + 1,
             total_bytes,
+            dir_entry_durable: false,
         })
     }
 
@@ -65,9 +75,67 @@ impl DeadLetterWriter {
 
     /// Rescans the dead-letter directory and refreshes `total_bytes`. Called by the
     /// drain when it wakes from a blocked-full wait to detect externally-deleted files.
+    ///
+    /// A directory that no longer exists is the operator's most direct way to
+    /// free headroom (`rm -rf dead_letter/`), so it is not an error: it is
+    /// recreated (private, like [`Self::open`]) and counts as empty (spec §4.5).
+    /// Before, the `read_dir` error left `total_bytes` stuck at its at-cap value
+    /// and a drain blocked on headroom never unblocked. `next_counter` is kept,
+    /// so no file name is reused within the run.
     pub(crate) fn rescan(&mut self) -> io::Result<()> {
-        let (total_bytes, _) = scan_dir(&self.dir)?;
-        self.total_bytes = total_bytes;
+        match scan_dir(&self.dir) {
+            Ok((total_bytes, _)) => {
+                self.total_bytes = total_bytes;
+                Ok(())
+            }
+            // NotFound can also be a file that vanished between `read_dir` and
+            // its stat; only a missing directory means "empty".
+            Err(e) if e.kind() == io::ErrorKind::NotFound && self.dir_is_missing() => {
+                self.recreate_dir()
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// True when the dead-letter directory itself is gone.
+    fn dir_is_missing(&self) -> bool {
+        matches!(
+            std::fs::symlink_metadata(&self.dir),
+            Err(e) if e.kind() == io::ErrorKind::NotFound
+        )
+    }
+
+    /// Recreates a deleted dead-letter directory. Everything that was in it is
+    /// gone, so nothing counts toward the cap any more.
+    ///
+    /// The new directory's entry in `wab_dir` is then made durable. A failed
+    /// fsync is an error, but the directory is kept and counted empty; the
+    /// next write retries the fsync before it writes anything.
+    fn recreate_dir(&mut self) -> io::Result<()> {
+        warn!(
+            dir = %self.dir.display(),
+            "dead-letter: directory is missing (deleted while the daemon runs?); recreating it"
+        );
+        self.create_dir()?;
+        self.total_bytes = 0;
+        self.make_dir_entry_durable()
+    }
+
+    /// Creates the directory (a no-op when it exists) and marks its entry as
+    /// not yet durable.
+    fn create_dir(&mut self) -> io::Result<()> {
+        self.dir_entry_durable = false;
+        create_dir_private(self.dir.clone())
+    }
+
+    /// Fsyncs `wab_dir` unless that already happened since the directory was
+    /// last created, so a record is never written into a directory whose own
+    /// entry a power loss could still undo.
+    fn make_dir_entry_durable(&mut self) -> io::Result<()> {
+        if !self.dir_entry_durable {
+            fsync_parent_dir(&self.dir)?;
+            self.dir_entry_durable = true;
+        }
         Ok(())
     }
 
@@ -79,11 +147,37 @@ impl DeadLetterWriter {
     /// Writes `records` to a new sealed dead-letter segment. The segment is sealed
     /// (fsynced and renamed) before this function returns, so a crash after a
     /// successful call leaves a complete file.
+    ///
+    /// A deleted `dead_letter/` directory (ENOENT) is recreated once and the
+    /// write retried (spec §4.9): only `open()` created it before, so a
+    /// directory removed while the daemon ran failed every dead-letter write
+    /// for the rest of the run.
     pub(crate) fn write_records(&mut self, records: &[Payload]) -> io::Result<()> {
         if records.is_empty() {
             return Ok(());
         }
+        #[cfg(test)]
+        if let Some(e) = write_hook::on_write(&self.dir) {
+            return Err(e);
+        }
+        self.make_dir_entry_durable()?;
+        match self.write_sealed(records) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                if self.dir_is_missing() {
+                    self.recreate_dir()?;
+                } else {
+                    self.create_dir()?;
+                    self.make_dir_entry_durable()?;
+                }
+                self.write_sealed(records)
+            }
+            other => other,
+        }
+    }
 
+    /// One attempt at [`Self::write_records`]: a new sealed segment under a
+    /// freshly reserved counter.
+    fn write_sealed(&mut self, records: &[Payload]) -> io::Result<()> {
         let counter = self.next_counter;
         // Reserve the counter BEFORE the fallible create/write/seal. If any of
         // those fail mid-way they leave a partial dl_<counter>.wab behind;
@@ -133,6 +227,68 @@ impl DeadLetterWriter {
         self.total_bytes = self.total_bytes.saturating_add(file_bytes);
 
         Ok(())
+    }
+}
+
+/// Test-only fault injection for [`DeadLetterWriter::write_records`], keyed by
+/// the dead-letter directory so concurrently running tests (each in its own
+/// scratch dir) never see each other's faults.
+#[cfg(test)]
+pub(crate) mod write_hook {
+    use std::{
+        collections::HashMap,
+        io,
+        path::{Path, PathBuf},
+        sync::Mutex,
+    };
+
+    struct Entry {
+        errno: i32,
+        fail_left: u32,
+        fired: u64,
+    }
+
+    static HOOKS: Mutex<Option<HashMap<PathBuf, Entry>>> = Mutex::new(None);
+
+    fn with<R>(f: impl FnOnce(&mut HashMap<PathBuf, Entry>) -> R) -> R {
+        let mut guard = HOOKS.lock().unwrap_or_else(|e| e.into_inner());
+        f(guard.get_or_insert_with(HashMap::new))
+    }
+
+    /// Fails the next `times` dead-letter writes into `dir` with `errno`.
+    pub(crate) fn fail(dir: &Path, errno: i32, times: u32) {
+        with(|m| {
+            m.insert(
+                dir.to_path_buf(),
+                Entry {
+                    errno,
+                    fail_left: times,
+                    fired: 0,
+                },
+            )
+        });
+    }
+
+    /// How many writes into `dir` the fault has failed.
+    pub(crate) fn fired(dir: &Path) -> u64 {
+        with(|m| m.get(dir).map_or(0, |e| e.fired))
+    }
+
+    /// Stops faulting `dir`.
+    pub(crate) fn forget(dir: &Path) {
+        with(|m| m.remove(dir));
+    }
+
+    pub(super) fn on_write(dir: &Path) -> Option<io::Error> {
+        with(|m| {
+            let e = m.get_mut(dir)?;
+            if e.fail_left == 0 {
+                return None;
+            }
+            e.fail_left -= 1;
+            e.fired += 1;
+            Some(io::Error::from_raw_os_error(e.errno))
+        })
     }
 }
 
@@ -233,6 +389,7 @@ mod tests {
             dir: dldir.clone(),
             next_counter: 1,
             total_bytes: 0,
+            dir_entry_durable: false,
         };
         assert!(
             dl.write_records(&[p(b"x")]).is_err(),
@@ -272,6 +429,159 @@ mod tests {
         let dl = DeadLetterWriter::open(&dir).unwrap();
         assert!(!dl.would_exceed_cap(100, 100));
         assert!(dl.would_exceed_cap(101, 100));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Spec §4.5: an operator who `rm -rf`s `dead_letter/` to free headroom
+    /// must not leave the writer stuck at its at-cap total. `rescan` recreates
+    /// the directory, counts it as empty, and keeps the counter (so a name is
+    /// never reused within the run).
+    #[test]
+    fn rescan_recreates_a_deleted_directory_and_counts_it_empty() {
+        let dir = tmp_dir("rescan_gone");
+        let mut dl = DeadLetterWriter::open(&dir).unwrap();
+        dl.write_records(&[p(b"one")]).unwrap();
+        assert!(dl.total_bytes() > 0);
+        let counter = dl.next_counter;
+
+        std::fs::remove_dir_all(&dl.dir).unwrap();
+        dl.rescan()
+            .expect("a missing dead_letter/ is recreated, not an error");
+        assert!(dl.dir.is_dir(), "the directory is recreated");
+        assert_eq!(dl.total_bytes(), 0, "nothing is left in it");
+        assert_eq!(dl.next_counter, counter, "the counter is kept");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dl.dir).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "recreated private, like open()");
+        }
+
+        // A rescan of a directory that exists but cannot be listed still fails:
+        // only a missing directory means "empty".
+        std::fs::remove_dir_all(&dl.dir).unwrap();
+        std::fs::write(&dl.dir, b"not a directory").unwrap();
+        assert!(dl.rescan().is_err());
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Spec §4.9 rider: only `open()` created the directory, so a deleted
+    /// `dead_letter/` failed every write for the rest of the run. One ENOENT
+    /// recreates it and retries the write once.
+    #[test]
+    fn write_records_recreates_a_deleted_directory_once() {
+        let dir = tmp_dir("write_gone");
+        let mut dl = DeadLetterWriter::open(&dir).unwrap();
+        dl.write_records(&[p(b"before")]).unwrap();
+        std::fs::remove_dir_all(&dl.dir).unwrap();
+
+        dl.write_records(&[p(b"after")])
+            .expect("a missing dead_letter/ is recreated and the write retried");
+        let sealed: Vec<_> = std::fs::read_dir(&dl.dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.to_string_lossy().ends_with(".wab.sealed"))
+            .collect();
+        assert_eq!(
+            sealed.len(),
+            1,
+            "exactly one dead-letter segment: {sealed:?}"
+        );
+        let records: Vec<Payload> = crate::wab::SegmentReader::open(&sealed[0])
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(records, vec![p(b"after")]);
+        assert_eq!(
+            dl.total_bytes(),
+            std::fs::metadata(&sealed[0]).unwrap().len(),
+            "the deleted files no longer count toward the cap"
+        );
+
+        // Something other than ENOENT is not retried: a file squatting on the
+        // directory's name fails the write.
+        std::fs::remove_dir_all(&dl.dir).unwrap();
+        std::fs::write(&dl.dir, b"not a directory").unwrap();
+        assert!(dl.write_records(&[p(b"lost?")]).is_err());
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// conf-durability-4: a `dead_letter/` recreated at runtime is a new
+    /// directory entry in `wab_dir`, and only an fsync of `wab_dir` makes it
+    /// durable. A dead-lettered record counts as handled, so its source segment
+    /// is then confirmed and deleted; if a power loss lost the recreated
+    /// directory's entry, the record would be gone with nothing pointing at it.
+    /// So no record is written into a recreated directory until `wab_dir` has
+    /// been fsynced: a failed fsync fails the write, and the next write that
+    /// finds the directory in place still syncs `wab_dir` before writing.
+    ///
+    /// Covers both re-creation paths: the blocked drain's `rescan` and the
+    /// write's own ENOENT retry.
+    #[cfg(unix)]
+    #[test]
+    fn a_recreated_directory_is_fsynced_into_wab_dir_before_any_write() {
+        use crate::wab::segment::sync_hook;
+        for via_rescan in [true, false] {
+            let dir = tmp_dir(&format!("recreate_sync_{via_rescan}"));
+            let mut dl = DeadLetterWriter::open(&dir).unwrap();
+            dl.write_records(&[p(b"before")]).unwrap();
+            std::fs::remove_dir_all(&dl.dir).unwrap();
+
+            sync_hook::fail(&dir, libc::EIO, u32::MAX);
+            if via_rescan {
+                assert!(
+                    dl.rescan().is_err(),
+                    "a recreated directory whose entry cannot be made durable is an error"
+                );
+                assert!(dl.dir.is_dir(), "it is recreated all the same");
+                assert_eq!(dl.total_bytes(), 0, "and it is empty");
+            }
+            assert!(
+                dl.write_records(&[p(b"lost?")]).is_err(),
+                "via_rescan={via_rescan}: no record goes into a directory wab_dir has not synced"
+            );
+            let written: Vec<_> = std::fs::read_dir(&dl.dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .collect();
+            assert!(written.is_empty(), "nothing written: {written:?}");
+            let failed_syncs = sync_hook::calls(&dir);
+            assert!(failed_syncs >= 1, "wab_dir's fsync was attempted");
+
+            sync_hook::clear(&dir);
+            dl.write_records(&[p(b"after")]).unwrap();
+            assert_eq!(
+                sync_hook::calls(&dir),
+                failed_syncs + 1,
+                "the write that finds the directory in place syncs wab_dir first"
+            );
+            dl.write_records(&[p(b"again")]).unwrap();
+            assert_eq!(
+                sync_hook::calls(&dir),
+                failed_syncs + 1,
+                "once durable, later writes do not sync wab_dir again"
+            );
+            sync_hook::forget(&dir);
+            std::fs::remove_dir_all(dir).ok();
+        }
+    }
+
+    #[test]
+    fn the_write_hook_fails_a_bounded_number_of_writes() {
+        let dir = tmp_dir("write_hook");
+        let mut dl = DeadLetterWriter::open(&dir).unwrap();
+        write_hook::fail(&dl.dir, libc::ENOSPC, 2);
+        for _ in 0..2 {
+            let e = dl.write_records(&[p(b"x")]).unwrap_err();
+            assert_eq!(e.raw_os_error(), Some(libc::ENOSPC));
+        }
+        dl.write_records(&[p(b"x")]).unwrap();
+        assert_eq!(write_hook::fired(&dl.dir), 2);
+        write_hook::forget(&dl.dir);
         std::fs::remove_dir_all(dir).ok();
     }
 

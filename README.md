@@ -188,7 +188,10 @@ destinations (Vector, Fluentd, Fluent Bit, Beats).
 **Delivery contract (read before migrating from Kafka/NATS):** delivery is
 **at-least-once** — a crash or retry can redeliver a record, so **your sink must
 dedupe** (e.g. on an `Idempotency-Key` / `ON CONFLICT`). **Ordering holds only
-within a single connection's** sequential pushes — there is **no ordering across
+within a single connection's** sequential pushes, and it is the order records
+enter the WAB, not the order the sink receives them: strands, retry cool-downs,
+parked segments, `weir-ctl` requeues and the HTTP sink's concurrent POSTs
+(`sink_http_concurrency`) can all reorder delivery. There is **no ordering across
 connections, and no per-key or global order**. And **routing/keys live in your
 payload**: the wire envelope is opaque bytes, with no topic/subject/key field —
 weir does not inspect or route on content. Details in
@@ -205,6 +208,7 @@ not benchmarks.*
 |-----------------|------------|------------------------------------------------------------------------------------------------------|
 | `weir-core`     | lib        | Wire protocol types — `Envelope`, `Header`, `Durability`, `NackReason`, `Payload`. Cross-platform.   |
 | `weir-wab`      | lib        | On-disk WAB segment format + `SegmentReader`. Shared by the daemon and `weir-ctl` (one parser) so `dl requeue` can read dead-letter segments without the daemon's dep tree. Cross-platform. |
+| `weir-status`   | lib        | The `weir.status/v1` model, Conditions evaluator and probe predicates shared by the daemon and `weir-ctl`. Pure Rust, no I/O. Cross-platform. |
 | `weir-server`   | bin + lib  | Daemon: socket layer, WAB, queue, worker pool, drain, metrics, config. **Unix only.**                |
 | `weir-client`   | lib        | Client library. Connects over a Unix socket (or TCP + mutual TLS), sends Push/HealthCheck frames, returns typed errors. Ships three examples (`push_simple`, `health_check`, `push_tls`). Benchmark coverage lives in `weir-server/tests/load.rs`. **The Unix-socket transport is Unix-only; the TCP + mutual-TLS transport is not** — since 2.0.3 `WeirClient<TlsStream>` builds on Windows too, and the `windows` CI job compiles `weir-client --features tls` there on every push. So a Windows producer talks to a Linux/macOS daemon over the [TCP + mutual-TLS listener](docs/operations/tcp-mtls.md) using this crate, rather than having to implement the [wire protocol](docs/wire_protocol.md) itself. `WeirClient::connect` (the Unix-socket constructor) remains `#[cfg(unix)]`. There is no Windows *server* build: it had no ingest path, and 2.0.5 dropped it. |
 | `weir-sink-sdk` | lib        | The `Sink` trait plus its `SinkError` / `CommitResult` contract — published standalone so you can **implement and unit-test** a custom sink against a stable API, independent of the daemon internals. *Running* a custom sink in the shipped daemon currently means building `weir-server` with your sink wired into the sink-selection path (no dynamic plugin yet — see the crate docs). |
@@ -255,8 +259,8 @@ listener is available behind the `tls` feature for cross-host producers.
   and it has been dropped. The **client** is a different story since 2.0.3: a
   dedicated `windows` CI job builds `weir-client --features tls` there, so a
   Windows producer against a Linux/macOS daemon over the mTLS listener remains
-  a supported configuration, alongside a portability check of the three
-  published libraries (`weir-core`, `weir-wab`, `weir-sink-sdk`).
+  a supported configuration, alongside a portability check of the four
+  published libraries (`weir-core`, `weir-wab`, `weir-sink-sdk`, `weir-status`).
 
 ## Contributing
 

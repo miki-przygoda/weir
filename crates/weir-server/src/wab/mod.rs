@@ -1,6 +1,9 @@
+pub(crate) mod cap;
 pub(crate) mod clock;
 #[cfg(any(test, feature = "dst"))]
 pub(crate) mod dst;
+pub(crate) mod handoff;
+pub(crate) mod lock;
 pub(crate) mod recovery;
 pub(crate) mod segment;
 
@@ -16,7 +19,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering::Relaxed},
+        atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
     },
     thread,
     time::{Duration, Instant},
@@ -24,11 +27,13 @@ use std::{
 
 use crossbeam_channel::{Receiver, Sender};
 use tokio::sync::oneshot;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::metrics::{Metrics, SegmentState, SegmentStateLabel};
 use crate::models::{AckOutcome, Batch, RecordSlot};
+use crate::status::{ShardRegistry, ShardSlot, SupervisorExit};
 use clock::{BlockingClock, RealClock};
+use handoff::{HandoffConfig, HandoffSite, HandoffState, hand_off};
 use recovery::{check_confirmed, recover_open_segments};
 use segment::{FsSegmentStore, SegmentStore, ShardWriter, WriteFailure};
 use weir_core::Durability;
@@ -102,9 +107,13 @@ impl Default for WabConfig {
     }
 }
 
-/// Returned by `spawn`. Drop `shard_txs` to initiate shutdown (flusher threads
+/// Returned by [`spawn_flushers`]. Drop `shard_txs` to initiate shutdown (flusher threads
 /// exit when their receiver disconnects), then join the handles to wait for all
 /// segments to be sealed.
+///
+/// A joined handle carries no verdict: each shard's supervisor records how its
+/// flusher ended (`Stopped`, or `Offline` with a reason) on the
+/// `ShardRegistry` passed to `spawn_flushers` before the thread returns (spec §5.3).
 pub(crate) struct WabHandle {
     /// One sender per shard. Drop all of them to signal shutdown.
     pub(crate) shard_txs: Vec<Sender<Batch>>,
@@ -115,11 +124,21 @@ fn shard_dir_path(wab_dir: &Path, shard_id: usize) -> PathBuf {
     wab_dir.join(format!("shard_{shard_id:02}"))
 }
 
+/// How a flusher body ended (spec §5.3). A panic is not a value: the
+/// supervisor sees it as `Err` from `catch_unwind`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FlusherExit {
+    /// The batch channel disconnected (every worker gone).
+    InputClosed,
+    /// The startup counter scan failed repeatedly; the shard refuses to seal.
+    CounterScanFailed,
+}
+
 /// Best-effort string extraction from a `catch_unwind` payload. `panic!` with
 /// a string literal lands in `&'static str`; `panic!("{}", ...)` lands in
 /// `String`. Anything else gets a placeholder so the log line still says
 /// *something*.
-fn panic_message_str(payload: &Box<dyn std::any::Any + Send>) -> &str {
+pub(crate) fn panic_message_str(payload: &Box<dyn std::any::Any + Send>) -> &str {
     if let Some(s) = payload.downcast_ref::<&'static str>() {
         return s;
     }
@@ -143,6 +162,11 @@ fn panic_message_str(payload: &Box<dyn std::any::Any + Send>) -> &str {
 /// `MAX_FLUSHER_RESPAWNS` attempts; the previous behaviour (offline
 /// after the first panic) is the upper bound of how-bad-can-it-get.
 pub(crate) const MAX_FLUSHER_RESPAWNS: u32 = 10;
+
+/// Capacity of the flusher → drain channel. It is the implicit disk bound
+/// between seal and delivery (spec §18 SP-H invariant): outside shutdown no
+/// flusher sends without blocking, so at most this many sealed segments wait.
+pub(crate) const DRAIN_CHANNEL_CAPACITY: usize = 256;
 
 /// Wraps a flusher body in `catch_unwind` and, on panic, respawns the
 /// flusher up to `MAX_FLUSHER_RESPAWNS` times. Each respawn:
@@ -168,14 +192,21 @@ pub(crate) const MAX_FLUSHER_RESPAWNS: u32 = 10;
 /// crossbeam channels (lock-free, panic-safe). We accept the
 /// unwind-safety claim — matching the previous implementation's
 /// rationale.
+///
+/// The supervisor is the single writer of the shard's terminal state on
+/// `slot` (spec §5.3): it marks `Respawning` before each respawn and
+/// records the exit before returning it. The flusher itself writes only
+/// `Up`, once its counter scan has succeeded.
 fn run_with_panic_supervision<F, B, C>(
     shard_id: usize,
     metrics: Arc<Metrics>,
     clock: &C,
+    slot: &ShardSlot,
     mut body_factory: F,
-) where
+) -> SupervisorExit
+where
     F: FnMut() -> B,
-    B: FnOnce(),
+    B: FnOnce() -> FlusherExit,
     C: BlockingClock,
 {
     let mut attempt: u32 = 0;
@@ -183,9 +214,17 @@ fn run_with_panic_supervision<F, B, C>(
         let body = body_factory();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
         match result {
-            // Clean exit (channel disconnected at daemon shutdown) —
-            // the supervisor is done, NOT a panic.
-            Ok(()) => return,
+            // The body returned (a channel close at shutdown, or the counter
+            // scan giving up) — the supervisor is done, NOT a panic. The
+            // supervisor is the single writer of terminal states (spec §5.3).
+            Ok(exit) => {
+                let exit = match exit {
+                    FlusherExit::InputClosed => SupervisorExit::InputClosed,
+                    FlusherExit::CounterScanFailed => SupervisorExit::CounterScanFailed,
+                };
+                slot.mark_exit(exit);
+                return exit;
+            }
             Err(panic_payload) => {
                 let msg = panic_message_str(&panic_payload);
                 metrics.wab_flusher_panics.inc();
@@ -200,8 +239,10 @@ fn run_with_panic_supervision<F, B, C>(
                          this shard will Nack(InternalError) until the \
                          daemon is restarted."
                     );
-                    return;
+                    slot.mark_exit(SupervisorExit::RespawnExhausted);
+                    return SupervisorExit::RespawnExhausted;
                 }
+                slot.mark_respawning();
                 tracing::warn!(
                     shard = shard_id,
                     attempt,
@@ -253,35 +294,112 @@ pub(crate) fn create_dir_private(path: PathBuf) -> io::Result<()> {
     }
 }
 
-/// Runs crash recovery, replays sealed-but-unconfirmed segments to `drain_tx`,
-/// then spawns one flusher thread per shard.
+/// What [`recover`] did. Logged once at startup ("WAB recovery complete").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RecoverySummary {
+    /// Shard directories ensured private (`0..shard_count`).
+    pub(crate) shard_dirs: usize,
+    /// Segments quarantined by this recovery pass.
+    pub(crate) segments_quarantined: u64,
+    /// Segments recovery could not process (`weir_recovery_segments_failed`).
+    pub(crate) segments_failed: u64,
+    pub(crate) elapsed: Duration,
+}
+
+/// Startup phase `recovering` (spec §6 step 8): `create_dir_private` for every
+/// configured shard, then crash recovery (unsealed `.wab` → `.wab.sealed`).
+/// Runs on the main thread before any flusher exists: the segment-counter
+/// safety rule in `flusher_thread` relies on recovery having finished.
+///
+/// Replay of sealed-but-unconfirmed segments is NOT done here: see
+/// [`scan_replay`], whose list reaches the drain only once the drain consumer
+/// runs (a blocking send into the bounded channel with no consumer would
+/// dead-lock startup on a backlog larger than its capacity, B3).
+pub(crate) fn recover(
+    wab_dir: &Path,
+    shard_count: usize,
+    metrics: &Arc<Metrics>,
+) -> io::Result<RecoverySummary> {
+    // Caller (`Config::load`) has already validated and canonicalised `wab_dir`.
+    let t0 = Instant::now();
+    let quarantined_before = metrics.recovery_segments_quarantined.get();
+    let failed_before = metrics.recovery_segments_failed.get();
+    for shard_id in 0..shard_count {
+        create_dir_private(shard_dir_path(wab_dir, shard_id))?;
+    }
+    recover_open_segments(wab_dir, metrics)?;
+    Ok(RecoverySummary {
+        shard_dirs: shard_count,
+        segments_quarantined: metrics
+            .recovery_segments_quarantined
+            .get()
+            .saturating_sub(quarantined_before),
+        segments_failed: metrics
+            .recovery_segments_failed
+            .get()
+            .saturating_sub(failed_before),
+        elapsed: t0.elapsed(),
+    })
+}
+
+/// Startup phase `handoff` (spec §6 step 9): the sealed-but-unconfirmed
+/// backlog, in the order the drain must deliver it, with the same footer
+/// accounting the old blocking `replay_unconfirmed` did, and NO sends: it
+/// logs "queuing segment for drain replay" for every segment. `main` hands the
+/// list to the drain in memory as `DrainRuntime::initial_backlog`, so a
+/// backlog larger than the drain channel can no longer block startup (B3).
+///
+/// `Some(shard_count)` is passed to the scan, so an unlistable shard fails
+/// startup (no later rescan is guaranteed), exactly as before.
+pub(crate) fn scan_replay(
+    wab_dir: &Path,
+    shard_count: usize,
+    metrics: &Arc<Metrics>,
+    orphan_cleanup: bool,
+) -> io::Result<Vec<PathBuf>> {
+    // `Some(shard_count)`: fail-fast, so the scan is never `incomplete` here.
+    let scan = scan_unconfirmed_sealed(
+        wab_dir,
+        Some(shard_count),
+        metrics,
+        &|_| false,
+        orphan_cleanup,
+    )?;
+    for sealed in &scan.segments {
+        // A footer-read failure here only undercounts the
+        // recovery_records_replayed metric (the segment is still queued +
+        // delivered); surface it rather than silently reporting 0 so the
+        // undercount is explainable.
+        let record_count = match read_segment_record_count(sealed) {
+            Ok(n) => n,
+            Err(e) => {
+                warn!(sealed = %sealed.display(), error = %e, "could not read record count for replay metric; reporting 0");
+                0
+            }
+        };
+        info!(sealed = %sealed.display(), records = record_count, "queuing segment for drain replay");
+        metrics.recovery_records_replayed.inc_by(record_count);
+    }
+    Ok(scan.segments)
+}
+
+/// Startup phase `handoff`, last step (spec §6 step 10): one flusher thread
+/// per shard. MUST run after [`recover`]: `flusher_thread` establishes its
+/// segment counter from what recovery left on disk.
 ///
 /// `coalesce_hint` is an `Arc<AtomicU64>` holding the EWMA of fsync latency in
 /// microseconds (init 200). Each flusher thread updates it after every fsync;
 /// the worker threads read it to size their coalesce window.
-pub(crate) fn spawn(
+pub(crate) fn spawn_flushers(
     wab_dir: PathBuf,
     config: WabConfig,
     drain_tx: Sender<PathBuf>,
     metrics: Arc<Metrics>,
     coalesce_hint: Arc<AtomicU64>,
+    registry: Arc<ShardRegistry>,
+    handoff: HandoffConfig,
 ) -> io::Result<WabHandle> {
-    // Caller (`Config::load`) has already validated and canonicalised `wab_dir`.
-
-    for shard_id in 0..config.shard_count {
-        create_dir_private(shard_dir_path(&wab_dir, shard_id))?;
-    }
-
-    // Phase 1 (calling thread): crash recovery — unsealed .wab → .wab.sealed
-    recover_open_segments(&wab_dir, &metrics)?;
-
-    // NOTE: replay of sealed-but-unconfirmed segments is intentionally NOT done
-    // here. The caller invokes `replay_unconfirmed` AFTER the drain consumer is
-    // spawned — otherwise the blocking sends into the bounded drain channel would
-    // dead-lock the startup thread once the recovery backlog exceeds the channel
-    // capacity and no consumer exists yet (B3).
-
-    // Phase 2: one flusher thread per shard
+    // One flusher thread per shard.
     let core_ids = core_affinity::get_core_ids().unwrap_or_default();
     let mut shard_txs = Vec::with_capacity(config.shard_count);
     let mut join_handles = Vec::with_capacity(config.shard_count);
@@ -303,6 +421,10 @@ pub(crate) fn spawn(
         let compression_level = config.compression_level;
         let core_id = core_ids.get(shard_id % core_ids.len().max(1)).copied();
         let coalesce_hint_for_flusher = Arc::clone(&coalesce_hint);
+        let slot = ShardSlot::new(Arc::clone(&registry), shard_id);
+        // One per flusher THREAD, outside the respawn factory: the shutdown
+        // budget is per flusher, shared by every respawn (wab::handoff).
+        let handoff_for_flusher = handoff.for_shard(shard_id as u16, Arc::clone(&metrics));
 
         let handle = thread::Builder::new()
             .name(format!("wab-flusher-{shard_id}"))
@@ -314,36 +436,50 @@ pub(crate) fn spawn(
                 // Batches buffered in the bounded queue survive a flusher
                 // panic and are drained by the respawned flusher in the
                 // same order.
-                run_with_panic_supervision(shard_id, metrics_for_panic, &RealClock, || {
-                    let sdir = sdir.clone();
-                    let rx = rx.clone();
-                    let drain_clone = drain_clone.clone();
-                    let metrics_for_flusher = Arc::clone(&metrics_for_flusher);
-                    let coalesce_hint = Arc::clone(&coalesce_hint_for_flusher);
-                    move || {
-                        // Production filesystem backend; the DST harness drives
-                        // `flusher_thread` directly with a fault-injecting store.
-                        let store: Arc<dyn SegmentStore> = Arc::new(FsSegmentStore);
-                        flusher_thread(
-                            shard_id as u16,
-                            sdir,
-                            rx,
-                            drain_clone,
-                            batch_size,
-                            batch_deadline,
-                            segment_max_bytes,
-                            segment_max_age,
-                            segment_max_lifetime,
-                            core_id,
-                            metrics_for_flusher,
-                            coalesce_hint,
-                            &RealClock,
-                            store,
-                            compression,
-                            compression_level,
-                        );
-                    }
-                });
+                //
+                // The supervisor's verdict is recorded on the registry; the
+                // return value is for callers (DST, tests) that have no
+                // registry to read.
+                let _ = run_with_panic_supervision(
+                    shard_id,
+                    metrics_for_panic,
+                    &RealClock,
+                    &slot,
+                    || {
+                        let sdir = sdir.clone();
+                        let rx = rx.clone();
+                        let drain_clone = drain_clone.clone();
+                        let metrics_for_flusher = Arc::clone(&metrics_for_flusher);
+                        let coalesce_hint = Arc::clone(&coalesce_hint_for_flusher);
+                        let slot = slot.clone();
+                        let handoff = handoff_for_flusher.clone();
+                        move || {
+                            // Production filesystem backend; the DST harness drives
+                            // `flusher_thread` directly with a fault-injecting store.
+                            let store: Arc<dyn SegmentStore> = Arc::new(FsSegmentStore);
+                            flusher_thread(
+                                shard_id as u16,
+                                sdir,
+                                rx,
+                                drain_clone,
+                                batch_size,
+                                batch_deadline,
+                                segment_max_bytes,
+                                segment_max_age,
+                                segment_max_lifetime,
+                                core_id,
+                                metrics_for_flusher,
+                                coalesce_hint,
+                                &RealClock,
+                                store,
+                                compression,
+                                compression_level,
+                                &slot,
+                                handoff,
+                            )
+                        }
+                    },
+                );
             })
             .map_err(io::Error::other)?;
 
@@ -360,7 +496,7 @@ pub(crate) fn spawn(
 /// segments (`.wab.sealed` with no `.confirmed` sidecar), returning their paths
 /// in ascending per-shard counter order. Already-confirmed segments are skipped;
 /// a segment that fails the confirmed check is quarantined by `check_confirmed`
-/// and skipped. Shared by startup [`replay_unconfirmed`] and the drain's
+/// and skipped. Shared by startup [`scan_replay`] and the drain's
 /// sink-recovery rescan of stranded segments.
 ///
 /// Enumerates EVERY shard directory on disk, not just `0..shard_count` —
@@ -371,13 +507,38 @@ pub(crate) fn spawn(
 /// Dirent errors propagate (no `.ok()` filtering): a silently-skipped sealed
 /// segment is silently-dropped acked data.
 ///
-/// `shard_count` only drives the "backlog beyond the configured count" advisory;
-/// pass `None` (e.g. from the recovery rescan) to skip it.
+/// `shard_count` is `Some` only for startup replay, where it drives the
+/// "backlog beyond the configured count" advisory. It also picks the policy for
+/// a shard directory that cannot be listed:
+///
+/// - `Some` (startup replay): the error propagates. No later rescan is
+///   guaranteed, so a skipped shard would be silently-dropped acked data.
+/// - `None` (the drain's rescan): the shard is skipped with a WARN and the
+///   result is marked [`SealedScan::incomplete`], so one unreadable directory
+///   does not block resuming every other shard (spec §4.9). The rescan runs
+///   again on the next poll, so the skipped shard is retried, not forgotten.
+///
+/// An unreadable `wab_dir` itself is an error either way.
+///
+/// `exclude` names segments the caller already owns. They are skipped BEFORE
+/// `check_confirmed`, whose quarantine side effects must never touch them: the
+/// drain's rescan passes its ledger's `excludes` (a delivered segment whose
+/// confirm is outstanding, a parked one, one cooling down). Startup replay owns
+/// nothing yet and passes `&|_| false`.
+///
+/// Two clean-ups ride along (spec §4.3). A stale `*.confirmed.tmp` (a sidecar
+/// write that died) is deleted. An orphan — a sealed segment beside a valid
+/// sidecar, already delivered — is never returned, and with `orphan_cleanup`
+/// (this daemon holds the `wab_dir` lock) it is deleted after its sidecar is
+/// made durable; without the lock it is kept, since another instance may be
+/// mid-confirm on it.
 pub(crate) fn scan_unconfirmed_sealed(
     wab_dir: &Path,
     shard_count: Option<usize>,
     metrics: &Metrics,
-) -> io::Result<Vec<PathBuf>> {
+    exclude: &dyn Fn(&Path) -> bool,
+    orphan_cleanup: bool,
+) -> io::Result<SealedScan> {
     let mut shard_dirs: Vec<PathBuf> = fs::read_dir(wab_dir)?
         .map(|e| e.map(|e| e.path()))
         .collect::<io::Result<Vec<_>>>()?;
@@ -386,6 +547,7 @@ pub(crate) fn scan_unconfirmed_sealed(
     shard_dirs.sort_by_key(|p| segment::shard_id_from_path(p));
 
     let mut unconfirmed = Vec::new();
+    let mut incomplete = false;
     for sdir in shard_dirs {
         if !sdir.is_dir() {
             continue;
@@ -414,9 +576,36 @@ pub(crate) fn scan_unconfirmed_sealed(
                 "draining backlog from a shard directory beyond the configured shard_count (shard_count reduced across a restart?); records are recovered, not stranded"
             );
         }
-        let mut sealed_segments: Vec<PathBuf> = fs::read_dir(&sdir)?
-            .map(|e| e.map(|e| e.path()))
-            .collect::<io::Result<Vec<_>>>()?
+        let entries: Vec<PathBuf> = match fs::read_dir(&sdir)
+            .and_then(|dir| dir.map(|e| e.map(|e| e.path())).collect::<io::Result<_>>())
+        {
+            Ok(entries) => entries,
+            // The rescan (no shard_count) skips a shard it cannot list, so one
+            // bad directory does not block resuming every other shard (spec
+            // §4.9). The caller is told (`incomplete`) and scans again on its
+            // next poll; nothing in the skipped shard is lost, it waits on
+            // disk. Startup replay propagates instead (the arm below): there
+            // no later rescan is guaranteed.
+            Err(e) if shard_count.is_none() => {
+                warn!(
+                    shard_dir = %sdir.display(),
+                    error = %e,
+                    "cannot list a shard directory; skipping it in this rescan and resuming the \
+                     other shards. Its segments wait on disk until it is readable again (check \
+                     its permissions and the WAB device)"
+                );
+                incomplete = true;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        for tmp in entries
+            .iter()
+            .filter(|p| p.to_string_lossy().ends_with(EXT_CONFIRMED_TMP))
+        {
+            remove_stale_confirmed_tmp(tmp);
+        }
+        let mut sealed_segments: Vec<PathBuf> = entries
             .into_iter()
             .filter(|p| p.to_string_lossy().ends_with(EXT_SEALED))
             .collect();
@@ -428,8 +617,37 @@ pub(crate) fn scan_unconfirmed_sealed(
         sealed_segments.sort_by_key(|p| segment::segment_counter_from_path(p));
 
         for sealed in sealed_segments {
+            // Before check_confirmed, never after: its quarantine side effects
+            // must not touch a segment the caller owns.
+            if exclude(&sealed) {
+                continue;
+            }
             match check_confirmed(&sealed, wab_dir, metrics) {
+                // An orphan: delivered (the sidecar is valid) but not deleted,
+                // because the process died, or the delete failed, between the
+                // confirm's two steps. Never replayed either way.
+                Ok(true) if orphan_cleanup => match delete_orphan(&sealed) {
+                    Ok(()) => info!(
+                        sealed = %sealed.display(),
+                        "deleted an orphaned sealed segment; its .confirmed sidecar proves \
+                         delivery and stays as the tombstone"
+                    ),
+                    Err(e) => warn!(
+                        sealed = %sealed.display(),
+                        error = %e,
+                        "could not delete an orphaned sealed segment (already confirmed, \
+                         never re-delivered); retried on the next scan"
+                    ),
+                },
                 Ok(true) => {
+                    if !ORPHAN_CLEANUP_OFF_LOGGED.swap(true, Relaxed) {
+                        warn!(
+                            "orphaned sealed segments (already confirmed) are kept on disk: \
+                             this daemon does not hold the wab_dir lock, so another instance \
+                             may still be confirming them. They are skipped, never re-delivered, \
+                             but count toward wab_bytes_on_disk until removed"
+                        );
+                    }
                     info!(sealed = %sealed.display(), "skipping — segment already confirmed");
                 }
                 Ok(false) => unconfirmed.push(sealed),
@@ -449,41 +667,85 @@ pub(crate) fn scan_unconfirmed_sealed(
             }
         }
     }
-    Ok(unconfirmed)
+    Ok(SealedScan {
+        segments: unconfirmed,
+        incomplete,
+    })
 }
 
-/// Replays sealed-but-unconfirmed segments from a previous run by sending their
-/// paths to the drain. MUST be called only after the drain consumer is running:
-/// the sends block on the bounded drain channel, so with no consumer a backlog
-/// larger than the channel capacity would dead-lock the caller (B3).
-pub(crate) fn replay_unconfirmed(
-    wab_dir: &Path,
-    shard_count: usize,
-    drain_tx: &Sender<PathBuf>,
-    metrics: &Arc<Metrics>,
-) -> io::Result<()> {
-    for sealed in scan_unconfirmed_sealed(wab_dir, Some(shard_count), metrics)? {
-        // A footer-read failure here only undercounts the
-        // recovery_records_replayed metric (the segment is still queued +
-        // delivered); surface it rather than silently reporting 0 so the
-        // undercount is explainable.
-        let record_count = match read_segment_record_count(&sealed) {
-            Ok(n) => n,
-            Err(e) => {
-                warn!(sealed = %sealed.display(), error = %e, "could not read record count for replay metric; reporting 0");
-                0
-            }
-        };
-        info!(sealed = %sealed.display(), records = record_count, "queuing segment for drain replay");
-        metrics.recovery_records_replayed.inc_by(record_count);
-        drain_tx.send(sealed).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "drain channel closed during startup replay",
-            )
-        })?;
+/// What [`scan_unconfirmed_sealed`] found.
+#[derive(Debug)]
+pub(crate) struct SealedScan {
+    /// Sealed-but-unconfirmed segments, ascending per shard.
+    pub segments: Vec<PathBuf>,
+    /// True when at least one shard directory could not be listed and was
+    /// skipped. Only the rescan (`shard_count == None`) skips; startup replay
+    /// fails instead. The list is then partial, and the caller must scan again.
+    pub incomplete: bool,
+}
+
+/// Set once the "orphans are kept" warning has been logged, so a rescan every
+/// health poll does not repeat it.
+static ORPHAN_CLEANUP_OFF_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// Deletes an orphaned sealed segment (spec §4.3, D7). Its sidecar has just
+/// parsed as valid; it is fsynced, and its directory entry with it, BEFORE the
+/// segment goes, so the tombstone is durable before the bytes disappear — a
+/// power loss can then never leave a shard directory with neither, which would
+/// let the segment counter rewind past a delivered segment. A sync failure
+/// keeps the segment. `NotFound` on the delete is success: the drain's own
+/// confirm, or the other scan (startup replay races the drain's rescan until
+/// replay moves into the drain), got there first.
+fn delete_orphan(sealed: &Path) -> io::Result<()> {
+    let confirmed = format::confirmed_path_for(sealed);
+    segment::sync_path(&confirmed)?;
+    segment::fsync_parent_dir(&confirmed)?;
+    match fs::remove_file(sealed) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        other => other,
     }
-    Ok(())
+}
+
+/// Deletes a stale `*.confirmed.tmp`: the leftover of a sidecar write that
+/// died (a crash, ENOSPC) and that no walker reads. Only a regular file is
+/// removed; anything else under that name (a directory, a symlink) is not
+/// ours, and the confirm that trips over it reports it.
+///
+/// Race: the startup replay scan runs on the main thread while the drain is
+/// already confirming segments, so it can delete the tmp of a sidecar write in
+/// progress. That write's rename then fails, the confirm reports
+/// `SidecarFailed`, and the drain retries it on its next poll — a retry, never
+/// a lost or false confirmation. Every later scan runs on the drain thread
+/// itself, between confirms.
+fn remove_stale_confirmed_tmp(tmp: &Path) {
+    match fs::symlink_metadata(tmp) {
+        Ok(meta) if meta.file_type().is_file() => match fs::remove_file(tmp) {
+            Ok(()) => info!(path = %tmp.display(), "deleted a stale .confirmed.tmp"),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => warn!(
+                path = %tmp.display(),
+                error = %e,
+                "could not delete a stale .confirmed.tmp; it is ignored by every reader"
+            ),
+        },
+        Ok(_) => debug!(
+            path = %tmp.display(),
+            "not deleting a non-file at a .confirmed.tmp name"
+        ),
+        Err(_) => {}
+    }
+}
+
+/// Suffix of the transient file a `.confirmed` sidecar is written to before it
+/// is renamed into place (spec §4.3). It matches no segment suffix, so every
+/// walker ignores it; stale ones are deleted by [`scan_unconfirmed_sealed`].
+pub(crate) const EXT_CONFIRMED_TMP: &str = ".wab.confirmed.tmp";
+
+/// The tmp path the sidecar `confirmed` is written to before its rename.
+pub(crate) fn confirmed_tmp_path(confirmed: &Path) -> PathBuf {
+    let mut s = confirmed.as_os_str().to_owned();
+    s.push(".tmp");
+    PathBuf::from(s)
 }
 
 /// Reads `record_count` from the footer of a sealed segment file without reading
@@ -577,12 +839,14 @@ fn due_timed_seal(
 /// none) — the caller's cue to stop the idle clock until the next write opens a
 /// fresh segment. Returns `false` when the seal failed and the segment is still
 /// active, so the next cycle retries instead of losing the attempt.
-fn seal_before_size_threshold(
+fn seal_before_size_threshold<C: BlockingClock>(
     writer: &mut ShardWriter,
     drain_tx: &Sender<PathBuf>,
     shard_id: u16,
     metrics: &Metrics,
     reason: TimedSeal,
+    clock: &C,
+    handoff: &HandoffState,
 ) -> bool {
     match writer.seal_current() {
         Ok(Some(sealed)) => {
@@ -592,15 +856,18 @@ fn seal_before_size_threshold(
                     state: SegmentState::sealed,
                 })
                 .inc();
-            if let Err(crossbeam_channel::SendError(unsent)) = drain_tx.send(sealed) {
-                error!(
-                    shard = shard_id,
-                    path = %unsent.display(),
-                    reason = reason.as_str(),
-                    "drain channel closed; timed-seal segment not handed off \
-                     (recovered on restart via replay)"
-                );
-            }
+            // Sealed (and fsynced) above; see wab::handoff for why any outcome
+            // of the hand-off leaves this segment's acks true. A segment not
+            // handed off is replayed on the next start.
+            let _ = hand_off(
+                clock,
+                drain_tx,
+                sealed,
+                handoff,
+                HandoffSite::TimedSeal {
+                    reason: reason.as_str(),
+                },
+            );
             true
         }
         Ok(None) => true,
@@ -634,7 +901,9 @@ fn flusher_thread<C: BlockingClock>(
     store: Arc<dyn SegmentStore>,
     compression: Compression,
     compression_level: i32,
-) {
+    slot: &ShardSlot,
+    handoff: HandoffState,
+) -> FlusherExit {
     // Core affinity (fail-open: log and continue if denied)
     if let Some(id) = core_id
         && !core_affinity::set_for_current(id)
@@ -680,8 +949,24 @@ fn flusher_thread<C: BlockingClock>(
     {
         let mut attempt = 0u32;
         loop {
-            match writer.scan_and_advance_counter() {
-                Ok(()) => break,
+            // System-test hook (spec §16 system test 8): force this shard's
+            // scan to fail so it ends Offline(CounterScanFailed). An inlined
+            // `false` without `test-hooks`, and inert unless WEIR_TEST_HOOKS=1.
+            let scan = writer.scan_and_advance_counter().and_then(|()| {
+                if crate::test_hooks::fail_counter_scan(shard_id) {
+                    Err(io::Error::other(
+                        "test hook: WEIR_TEST_FAIL_SHARD_COUNTER_SCAN",
+                    ))
+                } else {
+                    Ok(())
+                }
+            });
+            match scan {
+                Ok(()) => {
+                    // The counter is established: this shard can seal safely.
+                    slot.mark_up();
+                    break;
+                }
                 Err(e) if attempt < 3 => {
                     attempt += 1;
                     warn!(shard = shard_id, error = %e, attempt, "segment-counter scan failed; retrying before giving up");
@@ -693,9 +978,10 @@ fn flusher_thread<C: BlockingClock>(
                         error = %e,
                         "segment-counter scan failed repeatedly; refusing to seal at an \
                          unestablished counter (would risk overwriting a recovered sealed \
-                         segment) — taking shard offline; records will Nack until restart"
+                         segment) — taking shard offline; records will Nack until restart \
+                         (weir_wab_shard_up=0, condition shard_offline/no_live_shard)"
                     );
-                    return;
+                    return FlusherExit::CounterScanFailed;
                 }
             }
         }
@@ -750,6 +1036,8 @@ fn flusher_thread<C: BlockingClock>(
                         shard_id,
                         &metrics,
                         &coalesce_hint,
+                        clock,
+                        &handoff,
                     );
                     record_count = 0;
                     last_write_at = Some(Instant::now());
@@ -770,6 +1058,8 @@ fn flusher_thread<C: BlockingClock>(
                             shard_id,
                             &metrics,
                             reason,
+                            clock,
+                            &handoff,
                         )
                     {
                         last_write_at = None;
@@ -799,6 +1089,8 @@ fn flusher_thread<C: BlockingClock>(
             shard_id,
             &metrics,
             &coalesce_hint,
+            clock,
+            &handoff,
         );
         record_count = 0;
         // Records just hit the active segment — restart the idle-seal clock.
@@ -824,7 +1116,15 @@ fn flusher_thread<C: BlockingClock>(
                 segment_max_lifetime,
                 writer.active_segment_age(),
             )
-            && seal_before_size_threshold(&mut writer, &drain_tx, shard_id, &metrics, reason)
+            && seal_before_size_threshold(
+                &mut writer,
+                &drain_tx,
+                shard_id,
+                &metrics,
+                reason,
+                clock,
+                &handoff,
+            )
         {
             last_write_at = None;
         }
@@ -840,9 +1140,16 @@ fn flusher_thread<C: BlockingClock>(
                     state: SegmentState::sealed,
                 })
                 .inc();
-            if let Err(crossbeam_channel::SendError(unsent)) = drain_tx.send(sealed) {
-                warn!(shard = shard_id, sealed = %unsent.display(), "drain channel closed on shutdown; sealed segment is durable and will be delivered on restart");
-            }
+            // Bounded once shutting_down is set (spec §5.5): a full channel
+            // gives up after FINAL_HANDOFF_TIMEOUT and the segment, sealed and
+            // fsynced above, is replayed on the next start.
+            let _ = hand_off(
+                clock,
+                &drain_tx,
+                sealed,
+                &handoff,
+                HandoffSite::ShutdownSeal,
+            );
         }
         Ok(None) => {
             info!(
@@ -854,15 +1161,19 @@ fn flusher_thread<C: BlockingClock>(
             tracing::error!(shard = shard_id, error = %e, "WAB flusher failed to seal segment on shutdown");
         }
     }
+    FlusherExit::InputClosed
 }
 
-fn flush_batch(
+#[allow(clippy::too_many_arguments)]
+fn flush_batch<C: BlockingClock>(
     writer: &mut ShardWriter,
     batches: &mut Vec<Batch>,
     drain_tx: &Sender<PathBuf>,
     shard_id: u16,
     metrics: &Arc<Metrics>,
     coalesce_hint: &Arc<AtomicU64>,
+    clock: &C,
+    handoff: &HandoffState,
 ) {
     // Every Durable record rides a single group fsync at the end of the
     // flush (the per-record fsync was the herd-benchmark bottleneck). Their acks
@@ -975,9 +1286,9 @@ fn flush_batch(
                         state: SegmentState::sealed,
                     })
                     .inc();
-                if let Err(crossbeam_channel::SendError(unsent)) = drain_tx.send(sealed) {
-                    warn!(shard = shard_id, sealed = %unsent.display(), "drain channel closed; sealed segment is durable and will be delivered on restart");
-                }
+                // INVARIANT (wab::handoff): hand off BEFORE promoting the acks
+                // below, and only a path the seal (with its fsync) returned.
+                let _ = hand_off(clock, drain_tx, sealed, handoff, HandoffSite::Rotation);
                 durable_acks.append(&mut pending_acks);
                 #[cfg(feature = "bench-trace")]
                 durable_ts.append(&mut pending_ts);
@@ -1140,6 +1451,35 @@ mod tests {
         dir
     }
 
+    /// `<wab_dir>/.weir.lock` is a regular file at the root: the scan that
+    /// feeds the drain must not mistake it for a shard or a segment.
+    #[test]
+    fn scan_unconfirmed_sealed_ignores_the_wab_dir_lock_file() {
+        let dir = tmp_dir("scan_ignores_lock");
+        let sd0 = shard_dir_path(&dir, 0);
+        crate::testutil::mkdir_p(&sd0);
+        let seg_path = segment_path(&sd0, 1);
+        for p in [seg_path.clone(), seg_path.with_extension("wab.sealed")] {
+            let _ = fs::remove_file(p);
+        }
+        let sealed = {
+            let mut s = WabSegment::create(&seg_path, 0, Compression::None).unwrap();
+            s.write_record(b"a").unwrap();
+            s.seal().unwrap()
+        };
+        fs::write(dir.join(crate::wab::lock::LOCK_FILE_NAME), b"pid=1\n").unwrap();
+
+        let found =
+            scan_unconfirmed_sealed(&dir, Some(1), &Metrics::new().0, &|_| false, true).unwrap();
+        assert_eq!(found.segments, vec![sealed]);
+        assert!(!found.incomplete);
+        assert!(
+            dir.join(crate::wab::lock::LOCK_FILE_NAME).exists(),
+            "orphan cleanup must never touch the lock file"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
     // ── Timed seals ───────────────────────────────────────────────────────────
 
     /// Pins the interaction rule between the two seal timers: **whichever comes
@@ -1250,61 +1590,6 @@ mod tests {
         fs::remove_dir_all(dir).ok();
     }
 
-    // ── B3: recovery replay must not dead-lock on the bounded drain channel ──
-    #[test]
-    fn replay_needs_a_live_consumer_for_backlog_over_channel_capacity() {
-        // replay_unconfirmed blocking-sends each sealed-but-unconfirmed segment
-        // into the bounded drain channel. If the backlog exceeds the channel
-        // capacity and no consumer is draining, the send blocks forever — the
-        // startup deadlock (B3). The fix is in the startup wiring: the drain
-        // consumer is spawned BEFORE replay runs. This test characterises the
-        // hazard — replay blocks without a consumer, and streams the whole backlog
-        // once one exists.
-        let dir = tmp_dir("replay_consumer");
-        let shard_dir = shard_dir_path(&dir, 0);
-        crate::testutil::mkdir_p(&shard_dir);
-
-        const N: u64 = 300; // > the bounded(256) drain channel capacity
-        for i in 1..=N {
-            let path = segment_path(&shard_dir, i);
-            let mut seg = WabSegment::create(&path, 0, Compression::None).unwrap();
-            seg.write_record(b"replayed").unwrap();
-            seg.seal().unwrap();
-        }
-
-        let (tx, rx) = crossbeam_channel::bounded::<PathBuf>(256);
-        let (done_tx, done_rx) = crossbeam_channel::bounded::<()>(1);
-        let dir_for_replay = dir.clone();
-        let replay = std::thread::spawn(move || {
-            let metrics = Arc::new(crate::metrics::Metrics::new().0);
-            replay_unconfirmed(&dir_for_replay, 1, &tx, &metrics).unwrap();
-            let _ = done_tx.send(());
-            // tx dropped here → the consumer below sees the channel disconnect.
-        });
-
-        // No consumer yet: replay fills the channel and blocks (the deadlock).
-        assert!(
-            done_rx.recv_timeout(Duration::from_millis(300)).is_err(),
-            "replay must block on a full channel with no consumer (the B3 deadlock)"
-        );
-
-        // Live consumer → replay streams the remaining backlog and completes.
-        let consumer = std::thread::spawn(move || {
-            let mut count = 0u64;
-            while rx.recv().is_ok() {
-                count += 1;
-            }
-            count
-        });
-        done_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("replay must complete once a consumer drains the channel");
-        let received = consumer.join().unwrap();
-        replay.join().unwrap();
-        assert_eq!(received, N, "every backlog segment must reach the drain");
-        fs::remove_dir_all(dir).ok();
-    }
-
     // ── S05: replay must drain shard dirs beyond the configured shard_count ──────
     #[test]
     fn replay_drains_shard_dirs_beyond_configured_count() {
@@ -1322,13 +1607,13 @@ mod tests {
             seg.seal().unwrap();
         }
 
-        let (tx, rx) = crossbeam_channel::bounded::<PathBuf>(256);
         let metrics = Arc::new(crate::metrics::Metrics::new().0);
         // Configured shard_count = 2, but 4 shard dirs hold backlog on disk.
-        replay_unconfirmed(&dir, 2, &tx, &metrics).unwrap();
-        drop(tx);
-
-        let received: Vec<String> = rx.iter().map(|p| p.display().to_string()).collect();
+        let received: Vec<String> = scan_replay(&dir, 2, &metrics, false)
+            .unwrap()
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
         assert_eq!(
             received.len(),
             4,
@@ -1369,12 +1654,8 @@ mod tests {
         s2.write_record(b"needs-delivery").unwrap();
         let sealed2 = s2.seal().unwrap();
 
-        let (tx, rx) = crossbeam_channel::bounded::<PathBuf>(256);
         let metrics = Arc::new(crate::metrics::Metrics::new().0);
-        replay_unconfirmed(&dir, 1, &tx, &metrics).unwrap();
-        drop(tx);
-
-        let queued: Vec<PathBuf> = rx.iter().collect();
+        let queued: Vec<PathBuf> = scan_replay(&dir, 1, &metrics, false).unwrap();
         assert_eq!(
             queued.len(),
             1,
@@ -1444,7 +1725,9 @@ mod tests {
         };
 
         let (m, _reg) = crate::metrics::Metrics::new();
-        let got = scan_unconfirmed_sealed(&dir, None, &m).unwrap();
+        let got = scan_unconfirmed_sealed(&dir, None, &m, &|_| false, false)
+            .unwrap()
+            .segments;
         assert!(
             !got.contains(&s1_confirmed),
             "the confirmed segment must be skipped by the recovery scan: {got:?}"
@@ -1453,6 +1736,271 @@ mod tests {
             got,
             vec![s0_1, s0_2, s1_2, s5_1],
             "all unconfirmed sealed segments across every shard dir, ascending"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// The drain's rescan passes the ledger's `excludes`, and an excluded path
+    /// must be skipped BEFORE `check_confirmed` runs. `check_confirmed`
+    /// quarantines a segment whose sidecar fails to parse, so a ledger-owned
+    /// segment (a delivered one whose sidecar is mid-retry, say) that reached
+    /// it would be moved to `quarantine/` and counted as corruption.
+    #[test]
+    fn excluded_paths_are_skipped_before_check_confirmed() {
+        use crate::wab::format::confirmed_path_for;
+        let dir = tmp_dir("scan_exclude");
+        let sd0 = shard_dir_path(&dir, 0);
+        crate::testutil::mkdir_p(&sd0);
+        let owned = {
+            let mut s = WabSegment::create(&segment_path(&sd0, 1), 0, Compression::None).unwrap();
+            s.write_record(b"owned").unwrap();
+            s.seal().unwrap()
+        };
+        // A torn sidecar: check_confirmed would quarantine the segment.
+        fs::write(confirmed_path_for(&owned), b"").unwrap();
+        let other = {
+            let mut s = WabSegment::create(&segment_path(&sd0, 2), 0, Compression::None).unwrap();
+            s.write_record(b"other").unwrap();
+            s.seal().unwrap()
+        };
+
+        let (m, _reg) = crate::metrics::Metrics::new();
+        let got = scan_unconfirmed_sealed(&dir, None, &m, &|p| p == owned.as_path(), false)
+            .unwrap()
+            .segments;
+        assert_eq!(
+            got,
+            vec![other],
+            "only the non-excluded segment is returned"
+        );
+        assert!(
+            owned.exists(),
+            "an excluded segment must never reach check_confirmed's quarantine"
+        );
+        assert_eq!(m.recovery_segments_quarantined.get(), 0);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    fn sealed_in_shard(shard_dir: &Path, counter: u64, payload: &[u8]) -> PathBuf {
+        crate::testutil::mkdir_p(shard_dir);
+        let mut s =
+            WabSegment::create(&segment_path(shard_dir, counter), 0, Compression::None).unwrap();
+        s.write_record(payload).unwrap();
+        s.seal().unwrap()
+    }
+
+    /// D7: an orphan — a sealed segment beside a VALID sidecar, left by a crash
+    /// (or a failed delete) between the confirm's two steps — is deleted by the
+    /// startup replay once this daemon owns the `wab_dir`, and kept without the
+    /// lock (`wab_dir_lock = "best-effort"` on a filesystem that cannot lock),
+    /// where another daemon may still be mid-confirm on it. The tombstone stays
+    /// either way: it is what keeps the segment counter from rewinding.
+    #[test]
+    fn an_orphan_is_deleted_at_startup_only_when_the_wab_dir_is_owned() {
+        use crate::wab::format::{build_confirmed, confirmed_path_for};
+        for orphan_cleanup in [true, false] {
+            let dir = tmp_dir(&format!("replay_orphan_{orphan_cleanup}"));
+            let sd0 = shard_dir_path(&dir, 0);
+            let orphan = sealed_in_shard(&sd0, 1, b"delivered");
+            fs::write(confirmed_path_for(&orphan), build_confirmed(0, 1, 1)).unwrap();
+            let pending = sealed_in_shard(&sd0, 2, b"undelivered");
+
+            let metrics = Arc::new(crate::metrics::Metrics::new().0);
+            let replay = scan_replay(&dir, 1, &metrics, orphan_cleanup).unwrap();
+
+            assert_eq!(
+                replay,
+                vec![pending],
+                "an orphan is never replayed, deleted or not"
+            );
+            assert_eq!(
+                orphan.exists(),
+                !orphan_cleanup,
+                "orphan_cleanup={orphan_cleanup}: the orphan is deleted only when the lock is held"
+            );
+            assert!(
+                confirmed_path_for(&orphan).exists(),
+                "the tombstone stays: the counter scan counts it"
+            );
+            assert_eq!(metrics.recovery_segments_quarantined.get(), 0);
+            fs::remove_dir_all(dir).ok();
+        }
+    }
+
+    /// conf-tests-13: `delete_orphan` makes the tombstone durable (the sidecar's
+    /// fsync, then its directory's) BEFORE the segment goes. A failure of
+    /// either sync keeps the orphan: deleting it on a tombstone a power loss
+    /// could still undo might leave the shard with neither, and the segment
+    /// counter would rewind past a delivered segment. The next scan, once the
+    /// syncs succeed, deletes it.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_sync_before_an_orphan_delete_keeps_the_orphan() {
+        use crate::wab::format::{build_confirmed, confirmed_path_for};
+        use crate::wab::segment::sync_hook;
+        for target in ["sidecar", "dir"] {
+            let dir = tmp_dir(&format!("orphan_sync_fail_{target}"));
+            let sd = shard_dir_path(&dir, 0);
+            let orphan = sealed_in_shard(&sd, 1, b"delivered");
+            let confirmed = confirmed_path_for(&orphan);
+            fs::write(&confirmed, build_confirmed(0, 1, 1)).unwrap();
+            let synced = if target == "sidecar" { &confirmed } else { &sd };
+            sync_hook::fail(synced, libc::EIO, u32::MAX);
+
+            let (m, _reg) = crate::metrics::Metrics::new();
+            let got = scan_unconfirmed_sealed(&dir, None, &m, &|_| false, true)
+                .unwrap()
+                .segments;
+            assert!(got.is_empty(), "an orphan is never replayed: {got:?}");
+            assert!(sync_hook::calls(synced) >= 1, "{target}: the sync ran");
+            assert!(
+                orphan.exists(),
+                "{target}: a failed sync keeps the orphan (its tombstone may not be durable)"
+            );
+            assert!(confirmed.exists());
+
+            sync_hook::clear(synced);
+            scan_unconfirmed_sealed(&dir, None, &m, &|_| false, true).unwrap();
+            assert!(!orphan.exists(), "{target}: deleted once the syncs succeed");
+            assert!(confirmed.exists(), "the tombstone stays");
+            sync_hook::forget(synced);
+            fs::remove_dir_all(dir).ok();
+        }
+    }
+
+    /// The same orphan handling on the drain's rescan entry point (`None` shard
+    /// count), where a confirm whose delete failed lands once its ledger entry
+    /// is gone (a restart, a respawn).
+    #[test]
+    fn the_rescan_deletes_an_orphan_only_when_the_wab_dir_is_owned() {
+        use crate::wab::format::{build_confirmed, confirmed_path_for};
+        for orphan_cleanup in [true, false] {
+            let dir = tmp_dir(&format!("rescan_orphan_{orphan_cleanup}"));
+            let orphan = sealed_in_shard(&shard_dir_path(&dir, 3), 7, b"delivered");
+            fs::write(confirmed_path_for(&orphan), build_confirmed(0, 1, 1)).unwrap();
+
+            let (m, _reg) = crate::metrics::Metrics::new();
+            let got = scan_unconfirmed_sealed(&dir, None, &m, &|_| false, orphan_cleanup)
+                .unwrap()
+                .segments;
+            assert!(got.is_empty(), "{got:?}");
+            assert_eq!(orphan.exists(), !orphan_cleanup);
+            assert!(confirmed_path_for(&orphan).exists());
+            fs::remove_dir_all(dir).ok();
+        }
+    }
+
+    /// Spec §4.9: one shard directory that cannot be listed (here, mode 000)
+    /// must not block the drain's rescan from resuming every OTHER shard — a
+    /// `?` on the per-shard `read_dir` used to fail the whole scan, so one bad
+    /// directory stranded the backlog of all of them. The rescan
+    /// (`shard_count == None`) skips that shard and says so (`incomplete`), so
+    /// its caller scans again. Startup replay (`Some(count)`) stays fail-fast:
+    /// there no later rescan is guaranteed, and a silently-skipped shard is
+    /// silently-dropped acked data.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_shard_is_skipped_by_the_rescan_but_fails_startup_replay() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp_dir("scan_unreadable_shard");
+        let first = sealed_in_shard(&shard_dir_path(&dir, 0), 1, b"first");
+        let bad = shard_dir_path(&dir, 1);
+        let hidden = sealed_in_shard(&bad, 1, b"hidden");
+        let last = sealed_in_shard(&shard_dir_path(&dir, 2), 1, b"last");
+        fs::set_permissions(&bad, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_dir(&bad).is_ok() {
+            // Running as root: directory permissions are not enforced, so the
+            // fault cannot be injected this way.
+            fs::set_permissions(&bad, fs::Permissions::from_mode(0o700)).unwrap();
+            eprintln!("skipping: a mode-000 directory is still readable (root?)");
+            fs::remove_dir_all(dir).ok();
+            return;
+        }
+
+        let (m, _reg) = crate::metrics::Metrics::new();
+        let rescan = scan_unconfirmed_sealed(&dir, None, &m, &|_| false, false);
+        let startup = scan_unconfirmed_sealed(&dir, Some(3), &m, &|_| false, false);
+        fs::set_permissions(&bad, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let rescan = rescan.expect("the rescan tolerates one unreadable shard");
+        assert_eq!(
+            rescan.segments,
+            vec![first.clone(), last.clone()],
+            "every readable shard is still returned"
+        );
+        assert!(rescan.incomplete, "the caller is told the list is partial");
+        let err = startup.expect_err("startup replay stays fail-fast");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+
+        // Readable again: complete, and the hidden segment is found.
+        let healed = scan_unconfirmed_sealed(&dir, None, &m, &|_| false, false).unwrap();
+        assert_eq!(healed.segments, vec![first, hidden, last]);
+        assert!(!healed.incomplete);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// A stale `*.confirmed.tmp` is the leftover of a sidecar write that died
+    /// (a crash, ENOSPC). The scan deletes it; it is never mistaken for a
+    /// segment or a sidecar. Something that is not a regular file under that
+    /// name is not ours to remove and is left alone.
+    #[test]
+    fn stale_confirmed_tmp_files_are_deleted_by_the_scan() {
+        use crate::wab::format::confirmed_path_for;
+        let dir = tmp_dir("scan_stale_tmp");
+        let sd0 = shard_dir_path(&dir, 0);
+        let sealed = sealed_in_shard(&sd0, 1, b"undelivered");
+        let tmp = confirmed_tmp_path(&confirmed_path_for(&sealed));
+        fs::write(&tmp, b"half a sidecar").unwrap();
+        let squatter = sd0.join(format!("seg_00000002{EXT_CONFIRMED_TMP}"));
+        crate::testutil::mkdir_p(&squatter);
+
+        let (m, _reg) = crate::metrics::Metrics::new();
+        let got = scan_unconfirmed_sealed(&dir, None, &m, &|_| false, false)
+            .unwrap()
+            .segments;
+        assert_eq!(got, vec![sealed.clone()]);
+        assert!(!tmp.exists(), "a stale tmp sidecar is deleted");
+        assert!(
+            squatter.is_dir(),
+            "a directory under the tmp name is left alone"
+        );
+        assert!(sealed.exists());
+        assert_eq!(m.recovery_segments_quarantined.get(), 0);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// Review Focus 4, upgrading from 4.0.x: a 0-byte `.confirmed` that the old
+    /// in-place write tore is still quarantined exactly once, as it was before —
+    /// the atomic write prevents NEW torn sidecars, it does not reinterpret old
+    /// ones. Orphan deletion must not touch it either: only a sidecar that
+    /// parses as valid proves delivery.
+    #[test]
+    fn a_legacy_torn_sidecar_is_quarantined_once_at_startup() {
+        use crate::wab::format::confirmed_path_for;
+        let dir = tmp_dir("replay_legacy_torn");
+        let sd0 = shard_dir_path(&dir, 0);
+        let sealed = sealed_in_shard(&sd0, 1, b"maybe delivered");
+        fs::write(confirmed_path_for(&sealed), b"").unwrap();
+
+        let metrics = Arc::new(crate::metrics::Metrics::new().0);
+        for _ in 0..2 {
+            let replay = scan_replay(&dir, 1, &metrics, true).unwrap();
+            assert!(replay.is_empty(), "a quarantined segment is not replayed");
+        }
+        assert_eq!(
+            metrics.recovery_segments_quarantined.get(),
+            1,
+            "quarantined once, as 4.0.x did"
+        );
+        assert!(!sealed.exists());
+        assert!(
+            dir.join("quarantine")
+                .join(format!(
+                    "shard_00__{}",
+                    sealed.file_name().unwrap().to_string_lossy()
+                ))
+                .exists(),
+            "the segment's bytes are kept in quarantine/"
         );
         fs::remove_dir_all(dir).ok();
     }
@@ -1521,7 +2069,7 @@ mod tests {
     fn panic_then_recover_factory(
         n_panics: u32,
         panic_payload: &'static str,
-    ) -> impl FnMut() -> Box<dyn FnOnce() + Send> {
+    ) -> impl FnMut() -> Box<dyn FnOnce() -> FlusherExit + Send> {
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
         move || {
             let counter = std::sync::Arc::clone(&counter);
@@ -1532,6 +2080,7 @@ mod tests {
                     panic!("{payload}");
                 }
                 // clean return on the (n_panics + 1)th attempt
+                FlusherExit::InputClosed
             })
         }
     }
@@ -1546,6 +2095,7 @@ mod tests {
             0,
             Arc::clone(&m),
             &RealClock,
+            &ShardSlot::detached(),
             panic_then_recover_factory(1, "boom"),
         );
         assert_eq!(m.wab_flusher_panics.get(), 1);
@@ -1562,14 +2112,21 @@ mod tests {
         let m = Arc::new(m);
         let shard = 7;
         let counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
-        run_with_panic_supervision(shard, Arc::clone(&m), &RealClock, move || {
-            let counter = std::sync::Arc::clone(&counter);
+        run_with_panic_supervision(
+            shard,
+            Arc::clone(&m),
+            &RealClock,
+            &ShardSlot::detached(),
             move || {
-                if counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
-                    panic!("panic from shard {shard}");
+                let counter = std::sync::Arc::clone(&counter);
+                move || {
+                    if counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                        panic!("panic from shard {shard}");
+                    }
+                    FlusherExit::InputClosed
                 }
-            }
-        });
+            },
+        );
         assert_eq!(m.wab_flusher_panics.get(), 1);
     }
 
@@ -1577,9 +2134,15 @@ mod tests {
     fn supervisor_lets_clean_exit_pass_through() {
         let (m, _reg) = crate::metrics::Metrics::new();
         let m = Arc::new(m);
-        run_with_panic_supervision(0, Arc::clone(&m), &RealClock, || {
-            || { /* normal return on first attempt */ }
-        });
+        run_with_panic_supervision(
+            0,
+            Arc::clone(&m),
+            &RealClock,
+            &ShardSlot::detached(),
+            || {
+                || FlusherExit::InputClosed // normal return on first attempt
+            },
+        );
         assert_eq!(m.wab_flusher_panics.get(), 0);
     }
 
@@ -1596,6 +2159,7 @@ mod tests {
             0,
             Arc::clone(&m),
             &RealClock,
+            &ShardSlot::detached(),
             panic_then_recover_factory(3, "transient boom"),
         );
         assert_eq!(
@@ -1616,10 +2180,16 @@ mod tests {
         let (m, _reg) = crate::metrics::Metrics::new();
         let m = Arc::new(m);
         let start = std::time::Instant::now();
-        run_with_panic_supervision(0, Arc::clone(&m), &RealClock, || {
-            // Every attempt panics — never recovers.
-            || panic!("persistent panic")
-        });
+        run_with_panic_supervision(
+            0,
+            Arc::clone(&m),
+            &RealClock,
+            &ShardSlot::detached(),
+            || {
+                // Every attempt panics — never recovers.
+                || -> FlusherExit { panic!("persistent panic") }
+            },
+        );
         let elapsed = start.elapsed();
         assert_eq!(
             m.wab_flusher_panics.get(),
@@ -1632,6 +2202,147 @@ mod tests {
             elapsed < Duration::from_secs(5),
             "respawn loop should terminate within ~1 s, took {elapsed:?}"
         );
+    }
+
+    // ── Shard registry: the supervisor records terminal states ─────────────────
+
+    use crate::status::{ShardRegistry, ShardSlot, SupervisorExit};
+    use weir_status::{OfflineReason, ShardState};
+
+    fn slot_with_flag(shutting_down: bool) -> ShardSlot {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(shutting_down));
+        ShardSlot::new(Arc::new(ShardRegistry::new(1, 1, flag)), 0)
+    }
+
+    #[test]
+    fn the_supervisor_maps_every_exit_to_a_terminal_registry_state() {
+        let m = Arc::new(crate::metrics::Metrics::new().0);
+        let clock = crate::wab::dst::SimClock::new();
+        let cases: Vec<(
+            bool,
+            FlusherExit,
+            SupervisorExit,
+            ShardState,
+            Option<OfflineReason>,
+        )> = vec![
+            (
+                false,
+                FlusherExit::InputClosed,
+                SupervisorExit::InputClosed,
+                ShardState::Offline,
+                Some(OfflineReason::FlusherExited),
+            ),
+            (
+                true,
+                FlusherExit::InputClosed,
+                SupervisorExit::InputClosed,
+                ShardState::Stopped,
+                None,
+            ),
+            (
+                false,
+                FlusherExit::CounterScanFailed,
+                SupervisorExit::CounterScanFailed,
+                ShardState::Offline,
+                Some(OfflineReason::CounterScanFailed),
+            ),
+        ];
+        for (sd, body_exit, want_exit, want_state, want_reason) in cases {
+            let slot = slot_with_flag(sd);
+            let got =
+                run_with_panic_supervision(0, Arc::clone(&m), &clock, &slot, || move || body_exit);
+            assert_eq!(got, want_exit);
+            assert_eq!(
+                slot.registry().state(0),
+                want_state,
+                "{body_exit:?} shutting_down={sd}"
+            );
+            assert_eq!(slot.registry().reason(0), want_reason);
+        }
+    }
+
+    #[test]
+    fn panic_exhaustion_ends_respawn_exhausted_after_marking_each_respawn() {
+        let m = Arc::new(crate::metrics::Metrics::new().0);
+        let clock = crate::wab::dst::SimClock::new();
+        let slot = slot_with_flag(false);
+        let got = run_with_panic_supervision(0, Arc::clone(&m), &clock, &slot, || {
+            || -> FlusherExit { panic!("persistent panic") }
+        });
+        assert_eq!(got, SupervisorExit::RespawnExhausted);
+        assert_eq!(slot.registry().state(0), ShardState::Offline);
+        assert_eq!(
+            slot.registry().reason(0),
+            Some(OfflineReason::RespawnExhausted)
+        );
+        assert_eq!(slot.registry().respawns(0), MAX_FLUSHER_RESPAWNS);
+    }
+
+    /// The counter-scan give-up used to be a bare `return`, indistinguishable
+    /// from a clean channel close (spec §5.3). A missing shard dir makes every
+    /// `segment_counters` read_dir fail.
+    #[test]
+    fn a_counter_scan_give_up_returns_counter_scan_failed_and_never_marks_up() {
+        let slot = ShardSlot::detached();
+        let (_work_tx, work_rx) = crossbeam_channel::bounded::<Batch>(1);
+        let (drain_tx, _drain_rx) = crossbeam_channel::bounded::<PathBuf>(1);
+        let missing = tmp_dir("counter_scan_missing").join("no_such_shard");
+        let exit = flusher_thread(
+            0,
+            missing,
+            work_rx,
+            drain_tx,
+            1,
+            Duration::from_millis(5),
+            64 * 1024 * 1024,
+            None,
+            None,
+            None,
+            Arc::new(crate::metrics::Metrics::new().0),
+            Arc::new(AtomicU64::new(200)),
+            &crate::wab::dst::SimClock::new(),
+            Arc::new(FsSegmentStore),
+            Compression::None,
+            1,
+            &slot,
+            handoff::HandoffState::detached(0, Arc::new(crate::metrics::Metrics::new().0)),
+        );
+        assert_eq!(exit, FlusherExit::CounterScanFailed);
+        assert_eq!(
+            slot.registry().state(0),
+            ShardState::Starting,
+            "only the supervisor writes terminal states"
+        );
+    }
+
+    #[test]
+    fn a_flusher_marks_its_shard_up_after_the_counter_scan_and_returns_input_closed() {
+        let slot = ShardSlot::detached();
+        let (work_tx, work_rx) = crossbeam_channel::bounded::<Batch>(1);
+        drop(work_tx); // Disconnected on the first recv
+        let (drain_tx, _drain_rx) = crossbeam_channel::bounded::<PathBuf>(1);
+        let exit = flusher_thread(
+            0,
+            tmp_dir("flusher_marks_up"),
+            work_rx,
+            drain_tx,
+            1,
+            Duration::from_millis(5),
+            64 * 1024 * 1024,
+            None,
+            None,
+            None,
+            Arc::new(crate::metrics::Metrics::new().0),
+            Arc::new(AtomicU64::new(200)),
+            &crate::wab::dst::SimClock::new(),
+            Arc::new(FsSegmentStore),
+            Compression::None,
+            1,
+            &slot,
+            handoff::HandoffState::detached(0, Arc::new(crate::metrics::Metrics::new().0)),
+        );
+        assert_eq!(exit, FlusherExit::InputClosed);
+        assert_eq!(slot.registry().state(0), ShardState::Up);
     }
 
     #[test]
@@ -1728,5 +2439,371 @@ mod tests {
             cur, clamped,
             "NVMe-range EWMA ({cur} µs) should not be clipped by [50, 2000] bounds"
         );
+    }
+
+    // ── The startup split (recover / scan_replay / spawn_flushers) ───────────
+
+    /// `recover` is the first half of the old `spawn`: it makes the shard dirs
+    /// private and seals what a crash left open, and it does nothing else.
+    #[test]
+    fn recover_creates_private_shard_dirs_and_seals_open_segments() {
+        let dir = tmp_dir("recover_split");
+        let sd0 = shard_dir_path(&dir, 0);
+        crate::testutil::mkdir_p(&sd0);
+        let open = segment_path(&sd0, 1);
+        {
+            let mut s = WabSegment::create(&open, 0, Compression::None).unwrap();
+            s.write_record(b"left-open").unwrap();
+            s.fsync().unwrap();
+            // dropped unsealed: what a crash leaves
+        }
+        let metrics = Arc::new(Metrics::new().0);
+
+        let summary = recover(&dir, 2, &metrics).unwrap();
+
+        assert_eq!(summary.shard_dirs, 2);
+        assert_eq!(summary.segments_quarantined, 0);
+        assert_eq!(summary.segments_failed, 0);
+        assert!(!open.exists(), "recovery seals the open segment");
+        let sealed = open.with_extension("wab.sealed");
+        assert_eq!(read_segment_record_count(&sealed).unwrap(), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for id in 0..2 {
+                let mode = fs::metadata(shard_dir_path(&dir, id))
+                    .unwrap()
+                    .permissions()
+                    .mode();
+                assert_eq!(mode & 0o777, 0o700, "shard_{id:02} must be private");
+            }
+        }
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// `scan_replay` is the replay WITHOUT the sends: the list, in the order
+    /// the drain will see it, and the replay metric, with no channel at all.
+    #[test]
+    fn scan_replay_lists_the_backlog_in_order_and_counts_its_records() {
+        let dir = tmp_dir("scan_replay");
+        let sd0 = shard_dir_path(&dir, 0);
+        let sd1 = shard_dir_path(&dir, 1);
+        let a = sealed_in_shard(&sd0, 1, b"a");
+        let b = sealed_in_shard(&sd0, 2, b"b");
+        let c = sealed_in_shard(&sd1, 1, b"c");
+        let metrics = Arc::new(Metrics::new().0);
+
+        let replay = scan_replay(&dir, 2, &metrics, false).unwrap();
+
+        assert_eq!(replay, vec![a, b, c]);
+        assert_eq!(metrics.recovery_records_replayed.get(), 3);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// Startup keeps the fail-fast policy: an unreadable shard aborts the scan
+    /// rather than silently dropping its backlog.
+    #[cfg(unix)]
+    #[test]
+    fn scan_replay_fails_on_an_unreadable_shard() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root reads a 0o000 directory; the condition cannot be built
+        }
+        let dir = tmp_dir("scan_replay_unreadable");
+        let sd0 = shard_dir_path(&dir, 0);
+        sealed_in_shard(&sd0, 1, b"a");
+        fs::set_permissions(&sd0, fs::Permissions::from_mode(0o000)).unwrap();
+        let err = scan_replay(&dir, 1, &Arc::new(Metrics::new().0), false);
+        fs::set_permissions(&sd0, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            err.is_err(),
+            "startup replay must not skip a shard it cannot list"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    // ── Hand-off tests A and B (spec §15) ─────────────────────────────────────
+
+    fn durable_unit(
+        payload: Vec<u8>,
+        ack_tx: oneshot::Sender<AckOutcome>,
+    ) -> crate::models::WorkUnit {
+        crate::models::WorkUnit {
+            shard_id: 0,
+            payload: weir_core::Payload::from(payload),
+            durability: Durability::Durable,
+            wants_coordinate: false,
+            ack_tx,
+            #[cfg(feature = "bench-trace")]
+            enqueued_at: Instant::now(),
+        }
+    }
+
+    /// One batch of `n` 32-byte Durable records, then the work channel closes,
+    /// so the flusher writes, group-fsyncs, acks, then runs its shutdown seal
+    /// and the final hand-off.
+    fn one_batch_then_close(n: u8) -> (Receiver<Batch>, Vec<oneshot::Receiver<AckOutcome>>) {
+        let (work_tx, work_rx) = crossbeam_channel::bounded::<Batch>(4);
+        let mut acks = Vec::new();
+        let mut units = Vec::new();
+        for i in 0..n {
+            let (tx, rx) = oneshot::channel();
+            acks.push(rx);
+            units.push(durable_unit(vec![i; 32], tx));
+        }
+        work_tx
+            .send(Batch {
+                shard_id: 0,
+                records: units,
+                #[cfg(feature = "bench-trace")]
+                flushed_at: Instant::now(),
+            })
+            .unwrap();
+        drop(work_tx);
+        (work_rx, acks)
+    }
+
+    /// The real flusher on the real filesystem with `RealClock`. PR 1's shard
+    /// slot is `ShardSlot::detached()`, as at the DST call sites.
+    fn run_real_flusher(
+        shard_dir: PathBuf,
+        work_rx: Receiver<Batch>,
+        drain_tx: Sender<PathBuf>,
+        segment_max_bytes: u64,
+        metrics: Arc<Metrics>,
+        handoff: handoff::HandoffState,
+    ) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            let _ = flusher_thread(
+                0,
+                shard_dir,
+                work_rx,
+                drain_tx,
+                64,
+                Duration::from_millis(5),
+                segment_max_bytes,
+                None,
+                None,
+                None,
+                metrics,
+                Arc::new(AtomicU64::new(200)),
+                &RealClock,
+                Arc::new(FsSegmentStore),
+                Compression::None,
+                1,
+                &ShardSlot::detached(),
+                handoff,
+            );
+        })
+    }
+
+    /// One `reason` series of `weir_wab_segments_not_handed_off_total` (README Q7).
+    fn not_handed_off_for(metrics: &Metrics, reason: crate::metrics::NotHandedOffReason) -> u64 {
+        metrics
+            .wab_segments_not_handed_off
+            .get_or_create(&crate::metrics::NotHandedOffLabel { reason })
+            .get()
+    }
+
+    fn sealed_files(shard_dir: &Path) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = fs::read_dir(shard_dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.to_string_lossy().ends_with(EXT_SEALED))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Test A: a full bounded(1) channel nobody consumes, flag already set.
+    /// The flusher returns within ~1 s; its segment is sealed with a valid
+    /// footer; every ack resolves true (they were fsynced before the hand-off).
+    #[test]
+    fn hand_off_test_a_full_channel_and_flag_already_set_returns_within_the_budget() {
+        let dir = tmp_dir("handoff_a");
+        let sd = shard_dir_path(&dir, 0);
+        crate::testutil::mkdir_p(&sd);
+        let metrics = Arc::new(Metrics::new().0);
+        let (drain_tx, drain_rx) = crossbeam_channel::bounded::<PathBuf>(1);
+        drain_tx.send(PathBuf::from("prefill")).unwrap();
+        let handoff = handoff::HandoffState::new(
+            0,
+            Arc::new(AtomicBool::new(true)),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            None,
+            Arc::clone(&metrics),
+        );
+        let (work_rx, acks) = one_batch_then_close(5);
+
+        let t0 = Instant::now();
+        run_real_flusher(
+            sd.clone(),
+            work_rx,
+            drain_tx,
+            64 * 1024 * 1024,
+            Arc::clone(&metrics),
+            handoff,
+        )
+        .join()
+        .unwrap();
+        let took = t0.elapsed();
+
+        assert!(
+            took >= Duration::from_millis(900) && took < Duration::from_millis(1700),
+            "the final hand-off must give up after the 1 s budget, took {took:?}"
+        );
+        for (i, mut rx) in acks.into_iter().enumerate() {
+            assert!(
+                rx.try_recv().unwrap().durable,
+                "record {i}: acks precede and do not depend on the hand-off"
+            );
+        }
+        let sealed = sealed_files(&sd);
+        assert_eq!(sealed.len(), 1);
+        assert_eq!(read_segment_record_count(&sealed[0]).unwrap(), 5);
+        assert_eq!(SegmentReader::open(&sealed[0]).unwrap().count(), 5);
+        assert_eq!(
+            not_handed_off_for(&metrics, crate::metrics::NotHandedOffReason::budget),
+            1
+        );
+        assert_eq!(
+            metrics.wab_segments_not_handed_off_total(),
+            1,
+            "budget only, nothing disconnected"
+        );
+        assert_eq!(
+            drain_rx.try_iter().collect::<Vec<_>>(),
+            vec![PathBuf::from("prefill")]
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// Test B: the same channel, but the flag is raised 500 ms AFTER the
+    /// flusher blocked: the blocked send re-reads it within one slice.
+    #[test]
+    fn hand_off_test_b_a_flag_raised_while_blocked_bounds_the_join() {
+        let dir = tmp_dir("handoff_b");
+        let sd = shard_dir_path(&dir, 0);
+        crate::testutil::mkdir_p(&sd);
+        let metrics = Arc::new(Metrics::new().0);
+        let (drain_tx, _drain_rx) = crossbeam_channel::bounded::<PathBuf>(1);
+        drain_tx.send(PathBuf::from("prefill")).unwrap();
+        let flag = Arc::new(AtomicBool::new(false));
+        let handoff = handoff::HandoffState::new(
+            0,
+            Arc::clone(&flag),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            None,
+            Arc::clone(&metrics),
+        );
+        let (work_rx, acks) = one_batch_then_close(3);
+
+        let t0 = Instant::now();
+        let flusher = run_real_flusher(
+            sd.clone(),
+            work_rx,
+            drain_tx,
+            64 * 1024 * 1024,
+            Arc::clone(&metrics),
+            handoff,
+        );
+        thread::sleep(Duration::from_millis(500));
+        assert!(
+            !flusher.is_finished(),
+            "outside shutdown the hand-off must keep blocking"
+        );
+        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        flusher.join().unwrap();
+        let took = t0.elapsed();
+
+        assert!(
+            took >= Duration::from_millis(1400) && took < Duration::from_millis(2400),
+            "≈500 ms + 1 s budget (+ ≤ one slice), took {took:?}"
+        );
+        for mut rx in acks {
+            assert!(rx.try_recv().unwrap().durable);
+        }
+        assert_eq!(sealed_files(&sd).len(), 1);
+        assert_eq!(
+            not_handed_off_for(&metrics, crate::metrics::NotHandedOffReason::budget),
+            1
+        );
+        assert_eq!(metrics.wab_segments_not_handed_off_total(), 1);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// Rotation goes through the hand-off too, and the shard's blocked marker
+    /// is set while it waits and cleared when the slow drain catches up.
+    #[test]
+    fn a_rotation_waits_out_a_slow_drain_and_marks_then_clears_the_shard() {
+        #[derive(Default)]
+        struct Marks(std::sync::Mutex<Vec<(u16, u64)>>);
+        impl handoff::HandoffMarker for Marks {
+            fn set_handoff_blocked_since_ms(&self, shard: u16, ms: u64) {
+                self.0.lock().unwrap().push((shard, ms));
+            }
+        }
+        let dir = tmp_dir("handoff_rotation");
+        let sd = shard_dir_path(&dir, 0);
+        crate::testutil::mkdir_p(&sd);
+        let metrics = Arc::new(Metrics::new().0);
+        let (drain_tx, drain_rx) = crossbeam_channel::bounded::<PathBuf>(1);
+        drain_tx.send(PathBuf::from("prefill")).unwrap();
+        let marks = Arc::new(Marks::default());
+        let handoff = handoff::HandoffState::new(
+            0,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            Some(Arc::clone(&marks) as Arc<dyn handoff::HandoffMarker>),
+            Arc::clone(&metrics),
+        );
+        // 32-byte records over a 100-byte segment rotate every second record.
+        let (work_rx, acks) = one_batch_then_close(4);
+        let consumer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(350));
+            drain_rx.iter().collect::<Vec<_>>()
+        });
+        run_real_flusher(
+            sd.clone(),
+            work_rx,
+            drain_tx,
+            100,
+            Arc::clone(&metrics),
+            handoff,
+        )
+        .join()
+        .unwrap();
+        let delivered = consumer.join().unwrap();
+
+        assert_eq!(
+            metrics.wab_segments_not_handed_off_total(),
+            0,
+            "outside shutdown nothing is given up"
+        );
+        let sealed = sealed_files(&sd);
+        assert!(
+            sealed.len() >= 2,
+            "the 100-byte segment must rotate at least once before the shutdown seal: {sealed:?}"
+        );
+        assert_eq!(
+            delivered.len(),
+            1 + sealed.len(),
+            "prefill + every sealed segment"
+        );
+        for mut rx in acks {
+            assert!(rx.try_recv().unwrap().durable);
+        }
+        let marks = marks.0.lock().unwrap().clone();
+        assert!(
+            marks.first().is_some_and(|(s, ms)| *s == 0 && *ms > 0),
+            "{marks:?}"
+        );
+        assert_eq!(
+            marks.last(),
+            Some(&(0, 0)),
+            "the marker must end cleared: {marks:?}"
+        );
+        fs::remove_dir_all(dir).ok();
     }
 }

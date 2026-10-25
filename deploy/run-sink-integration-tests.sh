@@ -165,6 +165,25 @@ info "running sql_sink_content_keyed_schema_loses_a_distinct_duplicate_record"
 cargo test $CARGO_FLAGS -p weir-server --test system -- --ignored --exact \
     sql_sink_content_keyed_schema_loses_a_distinct_duplicate_record
 
+# Plain-mode duplicate keys (safety-floor spec section 4.7). In plain mode a
+# duplicate key used to be transient, and the all-or-nothing INSERT was re-sent
+# forever. The sink-level tests drive a replay of the same WAB coordinates (the
+# id-column path, which only a crash produces through the daemon), an
+# all-duplicate 5,000-record replay against the sink timeout, and a commit the
+# server applied after the client timed out (latency injected by a trigger).
+# They live in the binary's unit tests because only there is the sink
+# constructible; the system test runs the bisection path through the daemon.
+info "running the plain-mode duplicate-key tests (mysql, postgres)"
+# shellcheck disable=SC2086
+cargo test $CARGO_FLAGS -p weir-server --bin weir-server -- --ignored --test-threads=1 \
+    sink::mysql::tests::live::live_
+# shellcheck disable=SC2086
+cargo test $CARGO_FLAGS -p weir-server --bin weir-server -- --ignored --test-threads=1 \
+    sink::postgres::tests::live::live_
+# shellcheck disable=SC2086
+cargo test $CARGO_FLAGS -p weir-server --test system -- --ignored --exact \
+    sql_sink_plain_mode_duplicate_keys_do_not_livelock_the_drain
+
 # The S3 suite is five tests, not one, and two of them carry the design:
 # s3_sink_replay_is_an_idempotent_overwrite pins replay stability, and
 # s3_sink_distinct_batches_of_identical_records_produce_distinct_objects pins

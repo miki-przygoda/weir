@@ -15,7 +15,259 @@ protocol** below.
 
 ## [Unreleased]
 
+The safety floor: the defects through which an operator mistake, a local disk
+fault or a sink quirk could cost acked records, re-deliver without bound, or
+kill the daemon. The mechanisms are under **Fixed**, the new key, exit code,
+files and metrics under **Added**, and **Changed** collects every behaviour an
+operator can notice on upgrade. **Upgrading from 4.0.x**, at the end, lists
+every new reason a deployment that ran 4.0.x can be refused at startup, with
+the message it prints and the fix. The wire protocol (`WIRE_VERSION` 1), the WAB
+segment format, the `.confirmed` sidecar format and `weir-ctl`'s `--json`
+output are unchanged, and downgrading to 4.0.x is safe: an old binary skips
+`.weir.lock` (not a directory) and `*.confirmed.tmp` (not `.wab.sealed`), and
+nothing new is persisted.
+
+Foundations: weir can be observed and steered while it runs, and it starts
+and stops within bounds. Health routes and a typed status document say *why*
+a daemon is not ready, an admin socket pauses and resumes delivery, startup
+no longer waits on the sink, and shutdown is bounded. The wire protocol, the
+WAB format, `HealthCheck`, every existing metric and every existing `--json`
+shape (including `weir-ctl attest`) are unchanged. Downgrading is safe:
+older releases warn about and ignore the new config keys, and never read
+`wab.admin.sock`.
+
 ### Fixed
+
+- **A second daemon on the same `wab_dir` turned the first one's `Durable`
+  acks into false acks.** Reproduced on 4.0.1: daemon B, started on a running
+  daemon A's `wab_dir` with its own socket and metrics port, ran startup
+  recovery on A's *active* segment, sealed it, and its drain delivered,
+  confirmed and deleted it. A then acked 50 more `Durable` records into the
+  unlinked inode; none was delivered, nothing remained on disk, and A's
+  shutdown seal logged "No such file or directory". Nothing in the tree called
+  `flock`, and the WAB's safety argument assumes a single writer.
+
+  `weir-server` now takes an exclusive `flock` on `<wab_dir>/.weir.lock` right
+  after the "weir starting" line, before the metrics registry and before
+  anything reads the WAB. The file is opened `O_NOFOLLOW`, mode 0600, must be a
+  regular file, and is never unlinked or released, so the kernel drops the lock
+  at process exit (a `SIGKILL`ed daemon's successor starts normally). A lock
+  file with more than one hard link (writing the record would truncate every
+  other name for it) or owned by another uid (that user could hold it while
+  the daemon is down) is refused before the `flock`, untouched; the owner
+  refusal names the uid and the `chown` that fixes it, which is what a
+  root-owned file left by a `sudo weir-server` run needs. (On a mount that
+  maps owners, such as NFS `root_squash` or CIFS/FUSE `uid=`, the daemon's own
+  new file reports another owner and is refused too; that fails closed.) A
+  file of ours with a loose mode is set to 0600 once held. A holder record
+  (pid, host, start time, boot id, version, socket, metrics address) is
+  written only after the lock is taken, so a refused contender never touches
+  it. Read back, the record is untrusted: only 4 KiB is parsed, control and
+  bidi formatting characters are stripped, and a value over 256 bytes is
+  dropped rather than printed. Contention refuses to start with exit status 1 and a message naming the
+  holder: `wab_dir <dir> is locked by another weir-server (pid … on host …,
+  started …, version …, socket …)`. The regression test is the reproduction: B
+  exits 1, A's tree is byte-identical, all 70 records reach the sink; with the
+  `flock` call removed, B is still running after 5 s.
+
+- **Deleting `.weir.lock` under a running daemon re-opened the same hole.** A
+  second daemon started afterwards locks a fresh file and recovers the first
+  one's active segments. The daemon now re-checks its lock once a second
+  (`lstat` against the held fd's `(dev, ino)`, and a re-`flock` of the held fd,
+  which reports `EWOULDBLOCK` after an NFS lease loss). A deleted file is
+  re-created with `O_EXCL` (a file planted there is never adopted), and a
+  replaced file nobody holds is re-locked, each with an ERROR and
+  `weir_wab_dir_lock_integrity_failures_total` +1. The replacement's record is
+  read before anything is written: a record naming another daemon proves one
+  held the directory (and may have recovered this daemon's segments before
+  exiting), so it is treated like contention and left in place as evidence.
+  The `flock` and that read come before the hard-link and owner checks, which
+  gate only writing this daemon's record: a second daemon running as another
+  uid owns its file, and that is proof of a lost lock, not an error to retry
+  while acks continue. A
+  path whose `lstat` id differs from the held fd's but which opens to the
+  same file (overlayfs before Linux 4.19) is recognised as the held lock, not
+  reported as a rival holding this daemon's own pid. If the re-lock meets
+  contention, another instance provably owns the directory: the daemon NACKs
+  every new push with the existing `InternalError` (one `Relaxed` atomic load
+  per push; no wire change), sets `weir_wab_dir_lock_held` to 0, logs
+  `CRITICAL: wab_dir ownership lost: another weir-server (…) holds or held the
+  lock on this wab_dir …`, and exits **3** at once, without sealing, because the
+  segments are the other daemon's now. The check runs on its own thread from
+  right after the lock is taken, so it also covers recovery and a long startup
+  replay, when the socket and metrics port are not bound yet and a duplicate
+  with an identical config would pass preflight; proven loss there exits 3
+  before anything is served. Detection does not close the window between the
+  unlink and the next tick (at most about a second); only never deleting
+  `.weir.lock` does.
+
+- **A daemon that had to refuse to start re-delivered on every restart.** A
+  taken metrics port, a live socket, bad TLS material or a taken `tcp_bind`
+  was found only after recovery, the drain and the replay had started, so
+  `main` returned with the drain mid-commit. Under `Restart=on-failure` or
+  compose `restart: unless-stopped`, every restart re-delivered the head of the
+  oldest unconfirmed segment and died before confirming it: unbounded duplicate
+  delivery at the restart cadence. A preflight now runs right after the lock
+  and before recovery: the socket path (format, `sun_path` length, a non-socket
+  entry, then a connect-only liveness probe that never unlinks), a test-bind of
+  the metrics address, and with `tcp_bind` a throwaway TLS load and a test-bind
+  of the TCP address. The real binds share the preflight's refusal messages,
+  so a late failure is now only a race. The system test starts the refused
+  duplicate on a seeded backlog and asserts the sink sees zero connections.
+
+- **A second daemon silently took over a live socket.** Startup unlinked any
+  socket at `socket_path`, including one a running daemon was listening on, so
+  the first daemon lost every new producer; shutdown went through the same
+  function and could unlink a successor's socket. Startup now probes before
+  unlinking: a refused connection (stale) is removed with INFO `removed stale
+  socket`, a live one refuses with `socket_path '<path>' is in use by a running
+  process; refusing to remove it. Stop the other weir-server or choose another
+  socket_path.`, and an errno the probe cannot read refuses too. Shutdown
+  removes the socket only if the path still names the inode this daemon bound
+  (pinned on Linux by an `O_PATH` fd held for the listener's life); otherwise it
+  WARNs and leaves the file. On non-Linux targets `ECONNREFUSED` can also mean
+  a live listener with a full backlog, so there a refused socket is removed only
+  if a datagram connect to it is refused too. Any bound socket answers that
+  with `EPROTOTYPE`, whatever its backlog, so a live daemon whose accept loop
+  is stalled keeps its socket.
+
+- **`SIGHUP` killed every daemon without TLS.** Only a TLS build with
+  `tcp_bind` installed a handler, and only once the runtime was up, so
+  `kill -HUP`, a log-rotation script or a terminal hang-up killed the daemon
+  outright, skipping the seal and the drain; a TLS daemon also died to a HUP
+  during recovery or replay. `SIGHUP` is now ignored from before config load
+  and then handled by one reload path: with TLS it reloads the certificates as
+  before (fail-safe, still counted in `weir_tls_config_reloads_total`);
+  otherwise it is a counted no-op logged as `SIGHUP received: nothing
+  reloadable in this build/config (config is read once at startup); nothing
+  changed`. Reloads go through a bounded queue of 8; a flood drops and counts
+  the excess rather than growing memory. `weir.service` still has no
+  `ExecReload`.
+
+- **A corrupt sealed segment header was retried forever.** Bad magic, version
+  0 and a short header were all classified transient: retried, stranded,
+  re-queued by every rescan for the life of the process, and replayed on every
+  restart. They are now quarantined on the first attempt. A header with a
+  version above what this build reads, or a v2 header with a flags bit this
+  build does not know (where a later weir adds a feature without bumping the
+  version), is a segment from a newer weir: it is parked as
+  `unsupported_version`, left untouched and replayed on the next start, so a
+  rollback does not push newer-format segments into manual recovery.
+
+- **An I/O blip mid-segment quarantined a good segment.** Any read error
+  committed the readable prefix and quarantined the rest, so an `EIO`, a stale
+  handle or descriptor pressure pushed a good, often fully delivered, segment
+  into `weir-ctl quarantine requeue`. Only `InvalidData`/`UnexpectedEof`
+  (corruption) still take that path. Any other read error, mid-segment or on
+  the footer, is a transient local-read failure that commits nothing partial
+  and resumes past the durable prefix. A persistent error escalates once it
+  has lasted both 3 strand cycles (`(sink_max_retries + 1) × 3` failures) and
+  10 minutes since the segment's first local read failure in the run: a
+  media-class error (`EIO` and similar) delivers the prefix once and
+  quarantines, a permission-class error (`EACCES`, a directory at the sealed
+  path) parks the segment as `local_read_failed`. The 10 minutes keep a device
+  blip (a remount, a path flap, a `chown -R` during maintenance) from
+  quarantining or parking a good segment, which the cycle count alone did
+  about a minute in at the defaults; the segment keeps retrying and delivers
+  once the fault clears. Process-class errors (`EMFILE`, `ENOMEM`) never
+  escalate, so fd pressure heals as before.
+
+- **A strand re-delivered a segment's committed prefix.** The resume cursor now
+  survives a strand within a run: it is pinned to the file's `(dev, ino)` in a
+  drain-owned ledger that also outlives a drain panic and respawn, so a
+  re-admitted segment resumes past what it already committed. Every path the
+  drain receives, from its queue or the rescan, passes one admission filter,
+  so a copy of a path still in the channel can no longer bypass a disposition,
+  a park or a cool-down. The pin is checked on every attempt, including the
+  retry and the unblock that carry the cursor in the drain's state, so a file
+  replaced at the same path is processed from its first record. The duplicate
+  window for a stranded segment is now a restart, not every strand
+  (`docs/sinks/s3.md` says so).
+
+- **A `.confirmed` sidecar that could not be written re-delivered the whole
+  segment every health poll, and a torn one got a delivered segment
+  quarantined.** The sidecar is now written as `seg_X.wab.confirmed.tmp`
+  (0600), fsynced, renamed into place and the shard directory fsynced, so the
+  final name only ever holds complete, durable contents. A failed sidecar or
+  delete is retried on its own on every health poll (and once on exit) and the
+  segment is never re-delivered meanwhile. Stale `*.confirmed.tmp` files are
+  deleted by the scan. A sidecar torn by 4.0.x is still quarantined once, as
+  before.
+
+- **A failed quarantine move re-delivered the prefix every poll.** With
+  `quarantine/` unwritable (`ENOSPC`, `EACCES`, a regular file squatting on the
+  name) the segment stayed sealed and unconfirmed, and the rescan sent its
+  readable prefix again every `health_poll_interval_secs`. The move is now
+  retried on its own and the segment is never delivered again this run.
+
+- **The dead-letter path re-committed records the sink had already accepted.**
+  The sink commits a sub-batch before its rejected records reach
+  `dead_letter/`; when that write could not happen the cursor stayed before the
+  sub-batch, so: with dead-letter headroom anywhere in `[cap - needed, cap)` the
+  drain unblocked, re-committed and blocked again every
+  `dead_letter_check_interval_secs`; a failed write (`ENOSPC`) re-committed on
+  every retry and strand; and an `rm -rf dead_letter/` never unblocked the
+  drain (the rescan failed, and only startup created the directory). The
+  rejected records are now carried in the ledger (bounded at 64 MiB in total;
+  past that, the sub-batch is re-committed once with a WARN) and written
+  before the next attempt without asking the sink again, the drain unblocks on
+  the predicate that blocked it, and a missing `dead_letter/` is re-created;
+  `wab_dir` is fsynced before any record is written into it.
+
+- **A plain-mode duplicate key livelocked the MySQL and Postgres sinks.** With
+  `insert_mode = "plain"`, `ER_DUP_ENTRY` (1062) and `unique_violation`
+  (23505) were transient, and the multi-row `INSERT` is all-or-nothing, so the
+  drain re-sent the identical statement forever. No concurrent writer is
+  needed: a commit that timed out after the server applied it makes the retry
+  collide with its own rows. With an `id_column`, one lookup moves rows whose
+  `RecordId` is already present to committed (the id is the WAB coordinate, so
+  they are this record, already delivered) and one `INSERT` writes the rest.
+  Without one, the batch is bisected and each row that is still a duplicate on
+  its own is dead-lettered with `duplicate key (insert_mode=plain, no
+  id_column): <server message>`. If the id lookup itself fails (Postgres
+  `42501`: an ingest role without `SELECT`), the error is logged and the
+  dead-letter reason says the lookup failed rather than blaming the id.
+
+- **Every strand ended in a wait nobody needed.** The drain served the full
+  final backoff, up to 300 s under a server's `Retry-After`, before noticing
+  the retry budget was spent, with every other segment queued behind it on the
+  one drain thread. It now strands at once and records that delay as the
+  segment's `not_before`: other segments deliver during the cool-down, the
+  stranded one resumes past its cursor afterwards, and a `Retry-After` is still
+  honoured. The three strand log lines gain a `cool_down` field.
+
+- **A segment that panicked the drain stopped delivery for every segment.**
+  The supervisor respawned the drain, the rescan re-queued the same segment,
+  and after 10 panics delivery stopped until restart. The panic is now
+  charged to the segment in flight, and at its second panic the segment is
+  parked as `drain_panic` with an ERROR naming the path; the count survives
+  respawns.
+
+- **A slow sink or a slow disk read as a wedged drain.** The heartbeat moved
+  only at the drain loop's head and in its deliberate waits, so one long
+  segment commit, sidecar fsync or directory walk produced a "wedged, restart"
+  WARN, and a restart re-delivers from record 0 and fixes neither. The drain
+  now publishes what it is busy with: a sink call up to the drain's commit
+  timeout (at least 60 s, and at least twice `sink_timeout_secs`) plus 15 s is
+  an INFO with no restart advice, local I/O of any duration is a WARN pointing
+  at the device, and only a sink call past that bound or a freeze with nothing
+  busy is a wedge. An escalating verdict logs at
+  once instead of waiting out the 300 s rate limit the previous verdict set.
+  The verdict no longer goes silent when the WAB scan fails.
+
+- **A mistyped `--config` path ran the daemon silently on defaults.** A missing
+  config file was read as an empty layer with no log line, so with nothing
+  else setting a sink the daemon ran the `noop` sink: every record acked and
+  discarded. It now WARNs naming the path (prefixed `NOOP SINK:` when the sink
+  resolved to `noop`) and logs `config source` at INFO. Not yet an error: the
+  Docker image always passes `--config`, so env-only containers would fail to
+  start.
+
+- **Two scan defects in the drain.** A shard directory the rescan could not
+  list blocked resuming every other shard; it is now skipped with a WARN
+  (startup replay still fails fast). And a directory-entry error while sizing
+  the WAB was flattened away, undercounting it and lifting the `wab_max_bytes`
+  cap by the bytes it missed; the size is now reported unknown instead.
 
 - **Three stale spots in the README, all of them claims about the project's own
   release state.** The badge row carried a placeholder comment saying crates.io
@@ -57,6 +309,357 @@ protocol** below.
   `PushBatch`/`AckBatch` and its vectors file, and its heavier-suite list
   predated `load_batch.rs` and `research.rs`. Two version headings
   (`[2.0.1]`, `[0.4.0]`) had no compare link at the foot of this file.
+
+- **With `shard_count = 1`, a dead flusher left a zombie daemon**: the drain
+  exited as if shutting down, so nothing was ingested or delivered while the
+  process still ran. The drain's lifetime is now explicit; it keeps
+  delivering the on-disk backlog until told to stop.
+
+- **A large backlog behind a slow sink kept the producer socket and
+  `/metrics` down during startup**, so `WeirInstanceDown` fired through every
+  recovery.
+
+- **`weir-readiness.sh` stayed NOT READY until a restart** after one
+  recovered flusher panic or one fsync failure, because it gated on lifetime
+  counters.
+
+- **The Docker `HEALTHCHECK` passed for anything listening on 9185.**
+
+- **ACK_TIMEOUT nacks of durable records were read as a storage problem.**
+  They are usually the drain channel backing up into the flushers; the
+  `drain_backpressure` condition and `WeirDrainBackpressure` now say so.
+
+- **`/metrics` died at the start of shutdown instead of the end**, so the
+  last scrapes of a stopping daemon failed. The runtime now outlives the
+  worker and flusher joins.
+
+### Added
+
+- **`wab_dir_lock = "required" | "best-effort"`** (env `WEIR_WAB_DIR_LOCK`,
+  CLI `--wab-dir-lock`; default `"required"`). It only decides what happens on
+  a filesystem that cannot lock (`ENOLCK`, `EOPNOTSUPP`, `ENOTSUP`, `ENOSYS`,
+  `EINVAL`): `required` refuses to start, `best-effort` WARNs and runs without
+  the guard (and keeps orphaned sealed files, since nothing proves the daemon
+  is alone). A lock held by another process always refuses; no setting
+  overrides it. NFS may grant weaker locks and is not a supported guard.
+
+- **Exit status 3**: the daemon lost its `wab_dir` to another instance. Exit
+  status 1 is still every startup refusal.
+
+- **On-disk files.** `<wab_dir>/.weir.lock` (0600, regular file, holds the
+  holder record, never unlinked; do not delete it) and the transient
+  `seg_X.wab.confirmed.tmp` that exists only during a sidecar write. Every WAB
+  walker in the daemon and in `weir-ctl` ignores both; `weir-ctl` never locks.
+
+- **Metrics.** Every `weir_drain_*` series below is pre-initialised to 0, so it
+  exists before its first event:
+  - `weir_wab_dir_lock_held` (gauge): 1 while the lock is held; 0 under
+    `best-effort` without a lock, or just before exit 3. Alert on 0.
+  - `weir_wab_dir_lock_integrity_failures_total`: lock-file checks that found
+    it deleted, replaced or unreadable.
+  - `weir_config_reloads_total{trigger,outcome}`: `trigger` is `sighup`
+    (`admin` is reserved); `outcome` is `ok`, `failed`, `noop` or `dropped`.
+  - `weir_drain_local_io_strands_total{cause}`: strands caused by local I/O,
+    `cause="read"` (reading the sealed segment) or `cause="write"` (the
+    dead-letter write).
+  - `weir_drain_segments_parked{reason}` (gauge): `local_read_failed`,
+    `unsupported_version`, `drain_panic`. Parked segments stay on disk and
+    replay on the next start.
+  - `weir_drain_segments_disposition_pending{kind}` (gauge): `confirm` or
+    `quarantine` steps still owed and retried each health poll; these segments
+    are never re-delivered.
+  - `weir_drain_confirm_failures_total{stage}`: `sidecar` or `delete`.
+  - `weir_drain_quarantine_failures_total`: segments whose quarantine move
+    failed, counted once each.
+  - `weir_drain_dead_letter_write_failures_total`.
+  - `weir_drain_busy_seconds{kind}` (gauge): how long the drain thread has
+    been in its current operation; `kind` is `sink_commit`, `sink_probe`,
+    `segment_read`, `local_fsync`, `dead_letter_write`, `quarantine_move` or
+    `dir_scan`, and only the current kind is non-zero.
+
+- **Two alert rules for what `WeirSegmentStranded` can no longer see**, each
+  with a `promtool` test in both directions and a runbook in
+  `docs/monitoring.md`: `WeirDrainLocalIoStrands` (warning) on
+  `increase(weir_drain_local_io_strands_total[15m]) > 0`, local WAB or
+  dead-letter device trouble; and `WeirSegmentParked` (critical) on
+  `weir_drain_segments_parked > 0` for 5m, acked data that is not delivered
+  until a restart.
+
+- **A config-load WARN for `insert_mode = "plain"` without an `id_column`**
+  (MySQL and Postgres), naming the cost (every duplicate-key row is
+  dead-lettered; an all-duplicate batch can exceed `sink_timeout_secs`) and
+  both fixes. Plain mode with an `id_column` needs `SELECT` on the table.
+
+- **A CI check that systemd's `@system-service` syscall set still contains
+  `flock`.** The shipped `weir.service` sets
+  `SystemCallFilter=@system-service` with `SystemCallErrorNumber=EPERM`; were
+  `flock` ever filtered, the lock would fail with `EPERM` and every daemon
+  under the unit would refuse to start.
+
+- **A status model the whole daemon shares (`weir-status`).** A new published crate holds the
+  `weir.status/v1` types, the 30-code Conditions catalogue and one pure evaluator. The daemon
+  publishes its live state to a wait-free status board, and a 5 s task evaluates it into new
+  gauges: `weir_ready`, `weir_live`, `weir_condition_active{code,severity}` (one series per code),
+  `weir_startup_phase{phase}`, `weir_wab_shard_up{shard}`, `weir_worker_up{worker}`,
+  `weir_wab_undelivered_{segments,records}`, `weir_wab_oldest_undelivered_age_seconds`,
+  `weir_build_info` and the `weir_config_*` effective-config gauges, among 34 new families (see
+  docs/monitoring.md "Status, lifecycle and conditions"). Missing evidence makes a condition
+  *unevaluated*, never healthy.
+- `weir_records_nack_internal_total{cause}` splits the transient `InternalError` nacks into
+  `queue_full`, `write_failed`, `sender_dropped`, `ack_timeout`, `wab_cap`, `coordinate` and
+  `ownership_lost`. The wire bytes are unchanged.
+- `/livez`, `/readyz`, `/startupz` and `/status` on the metrics listener (exact paths, GET/HEAD;
+  every other path still returns metrics byte for byte); the `livez_checks` key
+  (`--livez-checks`, `WEIR_LIVEZ_CHECKS`); `weir_http_requests_dropped_total{reason}`.
+  They answer within milliseconds of start, through recovery and through
+  shutdown.
+- **Conditions everywhere.** The `weir-status` evaluator's condition codes
+  (30 the daemon evaluates, from `starting` to `admin_unavailable`, each with
+  a severity, what it affects and whether it gates readiness) are what
+  `/status`, `/readyz`, `/livez`, `weir_condition_active{code,severity}`,
+  `weir-readiness.sh` and `weir-ctl status` all read, so they agree.
+  Runbooks for every code are in `docs/monitoring.md#conditions`.
+- **An admin socket**, `<parent(wab_dir)>/<basename(wab_dir)>.admin.sock`
+  (`/var/lib/weir/wab.admin.sock` in the image and the systemd unit), mode
+  0600, daemon uid or root only. Verbs: `status`, `reload` (TLS, the same
+  path as SIGHUP), `drain.pause`, `drain.resume`, `drain.retry_stranded`.
+  A pause stops delivery before the next commit batch, keeps ingest
+  buffering, and is in memory only: a restart resumes.
+- **`weir-ctl status`** (admin socket, then `/status`, then metrics and disk;
+  exit 0 ready, 1 not ready, 2 unreachable, 3 ready with a critical
+  condition), **`weir-ctl reload`**, and **`weir-ctl drain pause`**,
+  `resume` and `retry-stranded`.
+- **Config keys** `admin_socket_enabled` (default true, env
+  `WEIR_ADMIN_SOCKET_ENABLED`) and `admin_socket_path` (`--admin-socket-path`,
+  `WEIR_ADMIN_SOCKET_PATH`), beside `drain_shutdown_budget_secs` (default 10,
+  under **Changed**) and `livez_checks` (default none, above).
+- **Metrics** for the admin socket and shutdown: `weir_admin_requests_total`,
+  `weir_admin_socket_up`, `weir_config_drain_shutdown_budget_seconds`,
+  `weir_drain_shutdown_deadline_seconds`, and the drain channel's
+  `weir_drain_channel_depth` and `weir_drain_channel_capacity`. All new
+  families; see the metric reference in `docs/monitoring.md`.
+- **Alert rules**, each with `promtool` tests in both directions and a
+  runbook: `WeirNotReady`, `WeirConditionCritical`, `WeirDrainPausedLong`,
+  `WeirOldestUndeliveredAge`, `WeirDrainBackpressure`,
+  `WeirAdminUnavailable`.
+
+### Changed
+
+Behaviour an operator can notice on upgrade:
+
+- **`weir-server` refuses to start**, before recovery reads a byte of the WAB,
+  when another instance holds the `wab_dir`, when the filesystem cannot lock
+  (under the default `wab_dir_lock = "required"`), when a live socket is at
+  `socket_path`, when the metrics port or `tcp_bind` is taken, or when the TLS
+  material is invalid. Under compose, a second replica on the same `wab_data`
+  volume refuses with `locked by`, and `restart: unless-stopped` crash-loops
+  it: safe, but noisy. With the shipped compose file, Docker's fixed host port
+  mapping (`127.0.0.1:9185:9185`) stops `--scale weir=2` before weir runs.
+- **It exits 3** when, while running, it finds another instance holding its
+  `wab_dir` lock (a startup refusal exits 1).
+- **`SIGHUP` no longer exits** any daemon; without TLS it is a counted no-op.
+- **Corrupt sealed segment headers are quarantined on the first attempt**;
+  newer-format segments are parked as `unsupported_version` instead.
+- **Transient read errors no longer quarantine.** Media errors that persist
+  for 3 strand cycles and at least 10 minutes quarantine; permission errors
+  that persist as long park. An error at segment open, which 4.0.x retried
+  for the life of the process, is now one of them.
+- **The drain's resume cursor survives strands** within a run.
+- **Orphaned sealed files are deleted**: a `.wab.sealed` beside a valid,
+  fsynced `.confirmed` is removed at startup and by the rescan, and the
+  sidecar stays. Only while the lock is held.
+- **Plain-mode duplicate keys**: with an `id_column`, a duplicate whose id is
+  already present counts as committed (other duplicates are dead-lettered);
+  without one, every duplicate row is dead-lettered.
+- **Strand timing**: no final backoff is served before a strand; the delay
+  becomes the segment's per-segment `not_before`, during which other segments
+  deliver.
+- **`weir_drain_segments_stranded_total` no longer counts local-I/O strands.**
+  Those move to `weir_drain_local_io_strands_total` and no longer mark the sink
+  down. The counter now means what its help text always said: the sink is
+  failing.
+- **Delivery order.** Per-connection order is the order records enter the WAB;
+  strands, cool-downs, parking, requeue and the HTTP sink's concurrent POSTs
+  can reorder delivery. The README and `weir-client` docs now say so.
+- **The `wab_max_bytes` cap clears without traffic.** The 5 s size scan now re-evaluates the cap,
+  so a daemon that drained below 90% of the cap resumes accepting before the next push arrives.
+  A failed scan leaves the flag as it was (fail-closed).
+- **A restart over the cap rejects from the first push.** A synchronous size scan runs after
+  recovery, before the socket binds. If that scan fails with a cap set, pushes nack until a
+  scan succeeds.
+- `weir_dead_letter_bytes_on_disk` and `weir_quarantine_bytes_on_disk` are also refreshed by the
+  5 s task.
+- Logging: the "weir starting" line carries `version`, `wire_version` and the effective config
+  (no secrets: sink URLs are reduced to scheme://host:port). Colour is emitted only when stdout
+  is a terminal. An invalid `log_level` is logged as a WARN instead of silently becoming `info`.
+  Commit-path log lines name their segment. A dead-letter-blocked episode WARNs when it starts.
+- Build: `arc-swap` is always compiled (it was optional behind `tls`).
+- **Shutdown is bounded.** After SIGTERM the daemon goes lame duck, waits at
+  most `shutdown_timeout_secs` for open connections, seals and hands off every
+  active segment, then gives the drain `drain_shutdown_budget_secs` (new key,
+  default 10, range 0-3600). Whatever is still undelivered stays sealed and
+  unconfirmed on disk and is delivered by the next start; the exit status is
+  0. The segment abandoned at the deadline re-delivers its committed prefix on
+  replay (at-least-once, the same window as a crash). A flusher blocked on a
+  full drain channel gives up its hand-off after 1 s, and that segment
+  replays too. At most one segment per shutdown is abandoned mid-delivery;
+  records it dead-lettered are dead-lettered again on replay.
+- **Lame duck at the first signal.** The producer socket is unlinked
+  (inode-checked) and the TCP listener closed at once, so new connects fail
+  fast instead of queueing for `shutdown_timeout_secs`, and `/readyz` answers
+  503 at once. Idle connections still get EOF; a frame already read is still
+  acked.
+- **A second SIGTERM/SIGINT forces the exit.** Open connections are aborted and
+  the drain deadline becomes "now"; the worker and flusher joins still run, so
+  no acked record is lost. A third signal only logs. It used to be swallowed.
+- **Startup no longer waits on the sink.** `/metrics` answers before WAB
+  recovery and reports `weir_startup_phase`; the replay backlog is handed to
+  the drain in memory, so a slow or unreachable sink no longer delays the
+  producer socket, and the backlog interleaves with new traffic. A daemon
+  restarted over `wab_max_bytes` is not ready from its first probe.
+- **SIGHUP is served from before WAB recovery**, because the runtime and its
+  handler now start right after the lock and preflight. It used to be ignored
+  through recovery and the startup replay.
+- **The shipped grace periods are 45 s** (`shutdown_timeout_secs +
+  drain_shutdown_budget_secs + 5`): systemd `TimeoutStopSec` 35 → 45, compose
+  `stop_grace_period: 45s`. Raise them with either key.
+- A metrics client must send its complete request head within 1 s or is
+  closed; `metrics_max_connections` now counts concurrent scrapes after the
+  head, and probes use their own pool of 4. A peer that connects and closes
+  or errors without sending a byte is now closed without a response (it used
+  to get the metrics body).
+- **New connections go only to live shards.** A connection is still pinned
+  to one shard for its life; a shard that is down is skipped at accept.
+- **`weir-readiness.sh`** decides on `/readyz` (or `weir-ctl status` when
+  installed). It no longer gates on sink health, drain state or lifetime
+  counters, which are now `WARN` lines. Exit 1 means exactly "`/readyz`
+  answers 503"; exit 3 needs `--fail-on-critical`. `--socket` is ignored.
+- **The image's `HEALTHCHECK`** sends `GET /livez` instead of opening a TCP
+  connection, with a 10 s start period. The systemd unit still has no
+  `ExecReload=`, on purpose.
+- **`WeirSegmentQuarantined`** now fires on `weir_quarantine_bytes_on_disk >
+  0`, so it keeps firing across a restart until the quarantine is dealt with.
+  `WeirAckTimeout` and `WeirQueueSaturation` now point at the drain hand-off
+  before storage.
+- Logging: the flusher's "drain channel closed" WARN is INFO while shutting
+  down.
+
+### Security
+
+- **Dependency advisories cleared** (lockfile only; no weir source changed,
+  and 4.0.1 carries the affected versions). `rustls` 0.23.45 -> 0.23.46 for
+  [RUSTSEC-2026-0346](https://rustsec.org/advisories/RUSTSEC-2026-0346),
+  [-0347](https://rustsec.org/advisories/RUSTSEC-2026-0347),
+  [-0348](https://rustsec.org/advisories/RUSTSEC-2026-0348) and
+  [-0349](https://rustsec.org/advisories/RUSTSEC-2026-0349): `Debug` impls on
+  client session values exposed TLS secrets, buffered application data went
+  to the outer server after an ECH rejection, Brotli certificate
+  decompression could allocate up to 1 GiB before authentication, and an
+  unauthenticated ServerHello could downgrade later connections to classical
+  key exchange. `tokio` 1.52.3 -> 1.54.1 for
+  [RUSTSEC-2026-0386](https://rustsec.org/advisories/RUSTSEC-2026-0386)
+  (unsound: `AsyncFd::new` and related constructors violated I/O safety; 1.52
+  has no fixed release). `rustls-webpki` 0.103.15 -> 0.103.16 for
+  [RUSTSEC-2026-0382](https://rustsec.org/advisories/RUSTSEC-2026-0382) and
+  `webpki-roots` 1.0.7 -> 1.0.11 for
+  [RUSTSEC-2026-0381](https://rustsec.org/advisories/RUSTSEC-2026-0381)
+  (certificate paths through the distrusted emSign intermediates).
+  `ctutils` 0.4.2 -> 0.4.5 for
+  [RUSTSEC-2026-0385](https://rustsec.org/advisories/RUSTSEC-2026-0385)
+  (const mask helpers and `u128` comparisons were not constant-time). Every
+  new version builds on the 1.88 MSRV.
+
+### Upgrading from 4.0.x
+
+Each refusal below exits with status 1 **before recovery reads the WAB**, so
+nothing is replayed or delivered and nothing is lost; under systemd's
+`Restart=on-failure` or compose's `restart: unless-stopped` the unit simply
+loops on the same message until the cause is fixed. Check for these before
+rolling the upgrade out. A `SIGKILL`ed predecessor is not one of them: the
+kernel drops its `flock` at exit, and its stale socket is removed as before.
+
+New refusals, where 4.0.x started:
+
+- **A `wab_dir` on a filesystem that cannot `flock`** (NFSv3 without
+  `lockd`/`statd`, some FUSE or CIFS mounts: `ENOLCK`, `EOPNOTSUPP`, `ENOTSUP`,
+  `ENOSYS`, `EINVAL`). Message: `wab_dir <dir> is on a filesystem that cannot
+  take an exclusive lock on <dir>/.weir.lock (<error>). … Move the WAB to a
+  local filesystem that supports flock, or set wab_dir_lock = "best-effort" to
+  run without this guard.` Moving `wab_dir` to local storage is the fix. To keep
+  the old behaviour instead, set `wab_dir_lock = "best-effort"` (env
+  `WEIR_WAB_DIR_LOCK=best-effort`, CLI `--wab-dir-lock best-effort`): the
+  daemon WARNs on every start, `weir_wab_dir_lock_held` stays 0 and
+  `WeirWabDirUnlocked` fires, and nothing stops a second daemon on the same
+  directory, exactly as in 4.0.x.
+
+- **A `.weir.lock` owned by another uid.** 4.0.x had no lock file, so this
+  appears after the upgrade, the first time weir-server runs against the
+  directory as someone else: a one-off `sudo weir-server` to debug leaves
+  `<wab_dir>/.weir.lock` owned by root (mode 0600, never unlinked by design),
+  and every later start as the service user is refused. A container image
+  whose weir user changed uid does the same. Message: ``cannot lock wab_dir
+  <dir>: <dir>/.weir.lock is owned by uid <owner>, not by this daemon's uid
+  <euid>. … If no weir-server is running on this wab_dir, either run
+  weir-server as uid <owner>, or give the file to this daemon's user as root:
+  `chown <euid> <dir>/.weir.lock`.`` Run the `chown` it names, as root, once
+  no weir-server is running there. On a mount that maps owners (NFS
+  `root_squash`, CIFS or FUSE `uid=`) even the daemon's own new file reports
+  another owner, and `chown` cannot help: move `wab_dir` to local storage.
+
+- **A stale socket at `socket_path` this daemon's uid cannot connect to**, for
+  example one left by a run as root, or by an image whose weir uid changed, on
+  a persistent socket volume (the shipped compose file keeps `/run/weir` in the
+  `weir_socket` volume). 4.0.x unlinked it; the liveness probe now gets
+  `EACCES`, cannot tell stale from live, and refuses: `cannot tell whether
+  socket_path '<path>' is in use: the liveness probe's connect failed with
+  Permission denied (os error 13) (errno 13); refusing to remove it. If no
+  weir-server is using it, remove the file manually and start again.` Confirm
+  nothing is serving it, then `rm` the socket.
+
+- **Two daemons on one `wab_dir` during a rolling update.** A Kubernetes
+  Deployment's default `RollingUpdate` (`maxSurge: 25%`) starts the new pod
+  while the old one still holds the volume; a compose or swarm service with
+  `update_config.order: start-first` does the same. In 4.0.x that overlap was
+  the false-ack bug under **Fixed**; now the new daemon is refused with
+  `wab_dir <dir> is locked by another weir-server (pid … on host …, started …,
+  version …, socket …). Two daemons on one wab_dir corrupt each other's
+  segments and can lose acked records. Stop the other instance or point this
+  one at a different wab_dir.` It crash-loops until the old daemon exits, and
+  with `maxUnavailable: 0` the rollout stalls. Use `strategy: {type:
+  Recreate}`, or `RollingUpdate` with `maxSurge: 0` (and `maxUnavailable: 1`);
+  for swarm, `order: stop-first`. Plain `docker compose up` already stops the
+  old container before starting the new one.
+
+- **A live socket at `socket_path`.** 4.0.x unlinked it and took the path over,
+  silently cutting the running daemon off from new producers. Now: `socket_path
+  '<path>' is in use by a running process; refusing to remove it. Stop the
+  other weir-server or choose another socket_path.` Give each daemon on a host
+  its own `socket_path`.
+
+Refusals 4.0.x also made, but only after recovery and the drain had started
+(so each restart re-delivered the head of the oldest unconfirmed segment), and
+which now come before recovery:
+
+- **A taken metrics port**: `failed to bind metrics endpoint to <bind>:<port>
+  (<error>) — another process (often another weir-server instance) is using
+  that port. Change it with --metrics-port / WEIR_METRICS_PORT (or
+  --metrics-bind / WEIR_METRICS_BIND).` A taken `tcp_bind` reads the same way
+  (`failed to bind the TCP+mTLS listener to tcp_bind <addr> (<error>) …`).
+- **Invalid TLS material** with `tcp_bind` set: `failed to load TLS config:
+  <error>`, naming the file that did not load. A `SIGHUP` reload of bad
+  material is still fail-safe and keeps the old certificates.
+- **A `socket_path` longer than the platform's `sun_path`**, or a non-socket
+  entry (a file, directory or symlink) at `socket_path`: refused as before,
+  with the same fix, but before recovery.
+
+One change needs action although it refuses nothing:
+
+- **SIGTERM no longer delivers the whole backlog.** It delivers for at most
+  `drain_shutdown_budget_secs` (10 s) once ingest is sealed; the rest is
+  delivered by the next start. Before decommissioning a host, stop the
+  producers and wait for `weir_wab_undelivered_segments` to reach 0, or raise
+  `drain_shutdown_budget_secs` for that stop. Raise your orchestrator's grace
+  period to at least 45 s.
 
 ## [4.0.1] - 2026-09-28
 

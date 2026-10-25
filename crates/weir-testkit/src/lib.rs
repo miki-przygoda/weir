@@ -24,10 +24,12 @@
 //! one thread effectively.
 
 mod harness;
+mod recording_sink;
 pub mod tls;
 mod util;
 
 pub use harness::{WeirServer, WeirServerBuilder};
+pub use recording_sink::RecordingSink;
 pub use util::{free_port, process_lock};
 
 /// Convenience: starts a [`WeirServerBuilder`] with the `weir-server` binary

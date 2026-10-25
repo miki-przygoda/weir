@@ -678,10 +678,10 @@ pub(crate) fn recover_segment(
     // `quarantined` (the preserved forensic copy) and `sealed` (the truncated
     // prefix, which the drain will confirm) — both transitions really happened.
     //
-    // Not double-counted anywhere: `replay_unconfirmed` only *queues* pre-existing
+    // Not double-counted anywhere: `scan_replay` only *lists* pre-existing
     // .wab.sealed files, which were counted by whichever process sealed them; a
     // replay is not a transition, so it must not bump this counter. Idempotency:
-    // recovery runs once per process (wab::spawn) and only ever sees unsealed
+    // recovery runs once per process (wab::recover) and only ever sees unsealed
     // .wab files, so within a process each seal is counted exactly once. If a
     // crash between the rename and the parent fsync lost the dirent, the next
     // process re-seals and re-counts — but that is a different process with a
@@ -1057,7 +1057,7 @@ mod tests {
 
     /// W1. A `.wab.sealed` left by a previous process was already counted as
     /// sealed by whichever process sealed it. Startup must NOT re-count it: the
-    /// replay path (`wab::replay_unconfirmed`) only *queues* it for the drain, and
+    /// replay path (`wab::scan_replay`) only *lists* it for the drain, and
     /// `recover_open_segments` only touches unsealed `.wab` files. Exactly one
     /// sealed transition is counted here — for the active segment recovery
     /// actually seals.
@@ -1606,6 +1606,32 @@ mod tests {
         }
         assert_eq!(recovered, vec![b"seg-one".to_vec(), b"seg-two".to_vec()]);
 
+        fs::remove_dir_all(wab_dir).ok();
+    }
+
+    /// `<wab_dir>/.weir.lock` is a regular file at the root, held by the live
+    /// daemon. Recovery walks the root for shard DIRECTORIES only, so it must
+    /// neither fail on the lock file nor touch it.
+    #[test]
+    fn recover_open_segments_ignores_the_wab_dir_lock_file() {
+        use crate::wab::lock::LOCK_FILE_NAME;
+        use crate::wab::segment::{WabSegment, segment_path};
+        let wab_dir = tmp_dir("recover_ignores_lock");
+        let shard_dir = wab_dir.join("shard_00");
+        crate::testutil::mkdir_p(&shard_dir);
+        let seg = segment_path(&shard_dir, 1);
+        let _ = fs::remove_file(&seg);
+        WabSegment::create(&seg, 0, Compression::None)
+            .unwrap()
+            .write_record(b"live")
+            .unwrap();
+        let lock = wab_dir.join(LOCK_FILE_NAME);
+        fs::write(&lock, b"pid=1\nhost=h\n").unwrap();
+
+        recover_open_segments(&wab_dir, &noop_metrics()).unwrap();
+
+        assert!(!seg.exists(), "the real shard segment is still recovered");
+        assert_eq!(fs::read(&lock).unwrap(), b"pid=1\nhost=h\n");
         fs::remove_dir_all(wab_dir).ok();
     }
 
@@ -2405,6 +2431,31 @@ mod tests {
             "audit must flag the two wide-mode segments and ignore README + the correct file"
         );
         fs::remove_dir_all(dir).ok();
+    }
+
+    /// The transient `seg_X.wab.confirmed.tmp` the atomic sidecar write leaves
+    /// behind after a crash or ENOSPC (spec §4.3) is neither a segment to seal
+    /// nor a sidecar: recovery must leave it alone, and the mode audit must not
+    /// flag it (it is created 0600, but a stale one is not worth an alert).
+    #[test]
+    #[cfg(unix)]
+    fn recovery_ignores_a_confirmed_tmp_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let wab = tmp_dir("rec_ignores_confirmed_tmp");
+        let shard = wab.join("shard_00");
+        fs::create_dir_all(&shard).unwrap();
+        let tmp = shard.join("seg_00000001.wab.confirmed.tmp");
+        fs::write(&tmp, b"half a sidecar").unwrap();
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let metrics = noop_metrics();
+        recover_open_segments(&wab, &metrics).unwrap();
+
+        assert!(tmp.exists(), "recovery does not touch a tmp sidecar");
+        assert!(!wab.join("quarantine").exists(), "nothing is quarantined");
+        assert_eq!(metrics.recovery_segments_quarantined.get(), 0);
+        assert_eq!(metrics.wab_unexpected_mode.get(), 0, "not a segment file");
+        fs::remove_dir_all(wab).ok();
     }
 
     #[test]

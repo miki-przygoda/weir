@@ -1,0 +1,39 @@
+# Foundations pre-release gate: a SECOND SIGTERM (Forced, spec §7) under a
+# power cut. weir's real defaults (budget 10 s, shutdown_timeout 30 s, so a
+# graceful bound of 45 s) make the second signal the only way out in time:
+# it lands 0.1-5 s after the first, and the cut lands 0-12 s after it. The
+# forced bound is faults.FORCED_BOUND_SECS (8 s); later cuts probe it.
+
+seed = 0xF0D52
+episodes = 300
+max_duration_secs = 21600  # 6h ceiling
+steady_lo_secs = 4.0
+steady_hi_secs = 8.0
+quiescence_timeout_secs = 180.0
+
+[load]
+threads = 8
+record_size = 256
+tier = "D"
+min_acked_per_episode = 100
+min_delivered_per_episode = 100
+
+[weir]
+shard_count = 4
+batch_size = 64
+batch_deadline_ms = 2
+wab_segment_max_bytes = 8388608
+drain_shutdown_budget_secs = 10
+
+[storage]
+size_mb = 2048
+dm_target = "flakey"
+
+[faults]
+kind = "double_sigterm"
+cut = "power_loss"
+second_signal_lo_ms = 100
+second_signal_hi_ms = 5000
+cut_lo_ms = 0
+cut_hi_ms = 12000
+stall_sink_probability = 0.5

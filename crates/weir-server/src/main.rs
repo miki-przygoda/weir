@@ -1,9 +1,19 @@
 mod config;
 mod drain;
+// The shutdown level, the signal task and the bounded drain wait (Foundations
+// §5.6, §7).
+mod lifecycle;
+mod logging;
 mod metrics;
 mod models;
+mod preflight;
 mod queue;
+mod reload;
 mod sink;
+mod status;
+// Test-only fault hooks for the system tests (spec §16); inert unless
+// WEIR_TEST_HOOKS=1 is also set.
+mod test_hooks;
 // The whole listener layer is Unix-only, and `tcp`/`tls` live inside it. So every
 // `feature = "tls"` site below is gated `all(unix, feature = "tls")`, not on the
 // feature alone: `--features tls` on Windows would otherwise name `crate::socket`,
@@ -12,6 +22,10 @@ mod sink;
 // is exactly why the mistake was invisible.
 #[cfg(unix)]
 mod socket;
+// The admin socket (Foundations spec §5.9, §11) is Unix-only, like the listener
+// layer it builds on.
+#[cfg(unix)]
+mod admin;
 // Also under `dst`: the simulation harness is compiled into a non-test build
 // by that feature, and it needs the same umask-immune scratch directories.
 #[cfg(any(test, feature = "dst"))]
@@ -50,385 +64,138 @@ use std::{
 
 use tracing::{info, warn};
 
-use config::{Config, SinkType};
-use drain::{DrainConfig, DrainHeartbeat, drain_appears_stalled};
+use config::Config;
+use drain::{DrainConfig, DrainHeartbeat};
 use models::WorkUnit;
-#[cfg(feature = "clickhouse-sink")]
-use sink::clickhouse::{ClickHouseSink, ClickHouseSinkConfig};
-#[cfg(feature = "http-sink")]
-use sink::http::{HttpBatchMode, HttpSink, HttpSinkConfig};
-#[cfg(feature = "mysql-sink")]
-use sink::mysql::{MySqlSink, MySqlSinkConfig};
-use sink::noop::NoopSink;
-#[cfg(feature = "postgres-sink")]
-use sink::postgres::{PostgresSink, PostgresSinkConfig};
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── wab_dir lock integrity ────────────────────────────────────────────────────
 
-/// Total live shard-segment bytes, or `None` if the WAB could not be scanned.
+/// How often the integrity thread re-checks `.weir.lock`. Bounds the residual
+/// window in which a second daemon, started after the file was deleted, can
+/// recover this daemon's live segments before this one stops acking. The
+/// thread runs from right after acquisition, so the bound holds through
+/// recovery and the startup replay too, not only once the runtime is up.
+const LOCK_INTEGRITY_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Applies one [`wab::lock::check_wab_dir_lock`] verdict. Returns the exit code
+/// the daemon must leave with NOW, if any; the caller exits, which keeps this
+/// testable.
 ///
-/// `None` is not "empty" — it is "we do not know", and the two must never
-/// collapse. This value feeds the atomic that the `wab_max_bytes` cap is checked
-/// against, so a scan error reported as `0` reads as an empty WAB and lifts the
-/// cap entirely until the next tick. `apply_wab_scan` already refuses to do that
-/// for a join failure (see its doc comment, which names this as "failing open on
-/// the one feature whose job is to fail closed"); returning `Option` here closes
-/// the same hole on the path that produces the number.
-///
-/// Any error makes the whole answer untrustworthy, including a per-shard one: an
-/// unreadable shard is an undercount, and an undercount lifts the cap by exactly
-/// the bytes we failed to see. The single exception is a file that vanished
-/// between `read_dir` and `metadata` — the drain confirms and deletes segments
-/// continuously, so that race is routine and the file genuinely occupies nothing.
-fn compute_wab_bytes_on_disk(wab_dir: &Path) -> Option<u64> {
-    let Ok(dir) = std::fs::read_dir(wab_dir) else {
-        return None;
-    };
-    let mut total = 0u64;
-    for entry in dir.flatten() {
-        let shard_path = entry.path();
-        if !shard_path.is_dir() {
-            continue;
-        }
-        // Skip the daemon's reserved subdirs — they aren't shards. dead_letter/
-        // (dl_*.wab.sealed) has its own weir_dead_letter_bytes_on_disk gauge, and
-        // quarantine/ holds forensic copies (both `.wab` and `.wab.sealed`,
-        // depending on whether crash recovery or the drain preserved them; see
-        // docs/wab_format.md); counting either here would double-count
-        // live-segment bytes (G15, mirrors recovery's skip).
-        let dir_name = shard_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
-        if dir_name == "dead_letter" || dir_name == "quarantine" {
-            continue;
-        }
-        let Ok(shard_dir) = std::fs::read_dir(&shard_path) else {
-            return None;
-        };
-        for file in shard_dir.flatten() {
-            let fpath = file.path();
-            let name = fpath.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name.ends_with(".wab") || name.ends_with(".wab.sealed") {
-                match std::fs::metadata(&fpath) {
-                    Ok(m) => total += m.len(),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(_) => return None,
-                }
-            }
-        }
-    }
-    Some(total)
-}
-
-/// Number of 5 s samples the growth warning considers (60 s).
-const WAB_GROWTH_WINDOW: usize = 12;
-
-/// How long the WAB growth warning stays quiet after firing. The polling task
-/// evaluates the warning every 5 s, so without this it would log 60 times a
-/// minute for as long as the condition held.
-const WAB_GROWTH_WARN_INTERVAL: Duration = Duration::from_secs(300);
-
-/// Consecutive 5 s polls — beyond the grace period in
-/// [`drain_heartbeat_looks_wedged`] — with no movement on
-/// [`drain::DrainHeartbeat`] before the drain is treated as possibly wedged.
-/// 3 polls = 15 s.
-const DRAIN_STALL_CONSECUTIVE_POLLS: u32 = 3;
-
-/// Whether an unchanged drain heartbeat has been frozen long enough to call
-/// it a likely wedge rather than ordinary idling.
-///
-/// A perfectly healthy but IDLE drain (nothing queued) only re-enters its own
-/// loop — and so only bumps [`drain::DrainHeartbeat`] — once per
-/// `health_poll_interval` (operator-tunable; 30 s by default): its idle wait
-/// is bounded by that interval, and nothing else wakes it. Applying the
-/// brief 3-poll/15 s rule from the moment the heartbeat froze would therefore
-/// fire on every idle window past 15 s at the default config — indistinguishable,
-/// to a poll-counter alone, from a genuine wedge (which just never recovers).
-/// So the clock only starts once `health_poll_interval` has already elapsed
-/// with no bump — the longest a healthy idle drain should ever go quiet — and
-/// [`DRAIN_STALL_CONSECUTIVE_POLLS`] more 5 s polls beyond THAT must also show
-/// no movement. A real wedge stays frozen forever and still trips this; a
-/// merely-idle drain resumes on its own cadence and never does.
-fn drain_heartbeat_looks_wedged(frozen_for: Duration, health_poll_interval: Duration) -> bool {
-    frozen_for >= health_poll_interval + Duration::from_secs(5) * DRAIN_STALL_CONSECUTIVE_POLLS
-}
-
-/// What a frozen drain heartbeat actually means. A freeze past the threshold is
-/// only half the diagnosis — the `drain_state` gauge supplies the other half.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DrainStallVerdict {
-    /// The drain thread is GONE: the supervisor exhausted its respawn budget
-    /// (or the daemon is shutting down) and published `drain_state{stopped}` on
-    /// its way out. The heartbeat is frozen because nobody is left to bump it.
-    /// Nothing is wedged; delivery has ended and only a restart resumes it.
-    Stopped,
-    /// The drain still claims a live state, yet cannot reach its own loop head
-    /// — the wedge this check was written for: a sink call blocking the drain's
-    /// OS thread instead of yielding, which no timeout inside the drain can fire
-    /// against.
-    Wedged,
-}
-
-/// Composes the freeze duration and the live `drain_state` gauge into the one
-/// diagnosis the operator is shown.
-///
-/// Split out — like [`drain_is_healthy`] and [`should_warn_wab_growth`] before
-/// it — because the composition, not the duration predicate alone, is where the
-/// bug was: the warning fired the "wedged inside a sink call" text on a drain
-/// whose own gauge said `stopped`, asserting in the same breath that "a wedge is
-/// not `stopped`". That is confidently wrong in a state the daemon reaches
-/// deterministically (the dead-letter-open panic exhausts the respawn ladder
-/// before the first `heartbeat.bump()` ever runs), and it points the operator at
-/// a live wedged sink instead of a dead drain.
-///
-/// Returns `None` while the freeze is still inside the grace period.
-fn drain_stall_verdict(
-    frozen_for: Duration,
-    health_poll_interval: Duration,
-    drain_stopped: bool,
-) -> Option<DrainStallVerdict> {
-    if !drain_heartbeat_looks_wedged(frozen_for, health_poll_interval) {
-        return None;
-    }
-    Some(if drain_stopped {
-        DrainStallVerdict::Stopped
-    } else {
-        DrainStallVerdict::Wedged
-    })
-}
-
-/// Whether the drain supervisor has published its terminal `stopped` state.
-///
-/// Reads the same one-hot `weir_drain_state` family `drain::set_drain_state`
-/// writes, exactly as [`drain_is_healthy`] reads `draining`.
-fn drain_is_stopped(metrics: &crate::metrics::Metrics) -> bool {
-    metrics
-        .drain_state
-        .get_or_create(&crate::metrics::DrainStateLabel {
-            state: crate::metrics::DrainStateValue::stopped,
-        })
-        .get()
-        > 0.0
-}
-
-/// Whether the growth warning is allowed to fire again at `now`.
-///
-/// Extracted from the polling task's closure for the same reason
-/// [`should_warn_wab_growth`] and [`drain_is_healthy`] were: it is the third
-/// piece of the warning's decision and the only one that was left inline, so it
-/// was the only one no test could reach. `saturating_duration_since` rather than
-/// `elapsed`/subtraction so a `now` behind `last_warned` reads as "not yet due"
-/// instead of panicking.
-fn growth_warning_is_due(last_warned: Option<std::time::Instant>, now: std::time::Instant) -> bool {
-    match last_warned {
-        // Never warned: the first qualifying window fires immediately.
-        None => true,
-        Some(t) => now.saturating_duration_since(t) >= WAB_GROWTH_WARN_INTERVAL,
-    }
-}
-
-/// Fold one WAB-size scan into the polling task's state, returning the size on
-/// success and `None` when the scan failed to join.
-///
-/// The `Err` arm lives in here rather than at the call site on purpose. The
-/// defect this replaced was `.await.unwrap_or(0)`, which is a call-site
-/// substitution — a test of a function that already takes `Option<u64>` would
-/// pass with that bug fully reintroduced. Taking the `JoinResult` itself is what
-/// makes the test load-bearing.
-///
-/// A join failure must not be papered over in either direction. Storing 0 reads
-/// as "the WAB is empty" and lifts the cap entirely until the next tick, failing
-/// open on the one feature whose job is to fail closed; pushing the previous
-/// value again reads as "not growing" and suppresses the growth warning for a
-/// whole window. So neither the gauge, the shared atomic, nor the window moves —
-/// the last known size stands, 5 s stale, which is exactly the staleness the cap
-/// is already documented to carry.
-fn apply_wab_scan(
-    scan: Result<Option<u64>, tokio::task::JoinError>,
-    samples: &mut Vec<u64>,
-    metrics: &crate::metrics::Metrics,
-    wab_bytes_now: &std::sync::atomic::AtomicU64,
-) -> Option<u64> {
-    let bytes = match scan {
-        Ok(Some(bytes)) => bytes,
-        Ok(None) => {
-            warn!(
-                "WAB byte scan could not read the WAB directory; keeping the last \
-                 known size. The wab_max_bytes cap and weir_wab_bytes_on_disk are \
-                 stale until the next tick."
+/// On `LostToOther` the order matters: the ingest flag first (every push from
+/// here on is Nacked before it reaches the queue), then the gauge and the log,
+/// then the exit. There is no seal (the segments now belong to the other
+/// daemon, and sealing would rename its files) and no grace period (a grace
+/// only lengthens the window of knowing false acks).
+fn apply_lock_integrity(
+    verdict: wab::lock::LockIntegrity,
+    wab_dir: &Path,
+    metrics: &metrics::Metrics,
+    ownership_lost: &std::sync::atomic::AtomicBool,
+) -> Option<i32> {
+    use wab::lock::LockIntegrity;
+    match verdict {
+        LockIntegrity::Ok => None,
+        LockIntegrity::Relocked => {
+            metrics.wab_dir_lock_integrity_failures.inc();
+            metrics.wab_dir_lock_held.set(1.0);
+            tracing::error!(
+                wab_dir = %wab_dir.display(),
+                "{} was deleted or replaced while this daemon was running; nobody else \
+                 held it, so it was re-created and re-locked. While it was missing a \
+                 second weir-server could have started on this wab_dir. Never delete \
+                 the lock file of a running daemon",
+                wab::lock::LOCK_FILE_NAME
             );
-            return None;
+            None
         }
-        Err(e) => {
-            warn!(
-                error = %e,
-                "WAB byte scan failed to join; keeping the last known size. The \
-                 wab_max_bytes cap and weir_wab_bytes_on_disk are stale until the \
-                 next tick."
+        LockIntegrity::LostToOther { holder } => {
+            ownership_lost.store(true, std::sync::atomic::Ordering::Relaxed);
+            metrics.wab_dir_lock_held.set(0.0);
+            let other = match &holder {
+                Some(h) => format!(
+                    "pid {} on host {}, version {}, socket {}",
+                    h.pid, h.host, h.version, h.socket_path
+                ),
+                None => "its holder record could not be read".to_string(),
+            };
+            tracing::error!(
+                wab_dir = %wab_dir.display(),
+                exit_code = wab::lock::EXIT_WAB_OWNERSHIP_LOST,
+                "CRITICAL: wab_dir ownership lost: another weir-server ({other}) holds or held \
+                 the lock on this wab_dir and may already have recovered this daemon's live \
+                 segments. Refusing every new push and exiting now, without sealing (the \
+                 segments are the other daemon's now). Records acked since the lock file \
+                 was deleted may not be delivered. Stop one of the two daemons"
             );
-            return None;
+            Some(wab::lock::EXIT_WAB_OWNERSHIP_LOST)
         }
-    };
-    metrics.wab_bytes_on_disk.set(bytes as f64);
-    wab_bytes_now.store(bytes, std::sync::atomic::Ordering::Relaxed);
-    samples.push(bytes);
-    if samples.len() > WAB_GROWTH_WINDOW {
-        samples.remove(0);
-    }
-    Some(bytes)
-}
-
-/// Whether to warn that the WAB is growing unbounded.
-///
-/// All three must hold:
-/// 1. no cap is set — with one set, the cap handles it and the warning is noise;
-/// 2. the window is full and shows net growth that never gave ground;
-/// 3. the sink is unhealthy or the drain is not draining.
-///
-/// Condition 3 is the one that matters. Sustained growth under a healthy drain
-/// is just a fast producer; warning on that teaches operators to ignore the
-/// message, which defeats the purpose.
-///
-/// Condition 2 is deliberately NOT "every step was non-decreasing". A *degraded*
-/// sink — one delivering some batches and failing others, which the spec names as
-/// a case this must catch — deletes a confirmed segment every so often, and each
-/// deletion drops the byte count for one sample. Under a strict per-step rule a
-/// single such dip anywhere in the 12-sample window resets the whole detector, so
-/// the warning would only ever fire for a *fully* dead sink. The rule here is
-/// weaker per-step but just as strong end-to-end: the window must end above where
-/// it started and must never have fallen below where it started. A WAB that is
-/// genuinely draining dips under its own starting point and still does not warn.
-fn should_warn_wab_growth(samples: &[u64], wab_max_bytes: u64, drain_healthy: bool) -> bool {
-    if wab_max_bytes != 0 || drain_healthy || samples.len() < WAB_GROWTH_WINDOW {
-        return false;
-    }
-    let window = &samples[samples.len() - WAB_GROWTH_WINDOW..];
-    let first = window[0];
-    let last = window[window.len() - 1];
-    last > first && window.iter().all(|&s| s >= first)
-}
-
-/// Reads the live `weir_sink_health` and `weir_drain_state` gauges and
-/// composes them into condition 3 of `should_warn_wab_growth`: is the drain
-/// healthy right now.
-///
-/// Returns `true` only when the sink is healthy AND the drain is actively
-/// draining. That `&&` is the whole point: condition 3 is "sink unhealthy OR
-/// not draining", and by De Morgan that is exactly NOT(healthy AND draining).
-/// The negation happens in the caller — `should_warn_wab_growth` takes this
-/// value as `drain_healthy` and returns `false` early when it is `true`. So a
-/// swapped `&&`/`||` here silently inverts which failures the warning covers.
-///
-/// Pulled out of the background task's closure (rather than left inline) so this
-/// composition — not just the pure predicate — is unit-tested; a swapped
-/// `&&`/`||` or a wrong label variant here would previously compile and pass
-/// every existing test.
-fn drain_is_healthy(metrics: &crate::metrics::Metrics) -> bool {
-    // `sink_health` and `drain_state` are Gauge families with the current
-    // state's series set to 1.0, so the live value reads back without any new
-    // plumbing.
-    let sink_healthy = metrics
-        .sink_health
-        .get_or_create(&crate::metrics::SinkHealthLabel {
-            state: crate::metrics::SinkHealthState::healthy,
-        })
-        .get()
-        > 0.0;
-    let draining = metrics
-        .drain_state
-        .get_or_create(&crate::metrics::DrainStateLabel {
-            state: crate::metrics::DrainStateValue::draining,
-        })
-        .get()
-        > 0.0;
-    sink_healthy && draining
-}
-
-// ── TLS SIGHUP reload task ────────────────────────────────────────────────────
-
-/// Spawn a background task that listens for SIGHUP and hot-reloads TLS certs.
-///
-/// The task is fail-safe: if `reload()` returns `Err`, the old `ServerConfig`
-/// is retained and an error is logged. Both outcomes increment the
-/// `tls_config_reloads` counter with the appropriate label so operators can
-/// alert on sustained reload failures.
-#[cfg(all(unix, feature = "tls"))]
-fn spawn_tls_reload_task(
-    tls: crate::socket::tls::ReloadableServerConfig,
-    metrics: std::sync::Arc<crate::metrics::Metrics>,
-) {
-    use crate::metrics::{TlsReloadLabel, TlsReloadOutcome};
-    use tokio::signal::unix::{SignalKind, signal};
-    tokio::spawn(async move {
-        let mut hup = match signal(SignalKind::hangup()) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!(error = %e, "failed to install SIGHUP handler; cert reload disabled");
-                return;
-            }
-        };
-        while hup.recv().await.is_some() {
-            match tls.reload() {
-                Ok(()) => {
-                    metrics
-                        .tls_config_reloads
-                        .get_or_create(&TlsReloadLabel {
-                            outcome: TlsReloadOutcome::ok,
-                        })
-                        .inc();
-                    tracing::info!("SIGHUP: TLS certificates reloaded");
-                }
-                Err(e) => {
-                    metrics
-                        .tls_config_reloads
-                        .get_or_create(&TlsReloadLabel {
-                            outcome: TlsReloadOutcome::failed,
-                        })
-                        .inc();
-                    tracing::error!(error = %e, "SIGHUP: TLS reload failed; keeping previous certs");
-                }
-            }
+        LockIntegrity::Error(errno) => {
+            metrics.wab_dir_lock_integrity_failures.inc();
+            tracing::error!(
+                wab_dir = %wab_dir.display(),
+                errno,
+                error = %std::io::Error::from_raw_os_error(errno),
+                "could not verify the wab_dir lock; retrying in {}s",
+                LOCK_INTEGRITY_INTERVAL.as_secs()
+            );
+            None
         }
-    });
+    }
 }
 
-/// Returns the configured sink URL, or a clear startup error if it's absent.
-/// Config validation already guarantees it's set for URL-requiring sinks, so
-/// this is belt-and-suspenders — but a `Result` beats a panic on the startup
-/// path, and one message replaces five near-identical `.expect` strings.
-#[cfg(any(
-    feature = "http-sink",
-    feature = "mysql-sink",
-    feature = "postgres-sink",
-    feature = "clickhouse-sink"
-))]
-fn require_sink_url(
-    config: &Config,
-    sink_label: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
-    config.sink_url.0.clone().ok_or_else(|| {
-        format!("sink_type = {sink_label} requires a sink URL (set --sink-url or WEIR_SINK_URL)")
-            .into()
-    })
-}
-
-/// Wraps a built sink and spawns the drain — the tail shared by every sink arm.
-/// `drain::spawn` is generic over the sink but returns the same
-/// `JoinHandle<()>`, so each arm produces a uniform handle for the join
-/// sequence later in `main`.
-fn build_and_spawn_drain<S: sink::Sink + 'static>(
-    sink: S,
-    drain_rx: crossbeam_channel::Receiver<std::path::PathBuf>,
-    drain_config: DrainConfig,
+/// Spawns the once-a-second `wab_dir` lock integrity check (spec §3.1) on its
+/// own thread, right after the lock is acquired and only when it is actually
+/// held. A plain thread, not a runtime task, so it already runs during
+/// preflight, before the runtime exists: a check that only started with the
+/// runtime once left the stated ~1 s window unbounded through the long
+/// startup phases (conf-durability-3), and recovery still runs on main's
+/// thread, outside any runtime task. Not part of the 5 s WAB poll either, which skips
+/// everything when its scan returns `None`. The first check runs at once.
+fn spawn_lock_integrity_thread(
+    wab_dir: std::path::PathBuf,
     metrics: Arc<metrics::Metrics>,
-    heartbeat: DrainHeartbeat,
-) -> std::thread::JoinHandle<()> {
-    drain::spawn(drain_rx, Arc::new(sink), drain_config, metrics, heartbeat)
+    ownership_lost: Arc<std::sync::atomic::AtomicBool>,
+) -> std::io::Result<()> {
+    std::thread::Builder::new()
+        .name("weir-lock-integrity".into())
+        .spawn(move || {
+            loop {
+                // A panicking check proves nothing: try again next tick, as the
+                // runtime task did with a failed spawn_blocking.
+                if let Ok(verdict) =
+                    std::panic::catch_unwind(|| wab::lock::check_wab_dir_lock(&wab_dir))
+                    && let Some(code) =
+                        apply_lock_integrity(verdict, &wab_dir, &metrics, &ownership_lost)
+                {
+                    std::process::exit(code);
+                }
+                std::thread::sleep(LOCK_INTEGRITY_INTERVAL);
+            }
+        })
+        .map(drop)
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
+/// The daemon. Startup is spec §6 (lock, preflight, runtime and signals,
+/// metrics, recovery, the replay handed to the drain, producer listeners);
+/// shutdown is the bounded §7 sequence:
+///
+/// - **T0** (the signal task, `Lifecycle::request_shutdown`): readiness off,
+///   phase `shutting_down`, drain absorb, the flushers' shutdown flag, and the
+///   lame duck (the producer socket unlinked, the TCP listener closed).
+/// - **T1** (here): await both listeners' bounded connection drains, abort the
+///   queue-depth task, wait up to `QUEUE_SENDERS_GRACE` for every work-queue
+///   sender to go, then join the workers and the flushers (each seals, fsyncs
+///   and hands off within its 1 s budget).
+/// - **T2**: `request_stop(drain_shutdown_budget_secs)`, publish the deadline,
+///   and wait for the drain at most `DRAIN_EXIT_GRACE` past it.
+/// - **T3**: one no-I/O summary line, `shutdown_timeout(1 s)`, exit 0. A drain
+///   that never returned takes the orphan exit, `process::exit(0)`.
+///
+/// A second SIGTERM/SIGINT forces: connection drains abort and the drain
+/// deadline becomes now, but the worker and flusher joins still run. Exit
+/// status is 0 for clean, forced and orphaned exits alike.
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Tighten process umask to 0o077 immediately. Defense-in-depth: every
     // file-creation path in weir specifies its mode bits explicitly today, so
@@ -442,21 +209,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // That nested tightening sees the value set here as its "previous", so
     // restoration is consistent.
     //
+    // SIGHUP is ignored from here until startup step 4 installs the reload
+    // handler (reload::spawn_sighup_task, right after the runtime is built and
+    // before recovery). With the default disposition a HUP (a `systemctl
+    // reload`, a log-rotation script, a terminal hang-up) killed the daemon
+    // outright, skipping the seal and the drain, and before this only a TLS
+    // build with tcp_bind ever installed a handler. Set before Config::load so
+    // a HUP during the config load, the lock or preflight is dropped: safe,
+    // because the real TLS load happens later and reads the current files
+    // (spec §3.2). From step 4 on, a HUP is served as a reload.
+    //
     // Safety: libc::umask is always safe; it swaps the process umask and
-    // returns the previous value. No invariants to uphold.
+    // returns the previous value. libc::signal with SIG_IGN installs no handler
+    // code, so there is nothing that must be async-signal-safe, and no other
+    // thread exists yet to race the disposition change.
     #[cfg(unix)]
     unsafe {
         libc::umask(0o077);
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
     }
 
-    let (config, config_warnings) = Config::load()?;
+    let (config, config_warnings, config_source) = Config::load()?;
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_new(&config.log_level)
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
+    // Colour only on a terminal, and a bad `log_level` is said out loud rather
+    // than silently falling back to `info` (spec §5.13, SP-D).
+    if let Some(w) = logging::init(&config.log_level) {
+        warn!("{w}");
+    }
 
     // Replay any advisory warnings collected during Config::load — it runs
     // before this subscriber exists, so emitting them there would silently drop
@@ -464,6 +243,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for w in &config_warnings {
         warn!("config: {w}");
     }
+    // Name the config source, so "which file did it read?" is answerable from
+    // the log alone. A missing file has its own WARN above (spec §3.4).
+    info!(
+        config_file = %config_source.path.display(),
+        origin = if config_source.explicit { "--config" } else { "default path" },
+        loaded = config_source.found,
+        "config source"
+    );
 
     // On macOS the durable-write path uses F_BARRIERFSYNC, which orders writes
     // and survives a process/OS crash but is NOT a guaranteed media flush on
@@ -476,13 +263,118 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
          data paths on Linux (fdatasync). See the durability section of the README."
     );
 
+    // One line with everything needed to reproduce the run (spec §5.13): the
+    // ConfigView carries no secret (the S3 secret is never entered, the sink URL
+    // is reduced to scheme://host[:port]).
+    let config_view = Arc::new(status::config_view::ConfigView::from(&config));
+    // `%` records the version with Display: a bare `&str` field is formatted
+    // with Debug by tracing-subscriber and would print `version="4.1.0"`.
     info!(
+        version = %env!("CARGO_PKG_VERSION"),
+        wire_version = weir_core::WIRE_VERSION,
         socket = %config.socket_path.display(),
         wab_dir = %config.wab_dir.display(),
         shards = config.shard_count,
         workers = config.worker_count,
+        config = ?config_view,
         "weir starting"
     );
+    // A test-hooks build says so loudly, armed or not: it must never be the
+    // binary a production host runs. A no-op without the feature.
+    test_hooks::warn_if_compiled_in();
+
+    // ── wab_dir ownership ─────────────────────────────────────────────────────
+    //
+    // Before ANYTHING reads the WAB (recovery in wab::recover, the replay, the
+    // drain) and before every other refuse-to-start check, so a duplicate on
+    // the same wab_dir reports "locked by" rather than some later symptom. A
+    // second daemon that got past this point would seal this one's ACTIVE
+    // segment, deliver and delete it, and turn this daemon's later Durable acks
+    // into false acks (spec §3.1). The lock is never released explicitly: the
+    // kernel drops it at process exit, after every join below, and also on an
+    // early `?` return while detached threads still run.
+    let lock_holder = wab::lock::HolderInfo::current(&config);
+    let lock_outcome =
+        wab::lock::acquire_wab_dir_lock(&config.wab_dir, config.wab_dir_lock, &lock_holder)
+            .inspect_err(|e| tracing::error!("{e}"))?;
+
+    // ── Metrics ───────────────────────────────────────────────────────────────
+    //
+    // Created here, ahead of preflight, only because the integrity check below
+    // needs them; nothing is served until the runtime binds the endpoint.
+
+    let (metrics_struct, registry) = metrics::Metrics::new();
+    metrics_struct.init_topology(config.shard_count, config.worker_count);
+    metrics_struct.publish_build_info(env!("CARGO_PKG_VERSION"), weir_core::WIRE_VERSION);
+    metrics_struct.publish_config(&config);
+    let metrics = Arc::new(metrics_struct);
+    let registry = Arc::new(registry);
+    metrics.wab_dir_lock_held.set(match lock_outcome {
+        wab::lock::LockOutcome::Held => 1.0,
+        wab::lock::LockOutcome::Unsupported { .. } => 0.0,
+    });
+
+    // ── wab_dir lock integrity ────────────────────────────────────────────────
+    //
+    // Set once another instance provably owns the wab_dir (spec §3.1, D4b).
+    // Created ONCE and cloned into every listener, like `wab_cap_rejecting`
+    // (created with the status board below); the integrity thread is the only
+    // writer. The thread starts now, so the check covers preflight and
+    // recovery as well as serving: a deletion during those phases is caught
+    // within a tick, and proven loss exits 3 before anything is served.
+    let wab_ownership_lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    if lock_outcome == wab::lock::LockOutcome::Held {
+        spawn_lock_integrity_thread(
+            config.wab_dir.clone(),
+            Arc::clone(&metrics),
+            Arc::clone(&wab_ownership_lost),
+        )?;
+    }
+
+    // ── Status board (spec §6 step 3) ─────────────────────────────────────────
+    //
+    // Created before the WAB so the flushers' supervisors and the workers'
+    // drop guards publish into the same registry the poll task and (from PR 5)
+    // the probes read. `wab_bytes_now` / `wab_cap_rejecting` move up from inside
+    // the runtime: the startup cap gate below writes them before any listener
+    // exists, and every listener clones these same Arcs.
+    #[cfg(all(unix, feature = "tls"))]
+    let tcp_configured = config.tcp_bind.is_some();
+    #[cfg(not(all(unix, feature = "tls")))]
+    let tcp_configured = false;
+    // Most recent WAB byte count, refreshed by the startup cap gate and then
+    // every 5 s by the poll task. Shared with the connection handlers so the
+    // ingest path can consult the WAB size without doing any I/O of its own.
+    let wab_bytes_now = Arc::new(AtomicU64::new(0));
+    // Whether the WAB cap is currently rejecting pushes. Created ONCE here and
+    // cloned into every listener so the hysteresis low-water mark is
+    // daemon-wide: a per-listener flag would let the Unix and TCP sides
+    // disagree about whether ingest has resumed.
+    let wab_cap_rejecting = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let board = status::StatusBoard::new(
+        status::board::StaticInfo::capture(&config, Arc::clone(&config_view)),
+        config.shard_count,
+        config.worker_count,
+        tcp_configured,
+        Arc::clone(&wab_cap_rejecting),
+        Arc::clone(&wab_bytes_now),
+    );
+    board.enter_phase(weir_status::Phase::Initializing, &metrics);
+
+    // ── Preflight ─────────────────────────────────────────────────────────────
+    //
+    // Every refuse-to-start check that can run before recovery: the socket
+    // path (format, then a connect-only liveness probe that never unlinks), a
+    // test-bind of the metrics address, and with tcp_bind the TLS material and
+    // a test-bind of the TCP address (spec §3.0). They used to fail only after
+    // recovery, replay and the drain had started, so a refused duplicate under
+    // Restart=on-failure re-delivered its oldest unconfirmed segment on every
+    // restart. The authoritative binds and the TLS load below stay where they
+    // are; preflight narrows their late failure to a race.
+    //
+    // Contract: no refuse-to-start check may run after the drain has begun
+    // delivering.
+    preflight::preflight(&config).inspect_err(|e| tracing::error!("{e}"))?;
 
     // ── Concurrency-vs-cores advisory ─────────────────────────────────────────
     // Each shard runs a flusher thread; each worker runs a worker thread.
@@ -500,41 +392,214 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // discover it by benchmarking.
     advise_agent_count(config.shard_count, config.worker_count);
 
-    // ── Metrics ───────────────────────────────────────────────────────────────
-
-    let (metrics_struct, registry) = metrics::Metrics::new();
-    let metrics = Arc::new(metrics_struct);
-    let registry = Arc::new(registry);
-
-    // ── Queue ─────────────────────────────────────────────────────────────────
+    // ── Step 3: in-memory setup (Foundations §6) ──────────────────────────────
+    //
+    // Metrics, the status board, the ownership flag and its integrity thread
+    // already exist (above preflight). This step adds the queue, the drain
+    // channel, the drain's control and the Lifecycle.
 
     // One queue partition per worker. Pushes are routed by shard_id so every
     // record for a given shard lands on a single worker's partition — see
     // worker::spawn_workers for the per-shard FIFO invariant.
     let (queue_tx, queue_rx) = queue::new::<WorkUnit>(config.worker_count);
+    // Held in an Option so every path names where main's sender is dropped
+    // (§5.7): `serve` takes it, or the pre-serving path drops it.
+    let mut queue_tx = Some(queue_tx);
 
-    // ── Drain channel ─────────────────────────────────────────────────────────
+    // ONE Receiver (the drain), Senders only in the flushers (§4). There is no
+    // startup replay sender any more: the replay list goes to the drain in
+    // memory (step 10).
+    let (drain_tx, drain_rx) =
+        crossbeam_channel::bounded::<std::path::PathBuf>(wab::DRAIN_CHANNEL_CAPACITY);
+    metrics
+        .drain_channel_capacity
+        .set(wab::DRAIN_CHANNEL_CAPACITY as f64);
 
-    let (drain_tx, drain_rx) = crossbeam_channel::bounded::<std::path::PathBuf>(256);
-    // Startup-only sender for replaying sealed-but-unconfirmed segments from a
-    // previous run. Replay runs AFTER the drain consumer is spawned (below) so
-    // the blocking bounded-channel sends drain live instead of dead-locking the
-    // startup thread on a recovery backlog larger than the channel capacity (B3).
-    // Dropped immediately after replay so it doesn't keep the channel open at
-    // shutdown.
-    let replay_tx = drain_tx.clone();
+    // ATTACHED (Foundations §5.4): the drain's lifetime is this control, not the
+    // channel. A closed channel (every flusher gone, e.g. shard_count=1 and the
+    // only flusher offline) no longer ends delivery; only request_stop /
+    // force_stop do. Every path past the drain spawn therefore reaches
+    // request_stop below, or exits the process.
+    let drain_ctl = drain::control::DrainControl::attached();
+    // The flushers' shutdown flag (spec §5.5); the Lifecycle sets it at T0.
+    let flushers_shutting_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let lifecycle = Arc::new(lifecycle::Lifecycle::new(
+        Arc::clone(&board),
+        Arc::clone(&metrics),
+        drain_ctl.clone(),
+        Arc::clone(&flushers_shutting_down),
+    ));
+    // The status-board block above already entered `initializing`.
+    let started = std::time::Instant::now();
 
-    // ── Coalesce hint: shared EWMA of fsync latency ───────────────────────────
+    // ── Step 4: runtime, signals, reload ──────────────────────────────────────
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    // Held for the rest of main: the sync binds (bind_hardened's
+    // UnixListener::from_std) and every spawn below need a reactor. Recovery,
+    // the scans and the joins run on this thread OUTSIDE any block_on, while
+    // the runtime's workers serve HTTP and the signal handlers.
+    let rt_guard = rt.enter();
+
+    // The one reload path (spec §3.2). The SIGHUP handler replaces the SIG_IGN
+    // set at the top of main; from here, which is now before recovery, a HUP
+    // is a counted reload request instead of a dropped signal. The TLS step
+    // below registers its config once it has loaded it.
+    let reloader = reload::Reloader::new(Arc::clone(&metrics), tcp_configured);
+    // Each report lands in the board's reload cell (admin `status`, /status).
+    reloader.attach_board(Arc::clone(&board));
+    let reload_tx = reload::spawn_reload_loop(Arc::clone(&reloader));
+    // The admin `reload` verb's handle on the SAME queue SIGHUP feeds (spec
+    // §5.10: one reload path, serialized).
+    #[cfg(unix)]
+    let admin_reload_tx = reload_tx.clone();
+    #[cfg(unix)]
+    reload::spawn_sighup_task(reload_tx, Arc::clone(&metrics));
+    #[cfg(not(unix))]
+    drop(reload_tx);
+    // SIGTERM/SIGINT are handled from here on (§6 step 4), every delivery, not
+    // only the first. A signal before this line takes the default disposition:
+    // nothing is in flight yet. The lock-integrity thread has run since right
+    // after the lock; nothing to start for it here.
+    lifecycle.spawn_signal_task()?;
+
+    // ── Step 5: metrics/health listener ───────────────────────────────────────
     //
-    // Flusher threads update this after each fsync; worker threads read it once
-    // per batch to size their coalesce window. Lock-free, Relaxed ordering —
-    // it is a heuristic, not a correctness signal.
+    // Before recovery, so `/metrics` (and the startup phase in it) answers
+    // during a long recovery. Default metrics_bind is 127.0.0.1 — see
+    // Config::metrics_bind for the security reasoning around exposing this
+    // surface on the network. Preflight test-bound it, so a failure here is a
+    // race (spec §3.0).
+    let metrics_listener = rt
+        .block_on(tokio::net::TcpListener::bind((
+            config.metrics_bind,
+            config.metrics_port,
+        )))
+        .map_err(|e| preflight::metrics_bind_error(&config, &e))?;
+    // The router (spec §5.8, §10): a 1 s head phase, then separate scrape
+    // and probe pools. /livez /readyz /startupz /status read the status
+    // board (loads only, spec §9.2); every other path is today's metrics.
+    let http_state = metrics::server::HttpState::new(
+        Arc::clone(&registry),
+        Some(Arc::clone(&metrics)),
+        Some(Arc::clone(&board) as Arc<dyn metrics::router::StatusSource>),
+        config.livez_checks.clone(),
+        config.metrics_max_connections,
+    );
+    metrics::server::spawn(metrics_listener, http_state);
+    info!(
+        bind = %config.metrics_bind,
+        port = config.metrics_port,
+        max_connections = config.metrics_max_connections,
+        livez_checks = ?config.livez_checks,
+        "metrics and health endpoint listening (/livez /readyz /startupz /status; any other path: metrics)"
+    );
+
+    // ── Step 6: TLS material, before a long recovery ──────────────────────────
     //
-    // Initial value 200 µs matches the old fixed COALESCE_WINDOW constant so
-    // behaviour before the first fsync is unchanged.
+    // Config validation guarantees the three tls_* paths are present whenever
+    // tcp_bind is set; preflight has already loaded this material once, so a
+    // failure here is a race (spec §3.0).
+    #[cfg(all(unix, feature = "tls"))]
+    let tls = match config.tcp_bind {
+        Some(_) => {
+            let (cert, key, ca) = preflight::tls_paths(&config)?;
+            let tls = socket::tls::ReloadableServerConfig::load(cert, key, ca)
+                .map_err(|e| preflight::tls_load_error(&e))?;
+            // Register for reload before `tls` moves into tcp::run. The clone
+            // shares the same inner ArcSwap, so a reload from the reload loop
+            // is immediately visible to the accept loop's `tls.current()`.
+            reloader.register_tls(tls.clone());
+            Some(tls)
+        }
+        None => None,
+    };
+
+    // ── Step 7: admin socket, before recovery ─────────────────────────────────
+    //
+    // admin path → refuse_if_live → bind_hardened_with → serve (spec §5.9,
+    // §11). An explicit admin_socket_path that cannot be bound is fatal here,
+    // before recovery; a derived default that cannot be bound disables admin
+    // (admin_unavailable) and the daemon runs on. `drain.pause` is accepted
+    // from here on. The same thresholds and liveness checks the HTTP router
+    // (step 5) uses, so admin `status`, /status and /readyz agree (G2).
+    #[cfg(unix)]
+    let admin_handle = admin::start(
+        &config,
+        admin::StartDeps {
+            board: Arc::clone(&board),
+            drain_ctl: drain_ctl.clone(),
+            reload_tx: admin_reload_tx,
+            level_rx: lifecycle.subscribe(),
+            thresholds: Arc::new(weir_status::Thresholds::DEFAULT),
+            livez_checks: Arc::from(config.livez_checks.clone()),
+            metrics: Arc::clone(&metrics),
+            started_at_ms: board.statik.started_at_ms,
+        },
+    )
+    .inspect_err(|e| tracing::error!("{e}"))?;
+
+    // ── Step 8: recovery, on this thread, while HTTP is served ────────────────
+    //
+    // Every shard dir made private, then each unsealed segment a crash left
+    // sealed. A signal here sets the level, but recovery is never interrupted:
+    // main finishes the step and skips the producer side below.
+    lifecycle.publish_phase(weir_status::Phase::Recovering);
+    if let Some(d) = test_hooks::startup_delay() {
+        warn!(
+            delay_ms = d.as_millis() as u64,
+            "test hook: delaying the recovering phase"
+        );
+        std::thread::sleep(d);
+    }
+    let recovery = wab::recover(&config.wab_dir, config.shard_count, &metrics)?;
+    info!(
+        shard_dirs = recovery.shard_dirs,
+        quarantined = recovery.segments_quarantined,
+        failed = recovery.segments_failed,
+        elapsed_ms = recovery.elapsed.as_millis() as u64,
+        "WAB recovery complete"
+    );
+
+    // ── Step 9: hand-off: the replay list in memory, then the first cap scan ──
+    lifecycle.publish_phase(weir_status::Phase::Handoff);
+    // Orphan deletion (spec §4.3, D7) is safe only while this daemon owns the
+    // wab_dir: with a second daemon on the same directory, a sealed segment
+    // beside a valid sidecar may be that daemon's confirm in progress. The
+    // ownership comes from the wab_dir lock: under `wab_dir_lock =
+    // "best-effort"` on a filesystem that cannot lock, nothing proves we are
+    // alone, so orphans are kept exactly as before.
+    let orphan_cleanup = lock_outcome == wab::lock::LockOutcome::Held;
+    // The sealed-but-unconfirmed backlog from a previous run. It becomes the
+    // drain's `backlog`, which alternates with live segments (spec §5.4);
+    // the two share no connection, so per-connection order is unchanged. No
+    // sends: a backlog larger than the drain channel can no longer block
+    // startup (B3), and the producer socket no longer waits on the sink.
+    let replay = wab::scan_replay(
+        &config.wab_dir,
+        config.shard_count,
+        &metrics,
+        orphan_cleanup,
+    )?;
+    let replay_len = replay.len();
+    // Spec §6 step 9: the first size scan and cap evaluation run here,
+    // synchronously, before any producer listener exists (fail-closed): a
+    // restart over the cap must not read wab_bytes_now = 0 and admit pushes.
+    status::poll::startup_cap_gate(&config.wab_dir, config.wab_max_bytes, &board, &metrics);
+
+    // ── Step 10: pipeline ─────────────────────────────────────────────────────
+
+    // Coalesce hint: the shared EWMA of fsync latency. Flusher threads update
+    // it after each fsync; worker threads read it once per batch to size
+    // their coalesce window. Lock-free, Relaxed ordering — it is a heuristic,
+    // not a correctness signal. Initial value 200 µs matches the old fixed
+    // COALESCE_WINDOW constant so behaviour before the first fsync is
+    // unchanged.
     let coalesce_hint = Arc::new(AtomicU64::new(200));
-
-    // ── WAB (one flusher thread per shard) ────────────────────────────────────
+    // The 5 s poll task reports the EWMA as evidence; the workers take the
+    // original.
+    let coalesce_hint_for_poll = Arc::clone(&coalesce_hint);
 
     let wab_config = wab::WabConfig {
         shard_count: config.shard_count,
@@ -556,21 +621,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         compression_level: config.wab_compression_level,
     };
-    let wab_handle = wab::spawn(
+    // One flusher thread per shard. MUST run after recovery: each flusher
+    // establishes its segment counter from what recovery left on disk. The
+    // flusher supervisors record each shard's state on the board's registry
+    // (spec §5.3).
+    let wab_handle = wab::spawn_flushers(
         config.wab_dir.clone(),
         wab_config,
         drain_tx,
         Arc::clone(&metrics),
         Arc::clone(&coalesce_hint),
+        Arc::clone(&board.shards),
+        wab::handoff::HandoffConfig {
+            shutting_down: Arc::clone(&flushers_shutting_down),
+            drain_depth: Arc::clone(&board.drain_depth),
+            marker: Some(Arc::clone(&board) as Arc<dyn wab::handoff::HandoffMarker>),
+        },
     )?;
 
-    // ── Workers (queue → per-shard Batch channels → flusher directly) ────────
-    //
     // Workers send `Batch`es directly to the WAB flusher via the shard channels
-    // returned by `wab::spawn`. No bridge thread: the hop is
-    // worker → Batch-channel → flusher.
-
-    let worker_handles = worker::spawn_workers(
+    // returned by `wab::spawn_flushers`: worker → Batch-channel → flusher.
+    let worker_handles = worker::spawn_workers_with(
         &queue_rx,
         wab_handle.shard_txs,
         config.shard_count,
@@ -578,9 +649,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.batch_size,
         Duration::from_millis(config.batch_deadline_ms),
         coalesce_hint,
+        Some(Arc::clone(&board.shards)),
     );
-
-    // ── Drain ─────────────────────────────────────────────────────────────────
 
     let drain_config = DrainConfig {
         wab_dir: config.wab_dir.clone(),
@@ -591,12 +661,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_respawns: drain::MAX_DRAIN_RESPAWNS,
         // Backstop >= 60s and >= 2x the sink's own timeout, so it only fires if a
         // sink hangs without honouring its internal timeout.
-        commit_timeout: Duration::from_secs(config.sink_timeout_secs.saturating_mul(2).max(60)),
+        commit_timeout: config.commit_timeout(),
         health_poll_interval: Duration::from_secs(config.health_poll_interval_secs),
         // A health probe is a liveness check, not a delivery, so cap it well below
         // commit_timeout: 5s, or the sink's own timeout if that's shorter.
         health_probe_timeout: Duration::from_secs(config.sink_timeout_secs.min(5)),
+        orphan_cleanup,
+        // The safety floor's escalation floor (3 strand cycles AND 10 minutes).
+        local_read_escalation_min_age: drain::LOCAL_READ_ESCALATION_MIN_AGE,
     };
+    // The stall verdict tells a slow sink call from a sink blocking the drain's
+    // thread by how far past this backstop the call has run (spec §4.8).
+    let commit_timeout_for_stall = drain_config.commit_timeout;
 
     // A counter the drain bumps once per loop iteration (see
     // `drain::DrainHeartbeat`), observed from the WAB-growth poll task below —
@@ -616,649 +692,375 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .set(1.0);
 
-    // Sink selection. drain::spawn is generic over the sink type but returns
-    // the same JoinHandle<()> regardless, so both arms produce a uniform
-    // drain_handle for the join sequence later in this function.
-    let drain_handle = match config.sink_type {
-        SinkType::Noop => {
-            warn!(
-                "sink: noop — records are acked and DISCARDED, not forwarded anywhere. \
-                 This is for soak-testing the pipeline; set --sink-type to deliver downstream."
-            );
-            build_and_spawn_drain(
-                NoopSink,
-                drain_rx,
-                drain_config,
-                Arc::clone(&metrics),
-                drain_heartbeat.clone(),
-            )
-        }
-        #[cfg(feature = "http-sink")]
-        SinkType::Http => {
-            let url = require_sink_url(&config, "http")?;
-            // Bearer token read from env at startup (never from config file).
-            // Logged only as a presence boolean — the token itself never reaches
-            // a log line.
-            let bearer_token = std::env::var("WEIR_SINK_BEARER_TOKEN")
-                .ok()
-                .filter(|t| !t.is_empty())
-                .map(Arc::from);
-            // One-shot startup hint: with no token set the sink POSTs
-            // unauthenticated, and the first symptom is otherwise a flood of 401
-            // dead-letters at drain time. Gated to the http arm, so it only fires
-            // when the http sink is actually selected.
-            if bearer_token.is_none() {
-                warn!(
-                    "sink: http — WEIR_SINK_BEARER_TOKEN is unset; requests will be sent \
-                     UNAUTHENTICATED (no Authorization header). If the endpoint requires auth, \
-                     set WEIR_SINK_BEARER_TOKEN or expect 401s to dead-letter at drain time."
-                );
-            }
-            // Validated to "none"|"ndjson" at config load; "ndjson" sends the
-            // whole batch as one newline-delimited POST, anything else (i.e.
-            // "none") keeps the per-record default.
-            let batch_mode = if config.sink_http_batch == "ndjson" {
-                HttpBatchMode::Ndjson
-            } else {
-                HttpBatchMode::PerRecord
-            };
-            // sink_http_concurrency only applies to per-record POSTs; in ndjson
-            // mode the whole batch is one POST, so report it as inert rather than
-            // logging a misleading "concurrency = 8".
-            let concurrency_display = match batch_mode {
-                HttpBatchMode::Ndjson => "n/a (ndjson)".to_string(),
-                HttpBatchMode::PerRecord => config.sink_http_concurrency.to_string(),
-            };
-            info!(
-                // The URL may carry userinfo (user:password@host); redact the
-                // password so it never reaches a log line (S25).
-                url = %crate::sink::redact_url_password(&url),
-                bearer = bearer_token.is_some(),
-                timeout_secs = config.sink_timeout_secs,
-                max_batch_size = config.sink_max_batch_size,
-                concurrency = %concurrency_display,
-                batch = %config.sink_http_batch,
-                "sink: http"
-            );
-            let http_cfg = HttpSinkConfig {
-                url,
-                timeout: Duration::from_secs(config.sink_timeout_secs),
-                max_batch_size: config.sink_max_batch_size,
-                batch_mode,
-                bearer_token,
-                send_idempotency_key: config.sink_send_idempotency_key,
-                concurrency: config.sink_http_concurrency,
-            };
-            let sink = HttpSink::new(http_cfg).map_err(|e| {
-                Box::<dyn std::error::Error>::from(format!("failed to build HTTP sink: {e}"))
-            })?;
-            build_and_spawn_drain(
-                sink,
-                drain_rx,
-                drain_config,
-                Arc::clone(&metrics),
-                drain_heartbeat.clone(),
-            )
-        }
-        #[cfg(feature = "mysql-sink")]
-        SinkType::Mysql => {
-            let url = require_sink_url(&config, "mysql")?;
-            let insert_mode = config.sink_mysql_insert_mode;
-            info!(
-                // URL omitted from the log line — it contains credentials.
-                // The MySqlSink Debug impl redacts the password, but logging
-                // even the user component here gives operators no information
-                // they can't get from `weir-server --help` plus their config.
-                table = %config.sink_mysql_table,
-                column = %config.sink_mysql_column,
-                // Logged because its absence is the interesting state: without
-                // it the operator's UNIQUE constraint is on payload bytes, and
-                // that discards distinct records that share bytes.
-                id_column = ?config.sink_mysql_id_column,
-                insert_mode = ?config.sink_mysql_insert_mode,
-                timeout_secs = config.sink_timeout_secs,
-                max_batch_size = config.sink_max_batch_size,
-                "sink: mysql"
-            );
-            let mysql_cfg = MySqlSinkConfig {
-                url,
-                table: config.sink_mysql_table.clone(),
-                column: config.sink_mysql_column.clone(),
-                id_column: config.sink_mysql_id_column.clone(),
-                insert_mode,
-                max_batch_size: config.sink_max_batch_size,
-                timeout: Duration::from_secs(config.sink_timeout_secs),
-            };
-            let sink = MySqlSink::new(mysql_cfg).map_err(|e| {
-                Box::<dyn std::error::Error>::from(format!("failed to build MySQL sink: {e}"))
-            })?;
-            build_and_spawn_drain(
-                sink,
-                drain_rx,
-                drain_config,
-                Arc::clone(&metrics),
-                drain_heartbeat.clone(),
-            )
-        }
-        #[cfg(feature = "postgres-sink")]
-        SinkType::Postgres => {
-            let url = require_sink_url(&config, "postgres")?;
-            info!(
-                // URL omitted from the log line for the same reason as MySQL.
-                table = %config.sink_postgres_table,
-                column = %config.sink_postgres_column,
-                // See the MySQL arm: absence is the interesting state.
-                id_column = ?config.sink_postgres_id_column,
-                insert_mode = ?config.sink_postgres_insert_mode,
-                timeout_secs = config.sink_timeout_secs,
-                max_batch_size = config.sink_max_batch_size,
-                "sink: postgres"
-            );
-            let pg_cfg = PostgresSinkConfig {
-                url,
-                table: config.sink_postgres_table.clone(),
-                column: config.sink_postgres_column.clone(),
-                id_column: config.sink_postgres_id_column.clone(),
-                insert_mode: config.sink_postgres_insert_mode,
-                max_batch_size: config.sink_max_batch_size,
-                timeout: Duration::from_secs(config.sink_timeout_secs),
-            };
-            let sink = PostgresSink::new(pg_cfg).map_err(|e| {
-                Box::<dyn std::error::Error>::from(format!("failed to build Postgres sink: {e}"))
-            })?;
-            build_and_spawn_drain(
-                sink,
-                drain_rx,
-                drain_config,
-                Arc::clone(&metrics),
-                drain_heartbeat.clone(),
-            )
-        }
-        #[cfg(feature = "clickhouse-sink")]
-        SinkType::ClickHouse => {
-            let url = require_sink_url(&config, "clickhouse")?;
-            info!(
-                // URL omitted from the log line — it may carry credentials.
-                database = %config.sink_clickhouse_database,
-                table = %config.sink_clickhouse_table,
-                column = %config.sink_clickhouse_column,
-                timeout_secs = config.sink_timeout_secs,
-                max_batch_size = config.sink_max_batch_size,
-                "sink: clickhouse"
-            );
-            let ch_cfg = ClickHouseSinkConfig {
-                url,
-                database: config.sink_clickhouse_database.clone(),
-                table: config.sink_clickhouse_table.clone(),
-                column: config.sink_clickhouse_column.clone(),
-                max_batch_size: config.sink_max_batch_size,
-                timeout: Duration::from_secs(config.sink_timeout_secs),
-            };
-            let sink = ClickHouseSink::new(ch_cfg).map_err(|e| {
-                Box::<dyn std::error::Error>::from(format!("failed to build ClickHouse sink: {e}"))
-            })?;
-            build_and_spawn_drain(
-                sink,
-                drain_rx,
-                drain_config,
-                Arc::clone(&metrics),
-                drain_heartbeat.clone(),
-            )
-        }
-        #[cfg(feature = "s3-sink")]
-        SinkType::S3 => {
-            if config.sink_s3_bucket.is_empty() {
-                return Err(Box::<dyn std::error::Error>::from(
-                    "sink_type = \"s3\" requires sink_s3_bucket",
-                ));
-            }
-            // One object per commit batch. At the default sink_max_batch_size of
-            // 100 that is roughly a 50 KB object for a 500-byte record --
-            // hundreds of thousands per hour for a busy producer, which is
-            // expensive to PUT and pathological for every query engine.
-            if config.sink_max_batch_size < 1000 {
-                warn!(
-                    sink_max_batch_size = config.sink_max_batch_size,
-                    "s3 sink: small batches produce many small objects; consider \
-                     sink_max_batch_size = 10000. NOTE: this value determines batch \
-                     boundaries, and batch boundaries determine object keys -- changing it \
-                     after records have been written makes replayed batches land under new \
-                     keys and duplicate. Choose it once."
-                );
-            }
-            info!(
-                bucket = %config.sink_s3_bucket,
-                region = %config.sink_s3_region,
-                // Endpoint omitted: it is operator-supplied and may carry a host
-                // an operator would rather not see echoed. Bucket + region are
-                // enough to identify the target.
-                path_style = config.sink_s3_force_path_style,
-                prefix = %config.sink_s3_prefix,
-                partition = %config.sink_s3_partition,
-                framing = %config.sink_s3_framing,
-                compression = %config.sink_s3_compression,
-                timeout_secs = config.sink_timeout_secs,
-                max_batch_size = config.sink_max_batch_size,
-                "sink: s3"
-            );
-            let opt = |v: &str| (!v.is_empty()).then(|| v.to_string());
-            let s3_cfg = weir_sink_s3::S3SinkConfig {
-                endpoint: opt(&config.sink_s3_endpoint),
-                bucket: config.sink_s3_bucket.clone(),
-                region: config.sink_s3_region.clone(),
-                force_path_style: config.sink_s3_force_path_style,
-                prefix: config.sink_s3_prefix.clone(),
-                partition: config.sink_s3_partition.clone(),
-                framing: weir_sink_s3::Framing::parse(&config.sink_s3_framing)
-                    .expect("sink_s3_framing validated at config parse"),
-                compression: weir_sink_s3::Compression::parse(&config.sink_s3_compression)
-                    .expect("sink_s3_compression validated at config parse"),
-                access_key_id: opt(&config.sink_s3_access_key_id),
-                secret_access_key: opt(&config.sink_s3_secret_access_key),
-                storage_class: opt(&config.sink_s3_storage_class),
-                sse: opt(&config.sink_s3_sse),
-                sse_kms_key_id: opt(&config.sink_s3_sse_kms_key_id),
-                max_batch_size: config.sink_max_batch_size,
-                timeout: Duration::from_secs(config.sink_timeout_secs),
-            };
-            let sink = weir_sink_s3::S3Sink::new(s3_cfg).map_err(|e| {
-                Box::<dyn std::error::Error>::from(format!("failed to build S3 sink: {e}"))
-            })?;
-            build_and_spawn_drain(
-                sink,
-                drain_rx,
-                drain_config,
-                Arc::clone(&metrics),
-                drain_heartbeat.clone(),
-            )
-        }
-    };
+    // Sink selection (spec §5.12). The drain owns the drain channel's only
+    // Receiver; the flushers hold the only Senders.
+    let drain_spawner = sink::select::build_drain_spawner(&config, &metrics)?;
+    let drain_handle = drain_spawner.spawn(sink::select::DrainSpawnArgs {
+        rx: drain_rx,
+        config: drain_config,
+        metrics: Arc::clone(&metrics),
+        heartbeat: drain_heartbeat.clone(),
+        runtime: drain::DrainRuntime {
+            control: drain_ctl.clone(),
+            board: Some(Arc::clone(&board)),
+            // The replay list, in memory: no blocking sends (§5.5).
+            initial_backlog: replay,
+        },
+    });
 
-    // ── Replay recovery backlog (drain consumer is now live) ──────────────────
-    //
-    // Replay sealed-but-unconfirmed segments from a previous run now that the
-    // drain thread is consuming. Done here rather than inside wab::spawn so the
-    // blocking sends into the bounded drain channel are drained live — a backlog
-    // larger than the channel capacity would otherwise dead-lock startup (B3).
-    // Runs before the socket binds, so the recovery backlog is queued ahead of
-    // any newly-accepted traffic.
-    wab::replay_unconfirmed(&config.wab_dir, config.shard_count, &replay_tx, &metrics)?;
-    drop(replay_tx); // release the startup sender so shutdown can close the drain channel
+    // Background: queue depth and the drain channel's high-water stamp every
+    // 500 ms (spec §5.11). It holds a queue sender, so shutdown aborts it
+    // before the worker joins.
+    let queue_depth_task = status::poll::spawn_queue_depth_task(
+        queue_tx
+            .as_ref()
+            .expect("queue_tx is still owned by main")
+            .clone(),
+        Arc::clone(&metrics),
+        Arc::clone(&board),
+    );
 
-    // ── Tokio runtime: socket accept loop + metrics server ────────────────────
-
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
-
-    rt.block_on(async {
-        // Bind metrics listener before starting the socket loop. Default
-        // metrics_bind is 127.0.0.1 — see Config::metrics_bind for the
-        // security reasoning around exposing this surface on the network.
-        let metrics_listener =
-            tokio::net::TcpListener::bind((config.metrics_bind, config.metrics_port))
-                .await
-                .map_err(|e| {
-                    std::io::Error::new(
-                        e.kind(),
-                        format!(
-                            "failed to bind metrics endpoint to {}:{} ({e}) — another process \
-                             (often another weir-server instance) is using that port. Change it \
-                             with --metrics-port / WEIR_METRICS_PORT (or --metrics-bind / \
-                             WEIR_METRICS_BIND).",
-                            config.metrics_bind, config.metrics_port
-                        ),
-                    )
-                })?;
-        metrics::server::spawn(
-            metrics_listener,
-            Arc::clone(&registry),
-            config.metrics_max_connections,
-        );
-
-        info!(
-            bind = %config.metrics_bind,
-            port = config.metrics_port,
-            max_connections = config.metrics_max_connections,
-            "metrics endpoint listening"
-        );
-
-        // Background: poll queue depth every 500 ms.
-        let queue_tx_bg = queue_tx.clone();
-        let metrics_q = Arc::clone(&metrics);
-        tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(tokio::time::Duration::from_millis(500));
-            loop {
-                interval.tick().await;
-                metrics_q.queue_depth.set(queue_tx_bg.len() as f64);
-            }
-        });
-
-        // Background: scan WAB shard dirs for on-disk byte usage every 5 s.
-        // The scan is synchronous I/O (read_dir + metadata per entry) so it
-        // runs inside spawn_blocking — putting it directly on a tokio worker
-        // would stall the runtime in proportion to the number of segments.
-        //
-        // Shared with the connection handlers so the ingest path can consult the
-        // WAB size without doing any I/O of its own — this task already walks
-        // the directory for the gauge, so the value is free.
-        let wab_bytes_now = Arc::new(std::sync::atomic::AtomicU64::new(0));
-
-        // Whether the WAB cap is currently rejecting pushes. Created ONCE here
-        // and cloned into every listener so the hysteresis low-water mark is
-        // daemon-wide: a per-listener flag would let the Unix and TCP sides
-        // disagree about whether ingest has resumed.
-        let wab_cap_rejecting = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-        let wab_dir_bg = config.wab_dir.clone();
-        let metrics_w = Arc::clone(&metrics);
-        let wab_bytes_bg = Arc::clone(&wab_bytes_now);
-        // Captured before the task is spawned so the growth-warning predicate
-        // sees the operator's configured cap without reaching back into `config`.
-        let cap_for_warning = config.wab_max_bytes;
-        // Same idea for the heartbeat-stall check below: the drain's own
-        // `health_poll_interval` sets the grace period in
-        // `drain_heartbeat_looks_wedged`. The grace period only has to cover an
-        // IDLE drain now — the two long deliberate waits inside the drain loop
-        // bump the heartbeat themselves (see `drain::DrainHeartbeat`), so a slow
-        // sink no longer has to be absorbed by this threshold.
-        let health_poll_interval_for_stall = Duration::from_secs(config.health_poll_interval_secs);
-        let drain_heartbeat_for_poll = drain_heartbeat;
-        tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(tokio::time::Duration::from_secs(5));
-            // Rolling window of on-disk-byte samples feeding should_warn_wab_growth,
-            // and the last time that warning actually fired (rate-limited below).
-            let mut samples: Vec<u64> = Vec::with_capacity(WAB_GROWTH_WINDOW + 1);
-            let mut last_warned: Option<std::time::Instant> = None;
-            // Heartbeat-stall tracking (see `drain::DrainHeartbeat` and
-            // `drain_heartbeat_looks_wedged`): the last observed value and when
-            // it last changed, plus the usual rate-limit for the warning itself
-            // once a stall is confirmed.
-            let mut last_heartbeat: Option<u64> = None;
-            let mut heartbeat_changed_at = std::time::Instant::now();
-            let mut last_stall_warned: Option<std::time::Instant> = None;
-            loop {
-                interval.tick().await;
-                let wab_dir = wab_dir_bg.clone();
-                let scan = tokio::task::spawn_blocking(move || {
-                    compute_wab_bytes_on_disk(&wab_dir)
+    // Background: scan WAB shard dirs for on-disk byte usage every 5 s. The
+    // scan is synchronous I/O (read_dir + metadata per entry) so it runs
+    // inside spawn_blocking — putting it directly on a tokio worker would
+    // stall the runtime in proportion to the number of segments. It also
+    // evaluates the conditions, latches them and publishes the status gauges
+    // (spec §5.11), on every tick. The drain's `health_poll_interval` sets
+    // the idle grace of the heartbeat-stall check: the long deliberate waits
+    // inside the drain loop bump the heartbeat themselves, and a single long
+    // sink call or local I/O operation is named by the busy signal.
+    let mut poll = status::poll::WabPoll::new(
+        Arc::clone(&metrics),
+        Arc::clone(&wab_bytes_now),
+        config.wab_max_bytes,
+        drain_heartbeat,
+        status::poll::DrainLiveness::new(
+            std::time::Instant::now(),
+            Duration::from_secs(config.health_poll_interval_secs),
+            commit_timeout_for_stall,
+        ),
+    )
+    .with_status(
+        status::poll::PollStatus::new(
+            Arc::clone(&board),
+            config.wab_dir.clone(),
+            coalesce_hint_for_poll,
+        )
+        .with_livez_checks(config.livez_checks.clone()),
+    );
+    let wab_dir_bg = config.wab_dir.clone();
+    rt.spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            let wab_dir = wab_dir_bg.clone();
+            poll.tick(std::time::Instant::now(), move || {
+                tokio::task::spawn_blocking(move || {
+                    status::poll::compute_wab_bytes_on_disk(&wab_dir)
                 })
-                .await;
-                // On a join failure the last known size stands and this tick
-                // contributes no sample — see `apply_wab_scan` for why neither
-                // 0 nor a repeated value is safe here.
-                let Some(bytes) =
-                    apply_wab_scan(scan, &mut samples, &metrics_w, &wab_bytes_bg)
-                else {
-                    continue;
-                };
-                let drain_healthy = drain_is_healthy(&metrics_w);
-                let due = growth_warning_is_due(last_warned, std::time::Instant::now());
-                if due && should_warn_wab_growth(&samples, cap_for_warning, drain_healthy) {
-                    warn!(
-                        wab_bytes = bytes,
-                        growth_bytes = bytes.saturating_sub(samples[0]),
-                        window_secs = WAB_GROWTH_WINDOW * 5,
-                        "WAB is growing while the sink is not healthy and no wab_max_bytes \
-                         is set — producers are still being acked into an unbounded buffer. \
-                         Set wab_max_bytes to bound it."
-                    );
-                    last_warned = Some(std::time::Instant::now());
-                }
+            })
+            .await;
+        }
+    });
 
-                // Drain-heartbeat stall check. Deliberately independent of
-                // `drain_healthy` above — a wedged drain (a sink call that
-                // blocks the drain's OS thread instead of yielding) is exactly
-                // the state where `drain_state`/`sink_health` stay frozen at
-                // their last (healthy-looking) reading, which is what silences
-                // the WAB-growth warning above. This check reads the heartbeat
-                // directly instead, so it isn't fooled by the same stale
-                // gauges. `drain_state` is still consulted for ONE thing — the
-                // `stopped` terminal state, the one value the supervisor writes
-                // that is never stale — because a dead drain freezes the
-                // heartbeat exactly like a wedged one and needs the opposite
-                // advice. See `drain_stall_verdict`.
-                let now = std::time::Instant::now();
-                let heartbeat_now = drain_heartbeat_for_poll.get();
-                match last_heartbeat {
-                    Some(prev) if drain_appears_stalled(prev, heartbeat_now) => {
-                        let frozen_for = now.duration_since(heartbeat_changed_at);
-                        // The freeze duration alone cannot tell a wedge from a
-                        // dead drain — `drain_state` supplies that half.
-                        let verdict = drain_stall_verdict(
-                            frozen_for,
-                            health_poll_interval_for_stall,
-                            drain_is_stopped(&metrics_w),
-                        );
-                        if let Some(verdict) = verdict
-                            && growth_warning_is_due(last_stall_warned, now)
-                        {
-                            let frozen_secs = frozen_for.as_secs();
-                            match verdict {
-                                DrainStallVerdict::Wedged => warn!(
-                                    frozen_secs,
-                                    "drain heartbeat has not advanced in over {frozen_secs}s — the \
-                                     drain thread may be wedged inside a sink call that blocks its \
-                                     OS thread (a synchronous DB driver, std::fs, or a spin loop) \
-                                     rather than yielding. That defeats both commit_timeout and \
-                                     health_probe_timeout, which can only fire when the awaited \
-                                     future actually yields on the drain's current-thread runtime. \
-                                     drain_state still reports a live state, so this is a wedge \
-                                     rather than a stopped drain; if delivery has genuinely \
-                                     stalled, an operator restart is the only recovery."
-                                ),
-                                DrainStallVerdict::Stopped => warn!(
-                                    frozen_secs,
-                                    "drain heartbeat has not advanced in over {frozen_secs}s and \
-                                     drain_state reports `stopped` — the drain thread is GONE, not \
-                                     wedged. Either the supervisor exhausted its respawn budget \
-                                     (look for the earlier \"drain thread panicked too many \
-                                     times\" ERROR) or the daemon is shutting down. Delivery has \
-                                     ended and the WAB will keep growing on disk; only a process \
-                                     restart resumes it. Do NOT go looking for a blocked sink \
-                                     call — there is no drain thread left to block."
-                                ),
-                            }
-                            last_stall_warned = Some(now);
-                        }
-                    }
-                    _ => heartbeat_changed_at = now,
-                }
-                last_heartbeat = Some(heartbeat_now);
-            }
-        });
+    // Routing sends connections only to settled, ingest-capable shards, so
+    // the listeners wait for the flushers' counter scans. Routing also needs
+    // the shard's worker running (PR 1's `ingest_capable`), so wait for every
+    // worker too: a connection accepted before a worker has entered its guard
+    // would otherwise be refused as no_live_shard.
+    // A shutdown already requested skips the wait: nothing will be bound.
+    if !lifecycle::wait_until(lifecycle::SETTLE_WAIT, Duration::from_millis(10), || {
+        lifecycle.level() != lifecycle::ShutdownLevel::Running
+            || (board.shards.all_settled()
+                && (0..board.shards.worker_count()).all(|w| board.shards.worker_running(w)))
+    }) {
+        warn!(
+            timeout_secs = lifecycle::SETTLE_WAIT.as_secs(),
+            "not every WAB shard and worker settled before the producer listeners were \
+             bound; unsettled shards receive no connections until they come up"
+        );
+    }
 
-        // Shutdown coordination: signal handler → shutdown_tx → socket::run exits.
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-
-        // ONE shared connection-cap semaphore for ALL listeners (Unix + TCP).
-        // Both listeners clone this Arc, so the COMBINED cap across all transports
-        // is exactly max_connections — not 2×max_connections as it would be with
-        // two independent semaphores.
-        let conn_sem = Arc::new(tokio::sync::Semaphore::new(config.max_connections));
-
-        // Optional TCP+mTLS listener (feature = "tls"). It runs its own accept
-        // loop concurrently with the Unix loop, feeding the SAME pipeline via a
-        // cloned queue_tx. Both listeners share `conn_sem` above so the combined
-        // connection cap is the single global max_connections value.
-        //
-        // `tcp_shutdown_tx` is fired by the same signal handler as the Unix
-        // loop's `shutdown_tx` so SIGTERM/Ctrl-C drains both listeners.
-        #[cfg(all(unix, feature = "tls"))]
-        let (tcp_shutdown_tx, tcp_join) = {
-            use socket::tcp::{self, TcpConfig};
-            use socket::tls::ReloadableServerConfig;
-
-            match config.tcp_bind {
-                Some(bind_addr) => {
-                    // Config validation guarantees the three tls_* paths are
-                    // present whenever tcp_bind is set, so these expects can't
-                    // fire on a validated Config.
-                    let cert = config
-                        .tls_cert_path
-                        .clone()
-                        .expect("config validation guarantees tls_cert_path when tcp_bind is set");
-                    let key = config
-                        .tls_key_path
-                        .clone()
-                        .expect("config validation guarantees tls_key_path when tcp_bind is set");
-                    let ca = config.tls_client_ca_path.clone().expect(
-                        "config validation guarantees tls_client_ca_path when tcp_bind is set",
-                    );
-
-                    let tls = ReloadableServerConfig::load(cert, key, ca).map_err(|e| {
-                        std::io::Error::other(format!("failed to load TLS config: {e}"))
-                    })?;
-
-                    // Bind in the caller so a bad bind address fails startup
-                    // (rather than the spawned accept task) — see socket::tcp
-                    // module docs on the bound-addr design.
-                    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
-                    let actual_addr = listener.local_addr()?;
-                    info!(addr = %actual_addr, "TCP+mTLS listener bound");
-
-                    let tcp_config = TcpConfig {
-                        max_connections: config.max_connections,
-                        max_payload_bytes: config.max_payload_bytes,
-                        max_batch_records: config.max_batch_records,
-                        shard_count: config.shard_count,
-                        shutdown_timeout_secs: config.shutdown_timeout_secs,
-                        connection_read_timeout_secs: config.connection_read_timeout_secs,
-                        handshake_timeout_secs: config.tls_handshake_timeout_secs,
-                        wab_max_bytes: config.wab_max_bytes,
-                        wab_bytes_now: Arc::clone(&wab_bytes_now),
-                        wab_cap_rejecting: Arc::clone(&wab_cap_rejecting),
-                    };
-
-                    let (tcp_shutdown_tx, tcp_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-                    let tcp_queue_tx = queue_tx.clone();
-                    let tcp_metrics = Arc::clone(&metrics);
-
-                    // Spawn SIGHUP reload task before moving `tls` into tcp::run.
-                    // The clone shares the same inner ArcSwap so a reload from the
-                    // SIGHUP task is immediately visible to the accept loop's
-                    // `tls.current()` call.
-                    spawn_tls_reload_task(tls.clone(), Arc::clone(&metrics));
-
-                    // Pass a clone of the shared semaphore so Unix + TCP draw
-                    // from the same permit pool — true global cap.
-                    let tcp_sem = Arc::clone(&conn_sem);
-                    let tcp_join = tokio::spawn(async move {
-                        // tcp::run owns the handler-shutdown watch internally and
-                        // signals handlers BEFORE draining — no extra plumbing needed here.
-                        let res = tcp::run(
-                            tcp_config,
-                            listener,
-                            tls,
-                            tcp_queue_tx,
-                            tcp_sem,
-                            tcp_shutdown_rx,
-                            tcp_metrics,
-                        )
-                        .await;
-                        if let Err(e) = res {
-                            tracing::error!(error = %e, "TCP+mTLS listener exited with error");
-                        }
-                    });
-
-                    (Some(tcp_shutdown_tx), Some(tcp_join))
-                }
-                None => (None, None),
-            }
+    // ── Steps 11-12: bind ALL producer listeners, then serve ─────────────────
+    //
+    // A signal during steps 4-10 set Graceful; main finished the step it was
+    // in and skips the producer side from here (spec §6 "A signal before
+    // serving"): nothing is bound, served or left on disk.
+    #[cfg(unix)]
+    let mut unix_join: Option<tokio::task::JoinHandle<std::io::Result<()>>> = None;
+    #[cfg(all(unix, feature = "tls"))]
+    let mut tcp_join: Option<tokio::task::JoinHandle<std::io::Result<()>>> = None;
+    #[cfg(unix)]
+    if lifecycle.level() == lifecycle::ShutdownLevel::Running {
+        lifecycle.publish_phase(weir_status::Phase::Binding);
+        // The producer socket's config (PR 1's `board` hook included), built
+        // once: `bind_all` reads it, then it moves into `serve`. Inline, so main
+        // keeps exactly two cloned ownership fields (this one and the TCP one).
+        let socket_config = socket::SocketConfig {
+            socket_path: config.socket_path.clone(),
+            max_connections: config.max_connections,
+            max_payload_bytes: config.max_payload_bytes,
+            max_batch_records: config.max_batch_records,
+            shutdown_timeout_secs: config.shutdown_timeout_secs,
+            connection_read_timeout_secs: config.connection_read_timeout_secs,
+            shard_count: config.shard_count,
+            peer_uid_check: config.peer_uid_check,
+            wab_max_bytes: config.wab_max_bytes,
+            wab_bytes_now: Arc::clone(&wab_bytes_now),
+            wab_cap_rejecting: Arc::clone(&wab_cap_rejecting),
+            wab_ownership_lost: Arc::clone(&wab_ownership_lost),
+            board: Some(Arc::clone(&board)),
         };
+        // Bind EVERY producer listener, TCP first, then Unix, before serving
+        // any (spec §5.7, §6 step 11): a bind failure fails startup before any
+        // producer is acked. `bind` / `bind_all` mark the listeners Bound or
+        // Failed (README Q6); main marks nothing here.
+        let listeners = rt.block_on(socket::bind_all(&socket_config, config.tcp_bind))?;
+        if lifecycle.level() == lifecycle::ShutdownLevel::Running {
+            // ONE shared connection-cap semaphore for ALL listeners (Unix +
+            // TCP), so the COMBINED cap is exactly max_connections.
+            let conn_sem = Arc::new(tokio::sync::Semaphore::new(config.max_connections));
+            // One router for both transports: one refusal counter and one WARN
+            // limiter. It sends each connection only to an ingest-capable
+            // shard (spec §5.7).
+            let router = socket::route::ShardRouter::live(
+                Arc::clone(&board) as Arc<dyn socket::route::LiveShards>
+            );
+            let socket::BoundListeners { unix, tcp } = listeners;
+            // Optional TCP+mTLS listener: its own accept loop feeding the SAME
+            // pipeline through a cloned queue sender, on the same shutdown
+            // level, so SIGTERM puts both listeners into lame duck. `tcp::run`
+            // owns its handlers' shutdown watch, and is the one writer of the
+            // TCP listener's Closed and Failed marks (README Q6).
+            #[cfg(feature = "tls")]
+            if let (Some(listener), Some(tls)) = (tcp, tls) {
+                let tcp_config = socket::tcp::TcpConfig {
+                    max_connections: config.max_connections,
+                    max_payload_bytes: config.max_payload_bytes,
+                    max_batch_records: config.max_batch_records,
+                    shard_count: config.shard_count,
+                    shutdown_timeout_secs: config.shutdown_timeout_secs,
+                    connection_read_timeout_secs: config.connection_read_timeout_secs,
+                    handshake_timeout_secs: config.tls_handshake_timeout_secs,
+                    wab_max_bytes: config.wab_max_bytes,
+                    wab_bytes_now: Arc::clone(&wab_bytes_now),
+                    wab_cap_rejecting: Arc::clone(&wab_cap_rejecting),
+                    wab_ownership_lost: Arc::clone(&wab_ownership_lost),
+                };
+                tcp_join = Some(
+                    rt.spawn(socket::tcp::run(
+                        tcp_config,
+                        listener,
+                        tls,
+                        queue_tx
+                            .as_ref()
+                            .expect("queue_tx is still owned by main")
+                            .clone(),
+                        Arc::clone(&conn_sem),
+                        lifecycle.subscribe(),
+                        Arc::clone(&metrics),
+                        router.clone(),
+                        Arc::clone(&board),
+                    )),
+                );
+            }
+            #[cfg(not(feature = "tls"))]
+            drop(tcp); // always None: config validation rejects tcp_bind without tls
+            unix_join = Some(rt.spawn(socket::serve(
+                socket_config,
+                unix,
+                queue_tx.take().expect("queue_tx is served exactly once"),
+                lifecycle.subscribe(),
+                Arc::clone(&metrics),
+                conn_sem,
+                router,
+            )));
+            // `serve` enters Serving at its start, the phase's only writer
+            // (README Q6). Log once it has; a signal that wins that race makes
+            // `enter` refuse, and the line is skipped.
+            if lifecycle::wait_until(Duration::from_secs(1), Duration::from_millis(1), || {
+                board.life.ever_served()
+            }) {
+                info!(
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    recovery_shard_dirs = recovery.shard_dirs,
+                    recovery_quarantined = recovery.segments_quarantined,
+                    replay_segments = replay_len,
+                    "weir serving"
+                );
+            }
+        } else {
+            // A signal landed between the binds and the spawns: unlink what was
+            // bound (inode-checked) and serve nothing.
+            discard_listeners(listeners, &board);
+        }
+    }
+    #[cfg(unix)]
+    if queue_tx.is_some() {
+        warn!("shutdown requested during startup; the producer listeners were not served");
+        drop(queue_tx.take());
+    }
+    #[cfg(not(unix))]
+    {
+        // weir-server has no producer listener off Unix; it only waits for
+        // shutdown.
+        let _ = (&recovery, replay_len, started);
+        lifecycle.publish_phase(weir_status::Phase::Serving);
+    }
 
-        tokio::spawn(async move {
-            #[cfg(unix)]
-            {
-                let mut sigterm = tokio::signal::unix::signal(
-                    tokio::signal::unix::SignalKind::terminate(),
-                )
-                .expect("failed to install SIGTERM handler");
-                tokio::select! {
-                    _ = sigterm.recv() => { info!("received SIGTERM, initiating shutdown"); }
-                    _ = tokio::signal::ctrl_c() => { info!("received Ctrl-C, initiating shutdown"); }
-                }
-            }
-            #[cfg(not(unix))]
-            {
-                tokio::signal::ctrl_c()
-                    .await
-                    .expect("failed to install Ctrl-C handler");
-                info!("received Ctrl-C, initiating shutdown");
-            }
-            #[cfg(all(unix, feature = "tls"))]
-            if let Some(tx) = tcp_shutdown_tx {
-                let _ = tx.send(());
-            }
-            let _ = shutdown_tx.send(());
-        });
+    // ── T0 ran in the signal task (Lifecycle::request_shutdown): readiness off,
+    //    phase shutting_down, drain absorb, flushers' flag, the lame duck. ──
+    let level = rt.block_on(lifecycle.wait_shutdown());
+    info!(?level, "shutdown: lame duck; draining producer connections");
 
-        // Socket accept loop — blocks until shutdown signal.
+    // ── T1: ingest closed. The runtime stays up: /metrics, the poll tasks and
+    //    (PR 6) admin `status` keep answering through the joins. Both accept
+    //    loops follow the level into lame duck and their bounded connection
+    //    drain; wait for both before the joins. ──
+    rt.block_on(async {
         #[cfg(unix)]
-        {
-            use socket::SocketConfig;
-            let socket_config = SocketConfig {
-                socket_path: config.socket_path.clone(),
-                max_connections: config.max_connections,
-                max_payload_bytes: config.max_payload_bytes,
-                max_batch_records: config.max_batch_records,
-                shutdown_timeout_secs: config.shutdown_timeout_secs,
-                connection_read_timeout_secs: config.connection_read_timeout_secs,
-                shard_count: config.shard_count,
-                peer_uid_check: config.peer_uid_check,
-                wab_max_bytes: config.wab_max_bytes,
-                wab_bytes_now: Arc::clone(&wab_bytes_now),
-                wab_cap_rejecting: Arc::clone(&wab_cap_rejecting),
-            };
-            socket::run(socket_config, queue_tx, shutdown_rx, Arc::clone(&metrics), conn_sem).await?;
+        if let Some(h) = unix_join {
+            log_listener_exit(h.await, "unix socket");
         }
-        #[cfg(not(unix))]
-        {
-            // On non-Unix builds weir-server is not supported; just wait for shutdown.
-            let _ = shutdown_rx.await;
-        }
-
-        // Await the TCP+mTLS listener's graceful drain before leaving the runtime.
-        // The signal handler already fired `tcp_shutdown_tx`, so `tcp::run` is
-        // draining its in-flight connections; without this await `drop(rt)` below
-        // would cancel that drain the moment the Unix loop returns (e.g. when there
-        // are no Unix connections), severing live TCP connections instead of
-        // letting them finish within `shutdown_timeout_secs` (S09).
         #[cfg(all(unix, feature = "tls"))]
         if let Some(h) = tcp_join {
-            let _ = h.await;
+            log_listener_exit(h.await, "TCP+mTLS");
         }
-
-        Ok::<(), std::io::Error>(())
-    })?;
-
-    // ── Graceful pipeline drain ───────────────────────────────────────────────
-    //
-    // queue_tx moved into socket::run and dropped when it returns.
-    // Workers observe Disconnected → flush remaining Batches → drop shard_txs
-    //   clones → flusher Disconnected.
-    // WAB flushers observe Disconnected → seal segments → exit → drop drain_tx.
-    // Drain thread observes drain_rx Disconnected → drains pending segments → exits.
-    //
-    // The queue-depth background task holds a `queue_tx.clone()`. Dropping the
-    // runtime aborts that task so the clone is released — otherwise workers
-    // never observe `Disconnected` and `worker_handles.join()` deadlocks.
-    drop(rt);
-
-    info!("socket layer shut down; waiting for pipeline to drain");
-
+    });
+    // Off Unix main still holds its sender here; every path ends with none.
+    drop(queue_tx.take());
+    // The queue-depth task holds the last queue_tx clone: it must go before
+    // the worker join (abort + await, which replaces the old `drop(rt)`).
+    queue_depth_task.abort();
+    let _ = rt.block_on(queue_depth_task);
+    // An aborted connection task can still own a sender inside its
+    // spawn_blocking push for up to QUEUE_PUSH_TIMEOUT (§5.7).
+    if !lifecycle::wait_until(
+        lifecycle::QUEUE_SENDERS_GRACE,
+        Duration::from_millis(10),
+        || queue_rx.live_senders() == 0,
+    ) {
+        tracing::error!(
+            live = queue_rx.live_senders(),
+            "a work-queue sender outlived ingest; the worker join waits for it"
+        );
+    }
+    debug_assert_eq!(queue_rx.live_senders(), 0, "a QueueSender outlived ingest");
+    info!(
+        "shutdown: ingest closed; joining workers and flushers (each flusher seals, \
+         fsyncs and hands off)"
+    );
     for h in worker_handles {
         h.join().ok();
     }
+    // Bounded in every drain state: PR 3's hand_off gives up after the
+    // per-flusher 1 s budget once `flushers_shutting_down` is set.
     for h in wab_handle.join_handles {
         h.join().ok();
     }
-    drain_handle.join().ok();
 
-    info!("weir shut down cleanly");
-    Ok(())
+    // ── T2: the drain's budget starts now that everything ingested is sealed. ──
+    let budget = Duration::from_secs(config.drain_shutdown_budget_secs);
+    drain_ctl.request_stop(budget); // fetch_min: a forced deadline stays forced
+    // The deadline actually in force (a forced one stays earlier), for
+    // /status, lifecycle.drain_deadline_ms and the gauge.
+    if let Some(deadline_ms) = drain_ctl.deadline_unix_ms() {
+        board
+            .life
+            .set_drain_deadline(deadline_ms, config.drain_shutdown_budget_secs);
+        metrics
+            .drain_shutdown_deadline_seconds
+            .set(deadline_ms as f64 / 1000.0);
+    }
+    info!(
+        budget_secs = config.drain_shutdown_budget_secs,
+        "shutdown: everything ingested is sealed; delivering until the budget ends"
+    );
+    let waited = lifecycle::wait_for_drain(
+        drain_handle,
+        &drain_ctl,
+        lifecycle::DRAIN_EXIT_GRACE,
+        lifecycle::DRAIN_JOIN_POLL,
+    );
+
+    // ── T3: exit. The summary does no I/O (no scan_unconfirmed_sealed). ──
+    // Both `reason` series (budget, disconnected; README Q7).
+    let not_handed_off = metrics.wab_segments_not_handed_off_total();
+    // The last successful size scan (PR 1's poll task writes both).
+    let on_disk = board.wab.last_scan_ok_ms().map(|as_of| lifecycle::OnDisk {
+        bytes: board
+            .wab_bytes_now
+            .load(std::sync::atomic::Ordering::Relaxed),
+        as_of_unix_ms: as_of,
+    });
+    match waited {
+        lifecycle::DrainWait::Joined(exit) => {
+            let facts = lifecycle::ShutdownFacts::from_exit(exit.as_ref(), not_handed_off, on_disk);
+            if facts.left_for_replay() == 0 {
+                info!("{}", lifecycle::shutdown_summary(&facts));
+            } else {
+                warn!("{}", lifecycle::shutdown_summary(&facts));
+            }
+            drop(rt_guard);
+            rt.shutdown_timeout(Duration::from_secs(1));
+            // spec §7 T3: unlink the admin socket (inode-checked: only the
+            // inode this daemon bound). The only close site: the pre-serving
+            // skip path falls through to this same T0-T3 sequence. The orphan
+            // arm below deliberately leaves it as a stale socket, which the
+            // next start's refuse_if_live / bind_hardened probes as Stale and
+            // replaces.
+            #[cfg(unix)]
+            if let Some(a) = admin_handle {
+                a.close();
+            }
+            // The wab_dir lock (wab::lock's process-lifetime static) is released
+            // by the kernel at exit, after everything above.
+            info!("weir shut down cleanly");
+            Ok(())
+        }
+        lifecycle::DrainWait::Orphaned => {
+            let in_flight = board
+                .drain
+                .in_flight
+                .load_full()
+                .map(|f| (f.segment.clone(), f.processed));
+            let facts = lifecycle::ShutdownFacts::orphaned(in_flight, not_handed_off, on_disk);
+            tracing::error!(
+                "drain did not stop within budget; exiting with its in-flight segment \
+                 unconfirmed. {}",
+                lifecycle::shutdown_summary(&facts)
+            );
+            // Without dropping the runtime or the lock: the kernel releases the
+            // flock only once the whole process, orphaned drain thread included,
+            // is gone. Exit status 0 (owner decision).
+            std::process::exit(0);
+        }
+    }
+}
+
+/// The pre-serving shutdown path (spec §6 "A signal before serving"): unlink
+/// the Unix socket we bound (inode-checked), close every listener, and serve
+/// nothing. The one place main marks listener state: `serve` / `tcp::run`,
+/// which own the `Closed` marks otherwise, never run on this path.
+#[cfg(unix)]
+fn discard_listeners(listeners: socket::BoundListeners, board: &status::StatusBoard) {
+    socket::remove_own_socket(&listeners.unix.path, &listeners.unix.socket);
+    drop(listeners.unix);
+    board.listeners.unix.set(weir_status::ListenerState::Closed);
+    if let Some(l) = listeners.tcp {
+        drop(l);
+        board.listeners.tcp.set(weir_status::ListenerState::Closed);
+    }
+}
+
+/// Logs a listener task's exit if it was not a clean `Ok`.
+#[cfg(unix)]
+fn log_listener_exit(r: Result<std::io::Result<()>, tokio::task::JoinError>, which: &str) {
+    match r {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::error!(error = %e, "{which} listener exited with an error"),
+        Err(e) => tracing::error!(error = %e, "{which} listener task failed"),
+    }
 }
 
 /// Logs a recommendation if `shard_count` / `worker_count` look unusual
@@ -1359,563 +1161,148 @@ mod tuning_tests {
 }
 
 #[cfg(test)]
-mod wab_bytes_tests {
-    use super::compute_wab_bytes_on_disk;
-
-    /// G15: the gauge counts only live shard-segment bytes — the dead_letter/ and
-    /// quarantine/ reserved subdirs (which carry .wab.sealed files too) must be
-    /// skipped, or their bytes would be double-counted against their own gauges.
-    #[test]
-    fn compute_wab_bytes_skips_dead_letter_and_quarantine() {
-        let root = crate::testutil::scratch_dir("g15");
-        let shard = root.join("shard_00");
-        let dl = root.join("dead_letter");
-        let q = root.join("quarantine");
-        for d in [&shard, &dl, &q] {
-            crate::testutil::mkdir_p(d);
-        }
-        // 100 live shard bytes; 999 in dead_letter; 999 in quarantine.
-        std::fs::write(shard.join("seg_00000001.wab.sealed"), vec![0u8; 100]).unwrap();
-        std::fs::write(dl.join("dl_00000001.wab.sealed"), vec![0u8; 999]).unwrap();
-        std::fs::write(q.join("shard_00__seg_00000001.wab.sealed"), vec![0u8; 999]).unwrap();
-
-        assert_eq!(
-            compute_wab_bytes_on_disk(&root),
-            Some(100),
-            "only live shard segments count; dead_letter + quarantine are skipped"
-        );
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    /// The cap's job is to fail CLOSED. A scan that cannot read the WAB
-    /// directory knows nothing about its size, and must not be able to report
-    /// the same answer as a directory it read successfully and found empty --
-    /// that answer is 0, which `apply_wab_scan` takes as a success and writes
-    /// into the atomic the cap is checked against, lifting the cap entirely.
-    ///
-    /// `apply_wab_scan` already refuses to do this for a JoinError, and says so
-    /// by name: "failing open on the one feature whose job is to fail closed".
-    /// The hole is upstream of that guard, in the value this function produces.
-    #[test]
-    fn an_unreadable_wab_dir_is_not_reported_as_empty() {
-        let empty = crate::testutil::scratch_dir("scanfail_ok");
-        crate::testutil::mkdir_p(&empty);
-        let unreadable = empty.join("no_such_wab_dir");
-        assert!(!unreadable.exists(), "the failure case must actually fail");
-
-        assert_eq!(
-            compute_wab_bytes_on_disk(&unreadable),
-            None,
-            "a WAB directory that could not be scanned reports no size at all"
-        );
-        assert_eq!(
-            compute_wab_bytes_on_disk(&empty),
-            Some(0),
-            "a directory that WAS scanned and found empty still reports a size"
-        );
-        std::fs::remove_dir_all(&empty).ok();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{WAB_GROWTH_WARN_INTERVAL, growth_warning_is_due, should_warn_wab_growth};
-    use std::time::{Duration, Instant};
-
-    /// Spec §7: "rate limiting holds across repeated polls." The warning's other
-    /// two inputs were extracted for unit testing; this one stayed inline in the
-    /// polling closure and so went untested until now.
-    #[test]
-    fn growth_warning_rate_limit_gates_on_the_full_interval() {
-        let base = Instant::now();
-        assert!(
-            growth_warning_is_due(None, base),
-            "the first qualifying window must warn immediately"
-        );
-        assert!(
-            !growth_warning_is_due(Some(base), base),
-            "a warning just emitted must not repeat on the same instant"
-        );
-        assert!(
-            !growth_warning_is_due(
-                Some(base),
-                base + WAB_GROWTH_WARN_INTERVAL - Duration::from_secs(1)
-            ),
-            "one second short of the interval is not due"
-        );
-        assert!(
-            growth_warning_is_due(Some(base), base + WAB_GROWTH_WARN_INTERVAL),
-            "exactly the interval is due"
-        );
-        assert!(growth_warning_is_due(
-            Some(base),
-            base + WAB_GROWTH_WARN_INTERVAL * 10
-        ));
-    }
-
-    /// The shape the rate limit actually has to survive: the task polls every
-    /// 5 s, and the warning conditions can stay satisfied for hours. Ten minutes
-    /// of ticks with the condition permanently true must produce three warnings
-    /// (t=0, t=300, t=600), not 121.
-    #[test]
-    fn growth_warning_rate_limit_holds_across_repeated_polls() {
-        let base = Instant::now();
-        let mut last_warned: Option<Instant> = None;
-        let mut fired = 0u32;
-        for tick in 0..=120u64 {
-            let now = base + Duration::from_secs(tick * 5);
-            if growth_warning_is_due(last_warned, now) {
-                fired += 1;
-                last_warned = Some(now);
-            }
-        }
-        assert_eq!(
-            fired, 3,
-            "600 s of 5 s polls with the condition always true must warn at \
-             t=0/300/600 only"
-        );
-    }
-
-    #[test]
-    fn growth_warning_fires_only_when_all_three_conditions_hold() {
-        // Growing + unhealthy + no cap => warn.
-        assert!(should_warn_wab_growth(
-            &[
-                100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200
-            ],
-            0,
-            false,
-        ));
-        // Growing + HEALTHY => no warning. This is the condition that keeps the
-        // message trustworthy: a fast producer must not trigger it.
-        assert!(!should_warn_wab_growth(
-            &[
-                100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200
-            ],
-            0,
-            true,
-        ));
-        // Growing + unhealthy but a cap IS set => no warning; the cap handles it.
-        assert!(!should_warn_wab_growth(
-            &[
-                100, 200, 300, 400, 500, 600, 700, 800, 900, 1000, 1100, 1200
-            ],
-            64 * 1024 * 1024,
-            false,
-        ));
-        // Flat or shrinking => no warning.
-        assert!(!should_warn_wab_growth(
-            &[500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500, 500],
-            0,
-            false,
-        ));
-        assert!(!should_warn_wab_growth(
-            &[
-                1200, 1100, 1000, 900, 800, 700, 600, 500, 400, 300, 200, 100
-            ],
-            0,
-            false,
-        ));
-        // Not enough samples yet => no warning.
-        assert!(!should_warn_wab_growth(&[100, 200, 300], 0, false));
-    }
-
-    /// The shape a *degraded* sink produces: net growth interrupted by dips
-    /// wherever a batch did get delivered and its segment was confirmed and
-    /// deleted. The spec names "slow or degraded sink" as a case this must
-    /// catch, and a strict per-step non-decrease rule never fires on it — one
-    /// dip anywhere in the window resets the detector.
-    #[test]
-    fn growth_warning_fires_on_a_dipping_but_net_growing_window() {
-        assert!(should_warn_wab_growth(
-            &[
-                100, 300, 250, 500, 420, 700, 650, 900, 850, 1100, 1000, 1300
-            ],
-            0,
-            false,
-        ));
-        // A dip exactly back to the starting value is still not giving ground.
-        assert!(should_warn_wab_growth(
-            &[100, 200, 100, 300, 200, 400, 300, 500, 400, 600, 500, 700],
-            0,
-            false,
-        ));
-    }
-
-    /// The counter-case that keeps the weaker rule honest: a WAB that is really
-    /// draining goes BELOW where the window started, and must not warn however
-    /// high it ends up. Without this, "net growth" alone would fire on a sawtooth
-    /// that is comfortably keeping up.
-    #[test]
-    fn growth_warning_stays_silent_when_the_window_dips_below_its_start() {
-        assert!(!should_warn_wab_growth(
-            &[
-                1000, 1200, 900, 1400, 800, 1600, 700, 1800, 600, 2000, 500, 2200
-            ],
-            0,
-            false,
-        ));
-        // A single sample one byte under the start is enough to disqualify it.
-        assert!(!should_warn_wab_growth(
-            &[100, 200, 300, 400, 500, 99, 700, 800, 900, 1000, 1100, 1200],
-            0,
-            false,
-        ));
-    }
-}
-
-#[cfg(test)]
-mod drain_is_healthy_tests {
-    use super::drain_is_healthy;
-    use crate::metrics::{
-        DrainStateLabel, DrainStateValue, Metrics, SinkHealthLabel, SinkHealthState,
-    };
-
-    /// Drives the `sink_health` gauge family exactly the way
-    /// `drain::set_sink_health` does in production: one-hot, active state at
-    /// 1.0, the rest 0.0.
-    fn set_sink_health(m: &Metrics, active: SinkHealthState) {
-        for s in [
-            SinkHealthState::healthy,
-            SinkHealthState::degraded,
-            SinkHealthState::down,
-        ] {
-            let v = if s == active { 1.0 } else { 0.0 };
-            m.sink_health
-                .get_or_create(&SinkHealthLabel { state: s })
-                .set(v);
-        }
-    }
-
-    /// Drives the `drain_state` gauge family exactly the way
-    /// `drain::set_drain_state` does in production: one-hot, active state at
-    /// 1.0, the rest 0.0.
-    fn set_drain_state(m: &Metrics, active: DrainStateValue) {
-        for s in [
-            DrainStateValue::draining,
-            DrainStateValue::retrying_transient,
-            DrainStateValue::blocked_dead_letter_full,
-            DrainStateValue::stopped,
-        ] {
-            let v = if s == active { 1.0 } else { 0.0 };
-            m.drain_state
-                .get_or_create(&DrainStateLabel { state: s })
-                .set(v);
-        }
-    }
-
-    #[test]
-    fn sink_healthy_and_draining_is_healthy() {
-        let m = Metrics::new().0;
-        set_sink_health(&m, SinkHealthState::healthy);
-        set_drain_state(&m, DrainStateValue::draining);
-        assert!(
-            drain_is_healthy(&m),
-            "healthy sink + actively draining must compose to healthy (no warning)"
-        );
-    }
-
-    #[test]
-    fn sink_healthy_but_not_draining_is_not_healthy() {
-        let m = Metrics::new().0;
-        set_sink_health(&m, SinkHealthState::healthy);
-        set_drain_state(&m, DrainStateValue::retrying_transient);
-        assert!(
-            !drain_is_healthy(&m),
-            "a healthy sink that isn't actively draining must not compose to healthy"
-        );
-    }
-
-    #[test]
-    fn sink_unhealthy_but_draining_is_not_healthy() {
-        let m = Metrics::new().0;
-        set_sink_health(&m, SinkHealthState::down);
-        set_drain_state(&m, DrainStateValue::draining);
-        assert!(
-            !drain_is_healthy(&m),
-            "an unhealthy sink must not compose to healthy even while draining"
-        );
-    }
-
-    #[test]
-    fn sink_unhealthy_and_not_draining_is_not_healthy() {
-        let m = Metrics::new().0;
-        set_sink_health(&m, SinkHealthState::down);
-        set_drain_state(&m, DrainStateValue::blocked_dead_letter_full);
-        assert!(!drain_is_healthy(&m));
-    }
-
-    /// The case that made the growth warning structurally unable to fire: the
-    /// drain thread is gone, so nothing updates these gauges any more. The
-    /// supervisor now publishes `stopped` on its way out, and a stopped drain
-    /// must not read as healthy however healthy the *sink* last looked — that
-    /// last reading is stale by definition once nobody is probing it.
-    #[test]
-    fn stopped_drain_is_not_healthy_even_with_a_healthy_sink() {
-        let m = Metrics::new().0;
-        set_sink_health(&m, SinkHealthState::healthy);
-        set_drain_state(&m, DrainStateValue::stopped);
-        assert!(
-            !drain_is_healthy(&m),
-            "a drain that has exited must never compose to healthy — this is what \
-             lets the WAB growth warning fire when delivery has stopped for good"
-        );
-    }
-}
-
-#[cfg(test)]
-mod apply_wab_scan_tests {
-    use super::{WAB_GROWTH_WINDOW, apply_wab_scan};
+mod lock_integrity_tests {
+    use super::apply_lock_integrity;
     use crate::metrics::Metrics;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use crate::wab::lock::{EXIT_WAB_OWNERSHIP_LOST, HolderInfo, LockIntegrity};
+    use std::path::Path;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
-    /// A real `JoinError`. Aborting a task is the only way to construct one —
-    /// the type has no public constructor — and it is also the realistic cause:
-    /// the blocking scan is cancelled at runtime shutdown.
-    async fn join_error() -> tokio::task::JoinError {
-        let h = tokio::spawn(async { std::future::pending::<()>().await });
-        h.abort();
-        h.await.expect_err("an aborted task must yield a JoinError")
+    fn fresh() -> (Metrics, AtomicBool) {
+        let (m, _reg) = Metrics::new();
+        m.wab_dir_lock_held.set(1.0);
+        (m, AtomicBool::new(false))
     }
 
-    #[tokio::test]
-    async fn failed_scan_leaves_the_cap_reading_the_last_known_size() {
-        let m = Metrics::new().0;
-        let mut samples = vec![4_096];
-        // What the cap actually reads. If a failed scan ever writes 0 here, the
-        // cap is lifted entirely until the next tick — the fail-open this test
-        // exists to prevent.
-        let live = AtomicU64::new(4_096);
-
-        let out = apply_wab_scan(Err(join_error().await), &mut samples, &m, &live);
-
-        assert_eq!(out, None, "a failed scan yields no size");
-        assert_eq!(
-            live.load(Ordering::Relaxed),
-            4_096,
-            "a failed scan must not move the value the WAB cap is checked against"
-        );
-        assert_eq!(
-            samples,
-            vec![4_096],
-            "a failed scan must not push a sample — a repeated value reads as \
-             'not growing' and would suppress the growth warning for a window"
-        );
-    }
-
-    /// The sibling of `failed_scan_leaves_the_cap_reading_the_last_known_size`,
-    /// for the other way a scan can fail to produce a number. `compute_wab_bytes_on_disk`
-    /// returns `None` when it could not read the WAB directory; treating that as a
-    /// size would write it into `wab_bytes_now` and lift the cap. Mutation-checked:
-    /// making the `Ok(None)` arm fall through to 0 fails this test on both asserts.
-    #[tokio::test]
-    async fn incomplete_scan_leaves_the_cap_reading_the_last_known_size() {
-        let m = Metrics::new().0;
-        let mut samples = vec![4_096];
-        let live = AtomicU64::new(4_096);
-
-        let out = apply_wab_scan(Ok(None), &mut samples, &m, &live);
-
-        assert_eq!(out, None, "an incomplete scan yields no size");
-        assert_eq!(
-            live.load(Ordering::Relaxed),
-            4_096,
-            "an unreadable WAB directory must not move the value the cap is \
-             checked against -- reporting 0 there lifts the cap entirely"
-        );
-        assert_eq!(
-            samples,
-            vec![4_096],
-            "an incomplete scan must not push a sample"
-        );
-    }
-
-    #[tokio::test]
-    async fn successful_scan_publishes_the_size_and_extends_the_window() {
-        let m = Metrics::new().0;
-        let mut samples = Vec::new();
-        let live = AtomicU64::new(0);
-
-        let out = apply_wab_scan(Ok(Some(8_192)), &mut samples, &m, &live);
-
-        assert_eq!(out, Some(8_192));
-        assert_eq!(live.load(Ordering::Relaxed), 8_192);
-        assert_eq!(samples, vec![8_192]);
-    }
-
-    #[tokio::test]
-    async fn the_window_is_bounded_and_drops_from_the_front() {
-        let m = Metrics::new().0;
-        let mut samples = Vec::new();
-        let live = AtomicU64::new(0);
-
-        // One more than the window holds, so the oldest must fall off.
-        for i in 0..=WAB_GROWTH_WINDOW as u64 {
-            apply_wab_scan(Ok(Some(i)), &mut samples, &m, &live);
-        }
-
-        assert_eq!(samples.len(), WAB_GROWTH_WINDOW);
-        assert_eq!(
-            samples[0], 1,
-            "the oldest sample is evicted, not the newest"
-        );
-        assert_eq!(samples[samples.len() - 1], WAB_GROWTH_WINDOW as u64);
-    }
-}
-
-#[cfg(test)]
-mod drain_heartbeat_stall_tests {
-    use super::{
-        DRAIN_STALL_CONSECUTIVE_POLLS, DrainStallVerdict, drain_heartbeat_looks_wedged,
-        drain_is_stopped, drain_stall_verdict,
-    };
-    use crate::metrics::{DrainStateLabel, DrainStateValue, Metrics};
-    use std::time::Duration;
-
-    fn set_drain_state(m: &Metrics, active: DrainStateValue) {
-        for s in [
-            DrainStateValue::draining,
-            DrainStateValue::retrying_transient,
-            DrainStateValue::blocked_dead_letter_full,
-            DrainStateValue::stopped,
-        ] {
-            let v = if s == active { 1.0 } else { 0.0 };
-            m.drain_state
-                .get_or_create(&DrainStateLabel { state: s })
-                .set(v);
-        }
-    }
-
-    /// F2(a): once the supervisor exhausts its respawn budget it publishes
-    /// `drain_state{stopped}` and the heartbeat freezes FOREVER — so the stall
-    /// check fires ~45-50 s later and, until this fix, asserted "drain_state is
-    /// left unchanged (a wedge is not `stopped`)". That is exactly backwards,
-    /// and it is the deterministic outcome of the dead-letter-open panic path:
-    /// the panic precedes the first `heartbeat.bump()`, so the heartbeat is 0
-    /// for the whole respawn ladder. The operator is then sent hunting a live
-    /// wedged sink while the drain is simply dead.
+    /// conf-tests-14: a refusal by the ownership flag and one by the process
+    /// exiting look alike from a client, so no system test can tell whether
+    /// the listeners read the flag the integrity thread sets. This pins the
+    /// wiring in `main` instead: the flag is created once, and the integrity
+    /// thread and both listener configs (Unix and TCP) each get a clone of
+    /// that one `Arc`, never a fresh `AtomicBool`. A source check, like
+    /// `lock_module_never_reopens_path`; the needles are built at run time so
+    /// this test's own text never matches them.
     #[test]
-    fn a_stopped_drain_is_diagnosed_as_stopped_not_wedged() {
-        let m = Metrics::new().0;
-        set_drain_state(&m, DrainStateValue::stopped);
-        let interval = Duration::from_secs(30);
-        let frozen_for = Duration::from_secs(50); // past the 45 s threshold
+    fn ownership_flag_is_one_arc_shared_by_the_integrity_thread_and_the_listeners() {
+        let src = include_str!("main.rs");
+        let name = "wab_ownership_lost";
+        let clone = format!("Arc::clone(&{name})");
+
+        let created = format!("let {name} = ");
+        assert_eq!(src.matches(&created).count(), 1, "the flag is created once");
+        let line = src[src.find(&created).unwrap()..].lines().next().unwrap();
         assert!(
-            drain_heartbeat_looks_wedged(frozen_for, interval),
-            "precondition: the freeze is long enough that something is reported"
+            line.contains("Arc::new(") && line.contains("AtomicBool::new(false)"),
+            "{line}"
+        );
+
+        let field = format!("{name}: ");
+        let cloned_field = format!("{name}: {clone},");
+        assert_eq!(
+            src.matches(&field).count(),
+            2,
+            "one ownership field per listener config (Unix and TCP)"
         );
         assert_eq!(
-            drain_stall_verdict(frozen_for, interval, drain_is_stopped(&m)),
-            Some(DrainStallVerdict::Stopped),
-            "a drain whose own gauge says `stopped` is dead, not wedged — reporting a              wedge here misdirects the operator during an incident"
+            src.matches(&cloned_field).count(),
+            2,
+            "every listener config gets a clone of the one flag"
+        );
+
+        let call = format!("{}(", "spawn_lock_integrity_thread");
+        let at = src
+            .match_indices(&call)
+            .map(|(i, _)| i)
+            .find(|&i| !src[..i].ends_with("fn "))
+            .expect("main spawns the integrity thread");
+        let args = &src[at..at + src[at..].find(")?").expect("call ends with ?")];
+        assert!(
+            args.contains(&clone),
+            "the integrity thread gets the same flag: {args}"
         );
     }
 
-    /// The other half: with the drain still claiming a live state, a frozen
-    /// heartbeat IS the wedge the warning was written for, and must still fire.
     #[test]
-    fn a_frozen_heartbeat_on_a_live_drain_state_is_still_a_wedge() {
-        let m = Metrics::new().0;
-        for live in [
-            DrainStateValue::draining,
-            DrainStateValue::retrying_transient,
-            DrainStateValue::blocked_dead_letter_full,
-        ] {
-            set_drain_state(&m, live.clone());
-            assert_eq!(
-                drain_stall_verdict(
-                    Duration::from_secs(50),
-                    Duration::from_secs(30),
-                    drain_is_stopped(&m)
-                ),
-                Some(DrainStallVerdict::Wedged),
-                "{live:?} is a live state; a frozen heartbeat under it is a real wedge"
-            );
-        }
+    fn exit_code_for_ownership_lost_is_3() {
+        // 1 stays "refused to start"; 3 is the new, distinct "ownership lost".
+        assert_eq!(EXIT_WAB_OWNERSHIP_LOST, 3);
     }
 
-    /// Below the threshold nothing is reported at all, stopped or not — the
-    /// grace period is not bypassed by the new branch.
     #[test]
-    fn nothing_is_reported_below_the_stall_threshold() {
-        let interval = Duration::from_secs(30);
-        for stopped in [true, false] {
-            assert_eq!(
-                drain_stall_verdict(Duration::from_secs(20), interval, stopped),
-                None
-            );
-        }
+    fn ok_changes_nothing() {
+        let (m, lost) = fresh();
+        assert_eq!(
+            apply_lock_integrity(LockIntegrity::Ok, Path::new("/w"), &m, &lost),
+            None
+        );
+        assert!(!lost.load(Ordering::Relaxed));
+        assert_eq!(m.wab_dir_lock_integrity_failures.get(), 0);
+        assert_eq!(m.wab_dir_lock_held.get(), 1.0);
     }
 
-    /// `drain_is_stopped` reads the same one-hot gauge family the drain
-    /// supervisor writes. A wrong label variant here would silently restore
-    /// the false diagnosis, so read it back explicitly.
+    /// D4a: deleted by hand, nobody else holds it. Loud, counted, no stop.
     #[test]
-    fn drain_is_stopped_reads_the_drain_state_gauge() {
-        let m = Metrics::new().0;
-        set_drain_state(&m, DrainStateValue::draining);
-        assert!(!drain_is_stopped(&m));
-        set_drain_state(&m, DrainStateValue::stopped);
-        assert!(drain_is_stopped(&m));
+    fn relocked_counts_keeps_the_gauge_and_keeps_running() {
+        let (m, lost) = fresh();
+        assert_eq!(
+            apply_lock_integrity(LockIntegrity::Relocked, Path::new("/w"), &m, &lost),
+            None
+        );
+        assert!(
+            !lost.load(Ordering::Relaxed),
+            "a re-lock must not stop ingest"
+        );
+        assert_eq!(m.wab_dir_lock_integrity_failures.get(), 1);
+        assert_eq!(m.wab_dir_lock_held.get(), 1.0);
     }
 
-    /// The false positive this function exists to prevent: at the default
-    /// `health_poll_interval` (30 s), a healthy but fully idle drain only
-    /// bumps its heartbeat once per interval (its idle wait is bounded by
-    /// that interval, and nothing else wakes it) — so a gap anywhere up to
-    /// that interval must never read as wedged, however suggestive the
-    /// brief's literal "3 polls / 15 s" figure looks in isolation.
     #[test]
-    fn a_healthy_idle_drain_at_the_default_poll_interval_never_reads_as_wedged() {
-        let health_poll_interval = Duration::from_secs(30);
-        // 15 s (the brief's literal figure) is well within one idle cycle.
-        assert!(!drain_heartbeat_looks_wedged(
-            Duration::from_secs(15),
-            health_poll_interval
-        ));
-        // So is a gap right up to (but not past) the interval itself.
-        assert!(!drain_heartbeat_looks_wedged(
-            health_poll_interval,
-            health_poll_interval
-        ));
+    fn error_counts_and_retries() {
+        let (m, lost) = fresh();
+        assert_eq!(
+            apply_lock_integrity(LockIntegrity::Error(libc::EIO), Path::new("/w"), &m, &lost),
+            None
+        );
+        assert!(!lost.load(Ordering::Relaxed), "an errno proves nothing");
+        assert_eq!(m.wab_dir_lock_integrity_failures.get(), 1);
+        assert_eq!(m.wab_dir_lock_held.get(), 1.0);
     }
 
-    /// Past one full idle cycle, the brief's 3-poll/15 s rule takes over:
-    /// three more silent 5 s polls beyond the grace period reads as wedged.
+    /// D4b: proof that a second writer owns the directory. Ingest is refused
+    /// first, the gauge drops to 0, and the caller is told to exit 3. It is not
+    /// counted as an integrity failure: it is an exit, not a retry.
     #[test]
-    fn a_stall_past_one_full_idle_cycle_plus_three_polls_reads_as_wedged() {
-        let health_poll_interval = Duration::from_secs(30);
-        let threshold =
-            health_poll_interval + Duration::from_secs(5) * DRAIN_STALL_CONSECUTIVE_POLLS;
-        assert!(!drain_heartbeat_looks_wedged(
-            threshold - Duration::from_secs(1),
-            health_poll_interval
-        ));
-        assert!(drain_heartbeat_looks_wedged(
-            threshold,
-            health_poll_interval
-        ));
-        // A real wedge never recovers, so this must keep reading true forever,
-        // not just at the moment it first crosses the threshold.
-        assert!(drain_heartbeat_looks_wedged(
-            threshold * 10,
-            health_poll_interval
-        ));
-    }
+    fn lost_to_other_stops_ingest_drops_the_gauge_and_exits_3() {
+        let (m, lost) = fresh();
+        let verdict = LockIntegrity::LostToOther {
+            holder: Some(HolderInfo {
+                pid: 4242,
+                host: "weir-b".into(),
+                ..HolderInfo::default()
+            }),
+        };
+        assert_eq!(
+            apply_lock_integrity(verdict, Path::new("/w"), &m, &lost),
+            Some(EXIT_WAB_OWNERSHIP_LOST)
+        );
+        assert!(
+            lost.load(Ordering::Relaxed),
+            "every later push must be Nacked"
+        );
+        assert_eq!(m.wab_dir_lock_held.get(), 0.0);
+        assert_eq!(m.wab_dir_lock_integrity_failures.get(), 0);
 
-    /// A short, test-style `health_poll_interval` still gets the full
-    /// three-poll grace ON TOP of it, not just the literal 15 s figure taken
-    /// in isolation.
-    #[test]
-    fn the_grace_period_scales_with_a_short_health_poll_interval() {
-        let health_poll_interval = Duration::from_secs(5);
-        assert!(!drain_heartbeat_looks_wedged(
-            Duration::from_secs(19),
-            health_poll_interval
-        ));
-        assert!(drain_heartbeat_looks_wedged(
-            Duration::from_secs(20),
-            health_poll_interval
-        ));
+        let (m, lost) = fresh();
+        assert_eq!(
+            apply_lock_integrity(
+                LockIntegrity::LostToOther { holder: None },
+                Path::new("/w"),
+                &m,
+                &lost
+            ),
+            Some(EXIT_WAB_OWNERSHIP_LOST),
+            "an unreadable record is still proof of loss"
+        );
+        assert!(lost.load(Ordering::Relaxed));
     }
 }

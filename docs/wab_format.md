@@ -16,6 +16,7 @@ mkdir -p /path/to/wab && chmod 700 /path/to/wab
 
 ```
 /path/to/wab/
+├── .weir.lock                      ← ownership lock + holder record (never deleted)
 ├── shard_00/
 │   ├── seg_00000003.wab            ← active (being written)
 │   ├── seg_00000002.wab.sealed     ← sealed, awaiting drain
@@ -29,20 +30,47 @@ mkdir -p /path/to/wab && chmod 700 /path/to/wab
     └── shard_01__seg_00000002.wab.sealed  ← corrupt SEALED segment (the drain, or a rejected .confirmed)
 ```
 
-Shard directories, the `dead_letter/` directory, and the `quarantine/` directory are created with mode `0o700`. Segment files (including `.confirmed` sidecars and dead-letter segments) are created with mode `0o600`. Permissions are set atomically at creation time via `OpenOptionsExt::mode` and `DirBuilderExt::mode` — there is no post-creation `chmod`.
+Shard directories, the `dead_letter/` directory, and the `quarantine/` directory are created with mode `0o700`. Segment files (including `.confirmed` sidecars, their transient `.confirmed.tmp`, and dead-letter segments) and the `.weir.lock` file are created with mode `0o600`. Permissions are set atomically at creation time via `OpenOptionsExt::mode` and `DirBuilderExt::mode` — there is no post-creation `chmod`.
 
 **The `.wab.sealed` and `.wab.confirmed` files do *not* normally coexist.** On a healthy daemon the drain, after committing a sealed segment to the sink, writes the `.wab.confirmed` sidecar and then **deletes** the `.wab.sealed` segment (see [Post-drain steady state](#post-drain-steady-state)). So a `.confirmed` sidecar usually has **no surviving segment file** beside it. The tree above shows the *transient* states a single segment passes through (`seg_00000001` confirmed, `seg_00000002` sealed-but-not-yet-drained, `seg_00000003` active) — not three files for one segment.
 
 ### Reserved subdirectories
 
-Two subdirectories of the WAB root are **not** shards and are skipped by recovery's shard scan:
+Two subdirectories of the WAB root are **not** shards and are skipped by recovery's shard scan (the root's `.weir.lock` is a regular file, so no directory walker treats it as a shard either; see [The `wab_dir` lock file](#the-wab_dir-lock-file)):
 
-- **`dead_letter/`** — records the sink **permanently** rejected. **"Permanent" means the sink returned a non-retryable rejection** (e.g. an HTTP sink replying 4xx other than 408/429) — *not* that the sink was unreachable. A **transient** failure (sink down/unreachable, 5xx, timeout, transport error) is **not** dead-lettered: the whole segment is retried and, once its retry budget is exhausted, left on disk as **stranded** (it stays in its shard dir as `seg_*.wab.sealed`, surfaces via `weir_drain_segments_stranded_total`, and auto-resumes when the sink recovers). So a recovery tool looking for un-delivered data after a sink *outage* should look at stranded sealed segments in the shard dirs, not `dead_letter/`. Files are named `dl_NNNNNNNN.wab.sealed` (zero-padded `u64` counter starting at 1), written by `DeadLetterWriter` (`crates/weir-server/src/drain/dead_letter.rs`). A crash mid-write can leave an orphan active partial `dl_NNNNNNNN.wab` (no `.sealed`), which recovery does not touch and the next `DeadLetterWriter::open` accounts for. Dead-letter files use the **same WEIR segment format** as the main WAB (header + records + sentinel + footer), so they are readable by the shared `weir-wab` `SegmentReader` with no separate parser — except their header carries the reserved shard id `0xFFFF` as a dead-letter marker. `weir-ctl dl requeue` reads them this way.
-- **`quarantine/`** — segments recovery could not safely recover (bad magic, unknown version, CRC mismatch), plus a `.confirmed` sidecar that fails its own verification during sealed-segment replay. The original file is **renamed** (mid-file-corrupt active segments are *copied*, so the valid prefix can still be truncated+sealed in place) here with a *flattened* name that prefixes the source shard directory and joins it with the original file name by a **double underscore**: `<shard_name>__<file_name>`, e.g. `shard_00__seg_00000004.wab.sealed` (see `quarantine()` / `copy_to_quarantine()` in `crates/weir-server/src/wab/recovery.rs`). The shard prefix prevents same-named segments from different shards clobbering each other once flattened into one directory; an exact-name collision appends `.1`, `.2`, … Quarantined files retain whatever extension they had: `.wab` when crash recovery preserved an **active** segment (the mid-file-corruption case — the one where acked records sit after the corruption), `.wab.sealed` when the drain (or a rejected `.confirmed` sidecar) preserved a **sealed** one, or `.wab.confirmed` for a sidecar that failed verification — the corresponding `.wab.sealed` copy sits beside it.
+- **`dead_letter/`** — records the sink **permanently** rejected. **"Permanent" means the sink returned a non-retryable rejection** (e.g. an HTTP sink replying 4xx other than 408/429) — *not* that the sink was unreachable. A **transient** failure (sink down/unreachable, 5xx, timeout, transport error) is **not** dead-lettered: the whole segment is retried and, once its retry budget is exhausted, left on disk as **stranded** (it stays in its shard dir as `seg_*.wab.sealed`, surfaces via `weir_drain_segments_stranded_total`, and auto-resumes once its per-segment cool-down has passed and the sink recovers, or the drain is idle, skipping the records already delivered in this run). So a recovery tool looking for un-delivered data after a sink *outage* should look at stranded sealed segments in the shard dirs, not `dead_letter/`. Files are named `dl_NNNNNNNN.wab.sealed` (zero-padded `u64` counter starting at 1), written by `DeadLetterWriter` (`crates/weir-server/src/drain/dead_letter.rs`). A crash mid-write can leave an orphan active partial `dl_NNNNNNNN.wab` (no `.sealed`), which recovery does not touch and the next `DeadLetterWriter::open` accounts for. Dead-letter files use the **same WEIR segment format** as the main WAB (header + records + sentinel + footer), so they are readable by the shared `weir-wab` `SegmentReader` with no separate parser — except their header carries the reserved shard id `0xFFFF` as a dead-letter marker. `weir-ctl dl requeue` reads them this way.
+- **`quarantine/`** — segments crash recovery could not safely recover (bad magic, unknown version, CRC mismatch); sealed segments the drain found corrupt (a corrupt header, on the first attempt; a CRC mismatch or truncated record mid-segment, or a footer that is cut short or disagrees with the record count, after delivering the readable prefix; a media-class read error such as `EIO` that persisted for three strand cycles and at least 10 minutes); plus a `.confirmed` sidecar that fails its own verification during sealed-segment replay. A transient read error (anything other than `InvalidData` / `UnexpectedEof`) is not corruption and is retried, not quarantined. The original file is **renamed** (mid-file-corrupt active segments are *copied*, so the valid prefix can still be truncated+sealed in place) here with a *flattened* name that prefixes the source shard directory and joins it with the original file name by a **double underscore**: `<shard_name>__<file_name>`, e.g. `shard_00__seg_00000004.wab.sealed` (see `quarantine()` / `copy_to_quarantine()` in `crates/weir-server/src/wab/recovery.rs`). The shard prefix prevents same-named segments from different shards clobbering each other once flattened into one directory; an exact-name collision appends `.1`, `.2`, … Quarantined files retain whatever extension they had: `.wab` when crash recovery preserved an **active** segment (the mid-file-corruption case — the one where acked records sit after the corruption), `.wab.sealed` when the drain (or a rejected `.confirmed` sidecar) preserved a **sealed** one, or `.wab.confirmed` for a sidecar that failed verification — the corresponding `.wab.sealed` copy sits beside it.
 
   **Reading a quarantined segment.** A quarantined segment preserves the corrupt record **and** the (valid) records *after* it — the whole file is moved (or copied) untouched, nothing is truncated. `weir-wab`'s `SegmentReader` stops at the **first** CRC error by contract: it yields every good record up to the corruption, then a single `Err` (for a CRC mismatch, `io::ErrorKind::InvalidData`), and every subsequent call returns `None` (see the iteration contract in `crates/weir-wab/src/lib.rs`) — so a plain `SegmentReader` recovers only the prefix before the bad record, by design (recovery and the drain depend on that stop-at-first-error contract).
 
   To reach the records *after* the corruption, use `weir_wab::RecoveryReader` instead — a separate, forensic iterator built for exactly this file. It continues past a corrupt record (resync is free: `SegmentReader::next` already reads the full payload before verifying the CRC, so a failure leaves the reader positioned at the next record's boundary with no seek needed) and never fabricates data: an implausible declared length, or a run of consecutive verification failures, ends iteration with `Desynced` rather than guessing. `weir-ctl quarantine list | inspect | requeue` is built on it and is the operator-facing way to do this — see [the quarantine recovery runbook](operations/quarantine-recovery.md) for the triage procedure, including how to read `RecoveryReader`'s "clean end" (every byte accounted for, *not* every record recovered) and why `requeue` re-sends the already-delivered prefix.
+
+  A sealed segment that the drain cannot read because its header names a **newer format** than this build reads (a version above 2, or a v2 flags bit it does not know) is **not** quarantined: it is *parked* — left in place in its shard directory, not retried for the rest of the run, counted in `weir_drain_segments_parked{reason="unsupported_version"}`, and replayed on the next start, where a newer binary delivers it. That keeps a downgrade from pushing every newer-format segment into manual recovery. Crash recovery of an **active** segment with such a header is unchanged: it is quarantined.
+
+### The `wab_dir` lock file
+
+`<wab_dir>/.weir.lock` makes the daemon the only writer of its `wab_dir`. Two daemons on one directory corrupt each other: the second one's crash recovery seals the first one's **active** segment, its drain delivers and deletes it, and the first daemon then acks `Durable` records into an unlinked inode. The lock is what stops that.
+
+- **Taken first.** At startup, after the config is loaded and before anything reads the WAB (crash recovery, the replay, the drain) or any other refuse-to-start check runs, the daemon opens the file (`O_NOFOLLOW`, created mode `0600`) and calls `flock(LOCK_EX | LOCK_NB)`. It holds the lock for the life of the process and never releases it explicitly; the kernel drops it at exit, after the flusher and drain threads have finished. Contention refuses startup with `wab_dir <wab_dir> is locked by another weir-server (…)`; what happens on a filesystem that cannot lock is the [`wab_dir_lock`](operations/configuration.md#wab_dir_lock) setting.
+- **A symlink, a directory or any other non-regular file** at the path refuses startup. So does a regular file with **more than one hard link** (taking the lock truncates and rewrites the file, which would overwrite every other name for it, so it is refused before the `flock` and nothing is written) and a file **owned by another uid** (that user could loosen its mode and hold the lock while the daemon is down). The owner refusal names the owner and the fix: run as that uid, or `chown <this daemon's uid> <wab_dir>/.weir.lock` as root while no daemon runs on the directory. A `sudo weir-server` run on a weir-owned `wab_dir` leaves such a file behind. A file of ours with a mode other than `0600` is set to `0600` once the lock is held, with a WARN (`wab_dir lock file was not mode 0600; set it to 0600`).
+- **The holder record is untrusted** when read back: only its first 4 KiB is parsed, control and bidi formatting characters are stripped from every value, and a value longer than 256 bytes is dropped rather than echoed into the refusal message or the exit-3 log line.
+- **Never unlinked.** weir does not delete the file at exit (unlink-on-exit opens a two-inode race between starters), so it outlives the daemon. A leftover file is harmless: the lock belongs to the open file, not to the file's existence, and the next daemon locks it and overwrites the record. **Do not delete it while a daemon runs**: the daemon checks once a second, by comparing the `(dev, ino)` at the path with its held descriptor and re-issuing the `flock` on that descriptor. If the file was deleted, it re-creates it with `O_EXCL` (never adopting a file planted in the meantime) and re-locks it; if it was replaced by a file nobody holds that carries no other daemon's record, it re-locks that one. Either way it logs an ERROR and increments `weir_wab_dir_lock_integrity_failures_total`. If another instance holds the file, or the replacement's record names another daemon (one held the directory and has exited since), the daemon NACKs every new push, logs `CRITICAL: wab_dir ownership lost` and exits with status 3 without sealing, leaving that record in place. The `flock` and the record read come before the hard-link and owner checks, which only decide whether this daemon may write its record into a replacement, so a second daemon running as another uid (or a hard link to its file) is still proof, not an error retried while acks continue. A path whose `lstat` id differs from the held descriptor's but which opens to the same file (overlayfs before Linux 4.19) counts as intact. A second daemon started in the gap (up to about a second) can still recover this daemon's live segments; detection cannot close that window.
+- **Opened once.** The daemon never re-opens the file in-process, except to re-create it after proving the path no longer names the held file. Where `flock` is emulated with POSIX locks (Linux on NFS), closing *any* descriptor to the file drops the lock. The daemon keeps its own holder record in memory for anything that wants to show it.
+- **Ignored by every walker.** It is a regular file at the root, not a directory, and has no segment suffix: crash recovery, the sealed-segment scan, `weir_wab_bytes_on_disk`, the segment-counter scan and `weir-ctl` all skip it. `weir-ctl` never calls `flock` on it, not even as a probe (a momentary probe could make a starting daemon fail with "locked by"), so the offline tools run beside a live daemon. A release from before the lock existed (4.0.1 and earlier) ignores the file entirely, so a downgrade works but runs unguarded.
+
+**Holder record.** Written only after `flock` succeeds (truncate, then write at offset 0, no fsync: it is informational), so a refused contender never touches the owner's record. Plain `key=value` lines, no serde:
+
+```
+pid=1234
+host=weir-0
+started_unix=1791100800
+boot_id=0f3c…           # Linux only (/proc/sys/kernel/random/boot_id); omitted elsewhere
+version=4.0.1
+socket_path=/run/weir/weir.sock
+metrics=127.0.0.1:9185
+```
+
+`host` is `gethostname(2)`, the pod name in Kubernetes; `metrics` is `<metrics_bind>:<metrics_port>`. A newline inside a value is replaced by a space, so a value cannot forge a key. Readers parse it best effort: unknown keys are ignored, and a file without a parseable `pid=` line reads as no record (the refusal then says `its holder record could not be read`). A pid means nothing across pid namespaces; `host`, `started_unix` and `boot_id` identify the holder. The record names the **recorded** owner, not a live one; whether that daemon is still running is a question for its socket or metrics endpoint.
 
 ---
 
@@ -106,6 +134,16 @@ stays stranded until a 2.x daemon reads it.
 Rejecting an unknown flag bit rather than ignoring it is the point: a future
 weir that adds bit 1 (say, encryption) must not have its segments silently read
 as plaintext by this build.
+
+What the daemon does with a rejected header depends on which rule rejected it.
+When the drain meets one on a **sealed** segment, it re-reads the header to tell
+the two cases apart. "Written by a newer weir" (the right magic with a version
+above 2, or a v2 header with an unknown flag bit) **parks** the segment as
+`unsupported_version`: bytes untouched, replayed on the next start. Everything
+else (bad magic, version 0, a v1 flags byte that is not zero, a file too short
+for a header) is corruption, and the segment is **quarantined on the first
+attempt**, not retried. Crash recovery still quarantines an **active** segment
+for any rejected header.
 
 ### Record size caps under compression
 
@@ -193,13 +231,19 @@ On a healthy daemon a sealed segment does **not** linger on disk. After the drai
 
 So in steady state a `.wab.confirmed` sidecar **frequently has no surviving `.wab.sealed` segment beside it** — the segment was deleted the moment delivery was confirmed. **A tool that derives a sealed path from a `.confirmed` sidecar and opens it will usually hit `ENOENT`.** Treat the `.confirmed` sidecar as a tombstone ("this segment was delivered and removed"), not as a pointer to a still-present segment.
 
-The delete is deliberately second: if the `.confirmed` write fails, the segment is **preserved** (no `.confirmed`, segment still on disk) so recovery re-drains it on the next restart — a duplicate absorbed by the at-least-once + dedup contract, never a deleted-but-unconfirmed segment. The only window where a `.sealed` and its `.confirmed` coexist is a crash *between* step 1 and step 2; recovery resolves it by skipping replay (the `.confirmed` is valid) and the orphaned `.sealed` is left for the operator.
+The sidecar write is atomic: the bytes go to a transient `seg_<N>.wab.confirmed.tmp` (mode 0600), which is fsynced, renamed to `seg_<N>.wab.confirmed`, and the shard directory is then fsynced. The final name therefore only ever holds complete, durable contents. A crash or a full disk mid-write leaves at worst a stale `.confirmed.tmp`, which no reader treats as a segment or a sidecar (`weir-ctl` included) and which the next sealed-segment scan deletes.
+
+The delete is deliberately second: if the `.confirmed` write fails, the segment is **preserved** (no `.confirmed`, segment still on disk), never a deleted-but-unconfirmed segment. While the daemon runs, it retries only the failed step (the sidecar, or the delete after a durable sidecar) on every health poll, and never re-delivers the segment; `weir_drain_confirm_failures_total{stage}` counts the failures and `weir_drain_segments_disposition_pending{kind="confirm"}` the segments waiting. A restart before the retry succeeds re-drains the segment once — a duplicate absorbed by the at-least-once + dedup contract.
+
+A `.sealed` and its valid `.confirmed` coexist only after a crash (or a failed delete) *between* step 1 and step 2: an **orphan**. It is never replayed. When the daemon holds the `wab_dir` lock, the startup scan and the drain's stranded-segment rescan delete it: the sidecar and the shard directory are fsynced first, so the tombstone is durable before the segment goes, and the `.confirmed` tombstone stays. Without the lock (`wab_dir_lock = "best-effort"` on a filesystem that cannot lock) orphans are kept, because another instance may still be confirming them; they are skipped and count toward `weir_wab_bytes_on_disk` until removed.
+
+A `.confirmed` that is present but fails to parse (wrong length, bad magic or CRC, unknown version) is still quarantined together with its segment. The atomic write means this version never produces a torn sidecar; one torn by the in-place write of 4.0.x and earlier is quarantined once on upgrade, as before.
 
 ---
 
 ## Crash recovery algorithm
 
-On startup, before accepting connections, the daemon runs recovery in the calling thread:
+On startup, before accepting connections, the daemon runs recovery in the calling thread. It runs only after the daemon has taken the [`wab_dir` lock](#the-wab_dir-lock-file) and passed its other refuse-to-start checks, so a second daemon never gets this far on a directory another one owns (unless `wab_dir_lock = "best-effort"` let it start without a lock on a filesystem that cannot take one).
 
 0. **Enumerate shards by directory scan, not by config.** Recovery `read_dir`s the WAB root, skips the reserved `dead_letter/` and `quarantine/` subdirectories, and treats every remaining directory as a shard (`recover_open_segments` in `crates/weir-server/src/wab/recovery.rs`; the sealed-segment replay scan in `crates/weir-server/src/wab/mod.rs` skips the same two subdirectories) — it does **not** reconstruct the shard set from the `shard_count` config, so segments from a previous run with a different `shard_count` are still recovered.
 1. **Scan** each shard directory for `.wab` (active) files.
@@ -211,7 +255,7 @@ On startup, before accepting connections, the daemon runs recovery in the callin
    e. Write sentinel + footer (record count, data bytes, running file CRC, timestamp).
    f. `sync_all()` (full fsync including metadata).
    g. Atomically rename `.wab` → `.wab.sealed`.
-3. **Replay sealed segments**: for each `.wab.sealed` without a valid `.wab.confirmed`, send the path to the drain channel.
+3. **Replay sealed segments**: for each `.wab.sealed` without a valid `.wab.confirmed`, send the path to the drain channel. The same scan deletes stale `*.wab.confirmed.tmp` files and, when the lock is held, orphaned sealed segments (see [Post-drain steady state](#post-drain-steady-state)). It is fail-fast: a shard directory it cannot list stops startup, because a silently skipped segment would be acked data silently dropped. (The drain's later rescans skip such a shard with a WARN and retry it on the next poll.)
 
 Key invariant: only records up to the first corrupt entry are replayed. A torn write at crash time never silently corrupts the replay stream — the trailing corrupt record is truncated, not forwarded.
 
@@ -229,9 +273,10 @@ A segment rotates (`should_rotate() == true`) when `bytes_written >=` the config
 seg_{counter:08}.wab          active
 seg_{counter:08}.wab.sealed   sealed, awaiting drain
 seg_{counter:08}.wab.confirmed  drain-confirmed
+seg_{counter:08}.wab.confirmed.tmp  transient: a sidecar being written (see Post-drain steady state)
 ```
 
-`counter` is a monotonically increasing `u64`, zero-padded to 8 digits, starting at 1. On startup, `ShardWriter::scan_and_advance_counter` advances `next_counter` past the highest existing counter to prevent collisions with existing sealed segments.
+`counter` is a monotonically increasing `u64`, zero-padded to 8 digits, starting at 1. On startup, `ShardWriter::scan_and_advance_counter` advances `next_counter` past the highest existing counter to prevent collisions with existing sealed segments. It parses the `seg_<digits>` prefix of every name, so a leftover `.confirmed.tmp` can only advance the counter, never rewind it.
 
 ---
 
@@ -243,6 +288,6 @@ The trust boundary is the WAB directory:
 
 - The directory must be on **local storage** accessible only to the daemon process.
 - Directory permissions are `0o700`; segment files are `0o600`.
-- If the WAB is on a **network filesystem or shared storage**, the security model does not hold — another process could overwrite or forge segments.
+- If the WAB is on a **network filesystem or shared storage**, the security model does not hold — another process could overwrite or forge segments. The [`wab_dir` lock](#the-wab_dir-lock-file) is not a supported guard there either: NFS can grant it with weaker semantics (with `nolock` the lock is local to one client, silently; with lockd or NFSv4 a lost lease can drop it between the once-a-second checks). See [Platform support](platform-support.md#untested-and-unsupported).
 
 This is an explicit assumption, not a weakness to be fixed. Operators who require tamper detection must add it at the storage layer (e.g. dm-verity, ZFS checksums with access control).

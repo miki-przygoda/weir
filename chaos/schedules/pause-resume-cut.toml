@@ -1,0 +1,40 @@
+# Foundations pre-release gate: drain.pause / drain.resume over the admin
+# socket under load, then a power cut, half while still paused (pause is
+# in-memory: the restart resumes delivery) and half 0-5 s after resume. Pause
+# stops at commit-batch granularity (spec §5.4, Held); delivery growth while
+# paused is an anomaly (delivered_while_paused). The admin socket lives at
+# run.ADMIN_SOCKET_PATH, off the device under test.
+
+seed = 0xF0D54
+episodes = 300
+max_duration_secs = 21600  # 6h ceiling
+steady_lo_secs = 4.0
+steady_hi_secs = 8.0
+quiescence_timeout_secs = 180.0
+
+[load]
+threads = 8
+record_size = 256
+tier = "D"
+min_acked_per_episode = 100
+min_delivered_per_episode = 100
+
+[weir]
+shard_count = 4
+batch_size = 64
+batch_deadline_ms = 2
+wab_segment_max_bytes = 8388608
+drain_shutdown_budget_secs = 10
+
+[storage]
+size_mb = 2048
+dm_target = "flakey"
+
+[faults]
+kind = "admin_pause_resume"
+cut = "power_loss"
+pause_hold_lo_ms = 2000
+pause_hold_hi_ms = 8000
+pause_cut_while_paused_probability = 0.5
+cut_lo_ms = 0
+cut_hi_ms = 5000

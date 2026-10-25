@@ -910,7 +910,7 @@ fn platform_fsync(file: &File) -> io::Result<()> {
 #[cfg(not(windows))]
 pub(crate) fn fsync_parent_dir(path: &Path) -> io::Result<()> {
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
-        File::open(dir)?.sync_all()?;
+        sync_path(dir)?;
     }
     Ok(())
 }
@@ -918,6 +918,96 @@ pub(crate) fn fsync_parent_dir(path: &Path) -> io::Result<()> {
 #[cfg(windows)]
 pub(crate) fn fsync_parent_dir(_path: &Path) -> io::Result<()> {
     Ok(())
+}
+
+/// Opens `path` (a file, or a directory on Unix) and fsyncs it with `sync_all`.
+///
+/// The one place the sidecar and directory syncs that guard a delete go
+/// through, so a test can fail them ([`sync_hook`]): the fault replaces the
+/// sync itself, so a caller that is ever changed to ignore the result is
+/// caught by the test, not hidden by it.
+pub(crate) fn sync_path(path: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if let Some(e) = sync_hook::on_sync(path) {
+        return Err(e);
+    }
+    File::open(path)?.sync_all()
+}
+
+/// Test-only fault injection and observation for [`sync_path`] (and so for
+/// [`fsync_parent_dir`]), keyed by the path being synced — the file, or the
+/// directory for a directory fsync — so concurrently running tests (each in
+/// its own scratch dir) never see each other's faults. Only registered paths
+/// are tracked.
+#[cfg(test)]
+pub(crate) mod sync_hook {
+    use std::{
+        collections::HashMap,
+        io,
+        path::{Path, PathBuf},
+        sync::Mutex,
+    };
+
+    struct Entry {
+        errno: i32,
+        fail_left: u32,
+        calls: u64,
+    }
+
+    static HOOKS: Mutex<Option<HashMap<PathBuf, Entry>>> = Mutex::new(None);
+
+    fn with<R>(f: impl FnOnce(&mut HashMap<PathBuf, Entry>) -> R) -> R {
+        let mut guard = HOOKS.lock().unwrap_or_else(|e| e.into_inner());
+        f(guard.get_or_insert_with(HashMap::new))
+    }
+
+    /// Fails the next `times` syncs of `path` with `errno` (`u32::MAX` = until
+    /// cleared), counting every sync.
+    pub(crate) fn fail(path: &Path, errno: i32, times: u32) {
+        with(|m| {
+            m.insert(
+                path.to_path_buf(),
+                Entry {
+                    errno,
+                    fail_left: times,
+                    calls: 0,
+                },
+            )
+        });
+    }
+
+    /// Stops failing `path`, keeping the count.
+    pub(crate) fn clear(path: &Path) {
+        with(|m| {
+            if let Some(e) = m.get_mut(path) {
+                e.fail_left = 0;
+            }
+        });
+    }
+
+    /// How many syncs of `path` were attempted since it was registered.
+    pub(crate) fn calls(path: &Path) -> u64 {
+        with(|m| m.get(path).map_or(0, |e| e.calls))
+    }
+
+    /// Stops tracking `path`.
+    pub(crate) fn forget(path: &Path) {
+        with(|m| m.remove(path));
+    }
+
+    pub(super) fn on_sync(path: &Path) -> Option<io::Error> {
+        with(|m| {
+            let e = m.get_mut(path)?;
+            e.calls += 1;
+            if e.fail_left == 0 {
+                return None;
+            }
+            if e.fail_left != u32::MAX {
+                e.fail_left -= 1;
+            }
+            Some(io::Error::from_raw_os_error(e.errno))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -929,6 +1019,25 @@ mod tests {
         let dir = crate::testutil::scratch_dir(&format!("seg_{label}"));
         crate::testutil::mkdir_p(&dir);
         dir
+    }
+
+    /// The counter scan must never read a counter out of `.weir.lock` (or any
+    /// non-segment name), wherever it sits: a phantom counter would make the
+    /// writer skip ahead, and a misparse could make it reuse one.
+    #[test]
+    fn segment_counters_ignores_the_wab_dir_lock_file() {
+        let dir = tmp_dir("counters_ignore_lock");
+        for e in fs::read_dir(&dir).unwrap().flatten() {
+            let _ = fs::remove_file(e.path());
+        }
+        fs::write(dir.join("seg_00000007.wab.sealed"), b"").unwrap();
+        fs::write(
+            dir.join(crate::wab::lock::LOCK_FILE_NAME),
+            b"pid=99999999\n",
+        )
+        .unwrap();
+        assert_eq!(FsSegmentStore.segment_counters(&dir).unwrap(), vec![7]);
+        fs::remove_dir_all(dir).ok();
     }
 
     /// WabSegment::create is the daemon's segment-creation trust boundary:
@@ -1483,6 +1592,28 @@ mod tests {
         );
         assert_eq!(segment_counter_from_path(Path::new("/s/README")), None);
         assert_eq!(segment_counter_from_path(Path::new("/s/seg_abc.wab")), None);
+    }
+
+    /// A stale `seg_X.wab.confirmed.tmp` (spec §4.3) parses to its segment's
+    /// counter, so it can only ADVANCE the next counter past a segment that
+    /// existed, never rewind it below one.
+    #[test]
+    fn a_confirmed_tmp_file_can_only_advance_the_counter() {
+        assert_eq!(
+            segment_counter_from_path(Path::new("/s/seg_00000009.wab.confirmed.tmp")),
+            Some(9)
+        );
+        let dir = tmp_dir("counters_tmp");
+        fs::write(dir.join("seg_00000003.wab.sealed"), b"x").unwrap();
+        fs::write(dir.join("seg_00000002.wab.confirmed.tmp"), b"x").unwrap();
+        let mut counters = FsSegmentStore.segment_counters(&dir).unwrap();
+        counters.sort_unstable();
+        assert_eq!(
+            counters,
+            vec![2, 3],
+            "the max, 3, is still the sealed segment's"
+        );
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]

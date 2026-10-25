@@ -20,7 +20,10 @@ use weir_core::{
 use weir_sink_sdk::RecordId;
 
 use crate::{
-    metrics::{Metrics, NackLabel, NackReason as MetricNack, TierLabel, TierValue},
+    metrics::{
+        Metrics, NackInternalCause, NackInternalLabel, NackLabel, NackReason as MetricNack,
+        TierLabel, TierValue,
+    },
     models::{AckOutcome, WorkUnit},
     queue::QueueSender,
 };
@@ -78,11 +81,11 @@ pub struct ConnectionConfig {
     /// override this to a short value so they don't need to mock the clock.
     pub ack_timeout: Duration,
     /// Target shard for every WorkUnit pushed on this connection. The accept
-    /// loop in `socket::run` assigns this round-robin (counter % shard_count)
-    /// at connection time so a multi-shard config (shard_count > 1) actually
-    /// fans out work across the per-shard WAB flusher threads. With
-    /// shard_count = 1 every connection gets shard_id = 0, which matches the
-    /// pre-multi-shard behaviour.
+    /// loops (`socket::serve`, `socket::tcp::run`) take it from their
+    /// `ShardRouter` at connection time: in production the (n mod k)-th
+    /// ingest-capable shard, so a multi-shard config (shard_count > 1) fans
+    /// out work across the per-shard WAB flusher threads that can take it.
+    /// With shard_count = 1 every connection gets shard_id = 0.
     pub shard_id: u32,
     /// Soft cap on live WAB bytes; `0` disables the check. See
     /// `Config::wab_max_bytes`.
@@ -95,6 +98,13 @@ pub struct ConnectionConfig {
     /// of them agree, and so the low-water mark is honoured globally rather
     /// than per-connection.
     pub wab_cap_rejecting: Arc<AtomicBool>,
+    /// Set by the `wab_dir` integrity thread in `main` once another instance
+    /// PROVABLY owns the `wab_dir` (spec §3.1, D4b), just before the process
+    /// exits with code 3. Every push after that is Nacked `InternalError`
+    /// before it reaches the queue: acking it would write into segments the
+    /// other daemon now recovers and deletes. One `Relaxed` load per push; it
+    /// never goes back to `false`.
+    pub wab_ownership_lost: Arc<AtomicBool>,
 }
 
 /// Handles one client connection: parses frames in a loop, queues work units,
@@ -352,8 +362,9 @@ where
                 // on exactly that.
                 //
                 // Both durability tiers are rejected: Buffered still writes
-                // to the WAB, it just acks earlier.
-                if over_wab_cap(&config) {
+                // to the WAB, it just acks earlier. The ownership check sits at
+                // the same point for the same reasons.
+                if let Some(refusal) = admission_refusal(&config) {
                     send_nack(
                         stream.get_mut(),
                         WireNack::InternalError,
@@ -361,7 +372,9 @@ where
                         config.read_timeout,
                     )
                     .await?;
-                    metrics.wab_cap_rejections.inc();
+                    if refusal == AdmissionRefusal::WabCap {
+                        metrics.wab_cap_rejections.inc();
+                    }
                     metrics
                         .records_nack
                         .get_or_create(&NackLabel {
@@ -369,6 +382,7 @@ where
                             reason: MetricNack::internal_error,
                         })
                         .inc();
+                    count_internal_nack(&metrics, refusal.cause(), 1);
                     // Keep the connection: unlike the decode-level rejections
                     // above, this is a transient condition the producer is
                     // expected to retry through once the drain catches up.
@@ -401,7 +415,7 @@ where
                 // anything counts as accepted. One check admits the whole
                 // batch, which is a widening of the cap's sampling window
                 // worth knowing about — see `max_batch_records`.
-                if over_wab_cap(&config) {
+                if let Some(refusal) = admission_refusal(&config) {
                     send_nack(
                         stream.get_mut(),
                         WireNack::InternalError,
@@ -409,7 +423,9 @@ where
                         config.read_timeout,
                     )
                     .await?;
-                    metrics.wab_cap_rejections.inc();
+                    if refusal == AdmissionRefusal::WabCap {
+                        metrics.wab_cap_rejections.inc();
+                    }
                     metrics
                         .records_nack
                         .get_or_create(&NackLabel {
@@ -417,6 +433,7 @@ where
                             reason: MetricNack::internal_error,
                         })
                         .inc();
+                    count_internal_nack(&metrics, refusal.cause(), 1);
                     continue;
                 }
 
@@ -612,6 +629,7 @@ where
                 reason: MetricNack::internal_error,
             })
             .inc();
+        count_internal_nack(metrics, NackInternalCause::queue_full, 1);
         return Ok(());
     }
 
@@ -653,13 +671,13 @@ where
                             reason: MetricNack::internal_error,
                         })
                         .inc();
+                    count_internal_nack(metrics, NackInternalCause::coordinate, 1);
                     Ok(())
                 }
             }
         }
-        Ok(_) => {
-            // Flusher fired ack with `false` (write/fsync error) or dropped
-            // the sender (panic). Either way: InternalError nack.
+        Ok(Ok(_)) => {
+            // The flusher resolved the ack false: the write or fsync failed.
             send_nack(stream, WireNack::InternalError, &[], write_timeout).await?;
             metrics
                 .records_nack
@@ -668,11 +686,26 @@ where
                     reason: MetricNack::internal_error,
                 })
                 .inc();
+            count_internal_nack(metrics, NackInternalCause::write_failed, 1);
+            Ok(())
+        }
+        Ok(Err(_)) => {
+            // The flusher dropped the sender (a panic). Same nack; only the
+            // cause label differs.
+            send_nack(stream, WireNack::InternalError, &[], write_timeout).await?;
+            metrics
+                .records_nack
+                .get_or_create(&NackLabel {
+                    tier: tv,
+                    reason: MetricNack::internal_error,
+                })
+                .inc();
+            count_internal_nack(metrics, NackInternalCause::sender_dropped, 1);
             Ok(())
         }
         Err(_elapsed) => {
             // ACK_TIMEOUT exceeded. The flusher is wedged (not panicked —
-            // a panic would have dropped the sender, which is the Ok(_)
+            // a panic would have dropped the sender, which is the Ok(Err(_))
             // branch above). The record may still get written; producer
             // sees Nack(InternalError) and retries on a fresh connection.
             metrics.ack_timeout.inc();
@@ -684,6 +717,7 @@ where
                     reason: MetricNack::internal_error,
                 })
                 .inc();
+            count_internal_nack(metrics, NackInternalCause::ack_timeout, 1);
             Ok(())
         }
     }
@@ -769,11 +803,14 @@ where
 
     // Records never enqueued are definitively not durable.
     let enqueued = receivers.len();
+    let enqueued_ok = receivers.iter().filter(|r| r.is_some()).count() as u64;
     receivers.resize_with(n, || None);
 
     let deadline = tokio::time::Instant::now() + ack_timeout;
     let mut accepted = vec![false; n];
     let mut acked = 0u64;
+    let mut write_failed = 0u64;
+    let mut dropped = 0u64;
     let mut timed_out = false;
 
     for (i, rx) in receivers.into_iter().enumerate() {
@@ -783,8 +820,10 @@ where
                 accepted[i] = true;
                 acked += 1;
             }
-            // Flusher acked false, or dropped the sender (a panic).
-            Ok(_) => {}
+            // The flusher acked false (a write or fsync failure).
+            Ok(Ok(_)) => write_failed += 1,
+            // The flusher dropped the sender (a panic).
+            Ok(Err(_)) => dropped += 1,
             Err(_elapsed) => {
                 // The shared budget is spent. Everything still outstanding is
                 // unknown, and unknown reports as not-durable.
@@ -796,6 +835,20 @@ where
     if timed_out {
         metrics.ack_timeout.inc();
     }
+    count_internal_nack(
+        metrics,
+        NackInternalCause::queue_full,
+        n as u64 - enqueued_ok,
+    );
+    count_internal_nack(metrics, NackInternalCause::write_failed, write_failed);
+    count_internal_nack(metrics, NackInternalCause::sender_dropped, dropped);
+    // Everything enqueued but not resolved before the shared deadline. Each
+    // record counted above had a receiver, so this cannot underflow.
+    count_internal_nack(
+        metrics,
+        NackInternalCause::ack_timeout,
+        enqueued_ok - acked - write_failed - dropped,
+    );
 
     let nacked = n as u64 - acked;
     if acked > 0 {
@@ -822,35 +875,57 @@ where
     send_ack_batch(stream, &accepted, write_timeout).await
 }
 
-/// Whether the WAB cap is currently rejecting pushes.
-///
-/// Hysteresis: once rejecting, keep rejecting until bytes fall below
-/// `cap * 9 / 10`, so ingest does not flap on and off at the boundary. `cap == 0`
-/// disables the check entirely.
-///
-/// The `rejecting` flag is shared by every connection on the daemon, so the
-/// low-water mark is global: one connection observing recovery releases all of
-/// them, and one observing the cap holds all of them.
+/// Why a fully read, CRC-verified push is refused before it counts as
+/// accepted. Both go out as `WireNack::InternalError` (no wire change); the
+/// distinction only decides which counter moves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdmissionRefusal {
+    /// Another instance provably owns the `wab_dir`; the daemon is exiting.
+    OwnershipLost,
+    /// Live WAB bytes are over `wab_max_bytes`.
+    WabCap,
+}
+
+impl AdmissionRefusal {
+    /// The `weir_records_nack_internal_total` cause this refusal counts as.
+    fn cause(self) -> NackInternalCause {
+        match self {
+            AdmissionRefusal::OwnershipLost => NackInternalCause::ownership_lost,
+            AdmissionRefusal::WabCap => NackInternalCause::wab_cap,
+        }
+    }
+}
+
+/// `weir_records_nack_internal_total{cause}` (spec §5.13): which of the
+/// transient causes behind one wire reason (`InternalError`) fired. Wire
+/// bytes are unchanged; only this counter tells the causes apart. A count of
+/// zero is a no-op, so the batch path can pass every cause unconditionally.
+fn count_internal_nack(metrics: &Metrics, cause: NackInternalCause, n: u64) {
+    if n > 0 {
+        metrics
+            .records_nack_internal
+            .get_or_create(&NackInternalLabel { cause })
+            .inc_by(n);
+    }
+}
+
+/// The admission check shared by the single-record and batch arms. Ownership
+/// loss comes first: it is one `Relaxed` load, and it must win over the cap
+/// (whose hysteresis state it must not disturb).
+fn admission_refusal(config: &ConnectionConfig) -> Option<AdmissionRefusal> {
+    if config.wab_ownership_lost.load(Ordering::Relaxed) {
+        return Some(AdmissionRefusal::OwnershipLost);
+    }
+    over_wab_cap(config).then_some(AdmissionRefusal::WabCap)
+}
+
+/// Whether the WAB cap is currently rejecting pushes; see [`crate::wab::cap`].
 fn over_wab_cap(config: &ConnectionConfig) -> bool {
-    if config.wab_max_bytes == 0 {
-        return false;
-    }
-    let bytes = config.wab_bytes_now.load(Ordering::Relaxed);
-    let rejecting = config.wab_cap_rejecting.load(Ordering::Relaxed);
-    // Divide before multiplying: `cap * 9` would overflow for caps above
-    // u64::MAX / 9, and the rounding loss is at most 9 bytes.
-    let low_water = config.wab_max_bytes / 10 * 9;
-    let now_rejecting = if rejecting {
-        bytes >= low_water
-    } else {
-        bytes >= config.wab_max_bytes
-    };
-    if now_rejecting != rejecting {
-        config
-            .wab_cap_rejecting
-            .store(now_rejecting, Ordering::Relaxed);
-    }
-    now_rejecting
+    crate::wab::cap::evaluate(
+        config.wab_max_bytes,
+        config.wab_bytes_now.load(Ordering::Relaxed),
+        &config.wab_cap_rejecting,
+    )
 }
 
 fn durability_to_tier(d: Durability) -> TierValue {
@@ -1025,6 +1100,7 @@ mod tests {
             wab_max_bytes: 0,
             wab_bytes_now: Arc::new(AtomicU64::new(0)),
             wab_cap_rejecting: Arc::new(AtomicBool::new(false)),
+            wab_ownership_lost: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1677,6 +1753,112 @@ mod tests {
         assert_eq!(payload[0], NackReason::InternalError as u8);
     }
 
+    // ── wab_dir ownership lost (spec §3.1, D4b) ───────────────────────────────
+
+    /// Once another instance provably owns the `wab_dir`, every new push is
+    /// Nacked `InternalError` BEFORE it reaches the queue, for all three push
+    /// kinds and both tiers, without touching the WAB-cap counter. The daemon
+    /// exits right after; this closes the window in which it would otherwise
+    /// keep acking into segments the other daemon now owns.
+    #[tokio::test]
+    async fn ownership_lost_nacks_before_queue() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
+        let lost = Arc::new(AtomicBool::new(true));
+        let cfg = ConnectionConfig {
+            wab_ownership_lost: Arc::clone(&lost),
+            // The cap is enabled and NOT exceeded, so only the ownership flag
+            // can be what refuses these pushes.
+            wab_max_bytes: 1_000,
+            wab_bytes_now: Arc::new(AtomicU64::new(0)),
+            // Short, so a regression (the push reaching the queue, where
+            // nothing acks it) fails in milliseconds instead of hiding behind
+            // an ack-timeout Nack 30 s later.
+            ack_timeout: Duration::from_millis(200),
+            ..test_cfg()
+        };
+        let metrics = Arc::new(Metrics::new().0);
+        tokio::spawn(handle_connection(
+            server,
+            queue_tx,
+            cfg,
+            Arc::clone(&metrics),
+            never_shutdown_rx(),
+        ));
+        let mut client = client;
+        let rx = queue_rx.get(0);
+
+        let batch = {
+            let body = weir_core::encode_batch_body(&[b"b1", b"b2"]);
+            Envelope::new(
+                Header::new(MessageType::PushBatch, Durability::Durable, 0),
+                body,
+            )
+            .encode()
+        };
+        let buffered = Envelope::new(
+            Header::new(MessageType::Push, Durability::Buffered, 0),
+            b"buffered".to_vec(),
+        )
+        .encode();
+        for frame in [
+            push_frame(b"durable"),
+            push_tracked_frame(b"tracked"),
+            batch,
+            buffered,
+        ] {
+            client.write_all(&frame).await.unwrap();
+            let (msg_type, payload) = read_response(&mut client).await;
+            assert!(
+                rx.try_recv().is_err(),
+                "nothing may reach the queue once ownership is lost"
+            );
+            assert_eq!(
+                msg_type,
+                MessageType::Nack,
+                "never an ack once ownership is lost"
+            );
+            assert_eq!(payload[0], NackReason::InternalError as u8);
+        }
+        assert_eq!(
+            metrics.wab_cap_rejections.get(),
+            0,
+            "an ownership-lost Nack is not a WAB-cap rejection"
+        );
+        let nacked = |tier| {
+            metrics
+                .records_nack
+                .get_or_create(&NackLabel {
+                    tier,
+                    reason: MetricNack::internal_error,
+                })
+                .get()
+        };
+        assert_eq!(nacked(TierValue::durable), 3);
+        assert_eq!(nacked(TierValue::buffered), 1);
+        assert_eq!(
+            metrics
+                .records_accepted
+                .get_or_create(&TierLabel {
+                    tier: TierValue::durable
+                })
+                .get(),
+            0,
+            "a refused push is never counted as accepted"
+        );
+
+        // The flag is the only thing that refused them: clear it and the same
+        // connection acks (proves the test is not vacuous).
+        lost.store(false, Ordering::Relaxed);
+        let acker = std::thread::spawn(move || {
+            let unit = rx.recv().unwrap();
+            let _ = unit.ack_tx.send(AckOutcome::durable(None));
+        });
+        client.write_all(&push_frame(b"after")).await.unwrap();
+        assert_eq!(read_response(&mut client).await.0, MessageType::Ack);
+        acker.join().unwrap();
+    }
+
     // ── WAB cap (wab_max_bytes) ───────────────────────────────────────────────
 
     #[tokio::test]
@@ -2126,5 +2308,131 @@ mod tests {
         .await
         .expect_err("a stalled writer must time out, not hang");
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    // ── weir_records_nack_internal_total{cause} (spec §5.13) ─────────────────
+
+    fn internal(m: &Metrics, cause: NackInternalCause) -> u64 {
+        m.records_nack_internal
+            .get_or_create(&NackInternalLabel { cause })
+            .get()
+    }
+
+    async fn push_once(cfg: ConnectionConfig, ack: Option<bool>) -> Arc<Metrics> {
+        let m = Arc::new(Metrics::new().0);
+        let mut c = spawn_handler_acking_with(cfg, Arc::clone(&m), ack).await;
+        c.write_all(&push_frame(b"x")).await.unwrap();
+        assert_eq!(read_response(&mut c).await.0, MessageType::Nack);
+        m
+    }
+
+    #[tokio::test]
+    async fn flusher_side_nacks_name_their_cause() {
+        let m = push_once(test_cfg(), Some(false)).await;
+        assert_eq!(internal(&m, NackInternalCause::write_failed), 1);
+        let m = push_once(test_cfg(), None).await;
+        assert_eq!(internal(&m, NackInternalCause::sender_dropped), 1);
+        assert_eq!(internal(&m, NackInternalCause::write_failed), 0);
+    }
+
+    #[tokio::test]
+    async fn admission_nacks_name_their_cause() {
+        let cap = ConnectionConfig {
+            wab_max_bytes: 1_000,
+            wab_bytes_now: Arc::new(AtomicU64::new(5_000)),
+            wab_cap_rejecting: Arc::new(AtomicBool::new(false)),
+            ..test_cfg()
+        };
+        assert_eq!(
+            internal(
+                &*push_once(cap, Some(true)).await,
+                NackInternalCause::wab_cap
+            ),
+            1
+        );
+        let lost = ConnectionConfig {
+            wab_ownership_lost: Arc::new(AtomicBool::new(true)),
+            ..test_cfg()
+        };
+        assert_eq!(
+            internal(
+                &*push_once(lost, Some(true)).await,
+                NackInternalCause::ownership_lost
+            ),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_and_timeout_nacks_name_their_cause() {
+        // Queue: no receivers, so the push fails at once.
+        let (client, server) = UnixStream::pair().unwrap();
+        let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
+        drop(queue_rx);
+        let m = Arc::new(Metrics::new().0);
+        tokio::spawn(handle_connection(
+            server,
+            queue_tx,
+            test_cfg(),
+            Arc::clone(&m),
+            never_shutdown_rx(),
+        ));
+        let mut client = client;
+        client.write_all(&push_frame(b"q")).await.unwrap();
+        read_response(&mut client).await;
+        assert_eq!(internal(&m, NackInternalCause::queue_full), 1);
+
+        // Ack timeout: the unit is received and its sender parked.
+        let (client, server) = UnixStream::pair().unwrap();
+        let (queue_tx, queue_rx) = queue::new::<WorkUnit>(1);
+        std::thread::spawn(move || {
+            let rx = queue_rx.get(0);
+            let mut parked = Vec::new();
+            while let Ok(unit) = rx.recv() {
+                parked.push(unit.ack_tx);
+            }
+        });
+        let m = Arc::new(Metrics::new().0);
+        let cfg = ConnectionConfig {
+            ack_timeout: Duration::from_millis(100),
+            ..test_cfg()
+        };
+        tokio::spawn(handle_connection(
+            server,
+            queue_tx,
+            cfg,
+            Arc::clone(&m),
+            never_shutdown_rx(),
+        ));
+        let mut client = client;
+        client.write_all(&push_frame(b"t")).await.unwrap();
+        read_response(&mut client).await;
+        assert_eq!(internal(&m, NackInternalCause::ack_timeout), 1);
+    }
+
+    /// A tracked push acked durable without an address is nacked (see
+    /// `tracked_push_without_a_coordinate_is_nacked_not_faked`); that nack
+    /// counts as `coordinate`, the one cause the tests above do not reach.
+    #[tokio::test]
+    async fn a_coordinate_nack_names_its_cause() {
+        let m = Arc::new(Metrics::new().0);
+        let mut c = spawn_handler_acking_with(test_cfg(), Arc::clone(&m), Some(true)).await;
+        c.write_all(&push_tracked_frame(b"x")).await.unwrap();
+        assert_eq!(read_response(&mut c).await.0, MessageType::Nack);
+        assert_eq!(internal(&m, NackInternalCause::coordinate), 1);
+    }
+
+    #[tokio::test]
+    async fn a_batch_counts_each_failed_record_by_cause() {
+        let m = Arc::new(Metrics::new().0);
+        let mut c = spawn_handler_acking_with(test_cfg(), Arc::clone(&m), Some(false)).await;
+        let frame = Envelope::new(
+            Header::new(MessageType::PushBatch, Durability::Durable, 0),
+            weir_core::encode_batch_body(&[b"b1", b"b2", b"b3"]),
+        )
+        .encode();
+        c.write_all(&frame).await.unwrap();
+        assert_eq!(read_response(&mut c).await.0, MessageType::AckBatch);
+        assert_eq!(internal(&m, NackInternalCause::write_failed), 3);
     }
 }

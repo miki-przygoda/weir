@@ -67,6 +67,27 @@ jobs:
             -v "$PWD/deploy/prometheus:/r:ro" -w /r prom/prometheus:v3.14.0 \
             test rules weir-alerts_test.yml
 
+      # The shipped weir.service runs under SystemCallFilter=@system-service with
+      # SystemCallErrorNumber=EPERM, and the wab_dir lock is a flock(2). If a
+      # systemd release ever dropped flock from that set, the lock would fail
+      # with EPERM and every daemon under the unit would refuse to start. This
+      # reads the runner's systemd tables, so it guards the systemd the runner
+      # ships, not every operator's. The output is captured first so grep -q
+      # cannot SIGPIPE systemd-analyze. act's images may lack systemd: skip there.
+      - name: systemd @system-service still allows flock
+        run: |
+          if ! command -v systemd-analyze >/dev/null 2>&1; then
+            echo "systemd-analyze not found; skipping the @system-service flock check"
+            exit 0
+          fi
+          set_members=$(systemd-analyze syscall-filter @system-service)
+          if ! printf '%s\n' "$set_members" | grep -qw flock; then
+            echo "flock is not in systemd's @system-service syscall set;" \
+                 "weir.service's SystemCallFilter would make the wab_dir lock fail with EPERM" >&2
+            exit 1
+          fi
+          echo "flock is in @system-service ($(systemd-analyze --version | head -n 1))"
+
   msrv:
     name: msrv (1.88)
     runs-on: ubuntu-latest
@@ -195,12 +216,12 @@ jobs:
       # The vendored AWS SigV4 vectors live here; run them explicitly so a
       # failure names this crate rather than hiding in a workspace summary.
       - run: cargo test -p weir-sink-s3
-      - run: cargo test -p weir-server --lib --test system --test docs_drift --test demo_drift --test load --test load_tls --test tls_client --test tls_listener
+      - run: cargo test -p weir-server --lib --test system --test docs_drift --test demo_drift --test deploy --test load --test load_tls --test tls_client --test tls_listener
       - run: cargo test -p weir-server --bins -- --test-threads=1
       # Build + run the clickhouse-sink and tls test code, which the default
       # feature set never compiles (S08). --all-features pulls in both.
       - run: cargo test --workspace --exclude weir-server --all-features
-      - run: cargo test -p weir-server --lib --test system --test docs_drift --test demo_drift --test load --test load_tls --test tls_client --test tls_listener --all-features
+      - run: cargo test -p weir-server --lib --test system --test docs_drift --test demo_drift --test deploy --test load --test load_tls --test tls_client --test tls_listener --all-features
       - run: cargo test -p weir-server --bins --all-features -- --test-threads=1
 
   dst:
@@ -460,13 +481,15 @@ jobs:
       - name: Build the mTLS client on Windows
         run: cargo build --release -p weir-client --features tls
 
-      # The three published libraries have no Unix API surface — a Rust
+      # These published libraries have no Unix API surface — a Rust
       # developer on Windows can legitimately depend on them for the wire codec,
       # the on-disk format, or to write a sink. They already compiled for Windows
-      # (the old weir-server build proved it incidentally, since all three are
+      # (the old weir-server build proved it incidentally, since the first three are
       # its dependencies); this makes the guarantee explicit rather than a side
       # effect, and catches an ungated `libc::` or `std::os::unix` import landing
       # in one of them.
+      # weir-status is pure Rust (serde only, no I/O) and is checked here because
+      # weir-ctl's evaluator depends on it and must build anywhere weir-ctl might.
       #
       # weir-server and weir-ctl are deliberately absent: the server has no
       # ingest path on Windows at all (`mod socket` is `#[cfg(unix)]`, the mTLS
@@ -474,7 +497,7 @@ jobs:
       # `#[cfg(not(unix))]` arm just awaits shutdown), and weir-ctl drives a
       # Unix-socket client.
       - name: Check the published libraries for Windows
-        run: cargo check -p weir-core -p weir-wab -p weir-sink-sdk --all-features --locked
+        run: cargo check -p weir-core -p weir-wab -p weir-sink-sdk -p weir-status --all-features --locked
 
   build:
     needs: test

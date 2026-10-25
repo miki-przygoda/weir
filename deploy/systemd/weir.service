@@ -31,7 +31,9 @@ Group=weir
 
 # /run/weir is the socket's PARENT directory. systemd creates and chowns it to
 # weir:weir on every start; the 0700 mode is load-bearing for weir's bind
-# security model (see docs/security/socket-bind.md) — DO NOT loosen it.
+# security model (see docs/security/socket-bind.md) — DO NOT loosen it. A stale
+# socket left by a crash is removed at the next start; a socket another process
+# is still listening on is never removed (the start refuses instead).
 RuntimeDirectory=weir
 RuntimeDirectoryMode=0700
 
@@ -60,16 +62,35 @@ ExecStartPre=/usr/bin/install -d -m0700 /var/lib/weir/wab
 # (this IS the default path, but spell it out for clarity).
 ExecStart=/usr/local/bin/weir-server --config /etc/weir/weir.toml
 
-# Graceful shutdown: weir traps SIGTERM, seals the open WAB segment, drains
-# in-flight connections, then exits — bounded by its own shutdown_timeout_secs
-# (default 30s). Keep TimeoutStopSec a few seconds ABOVE shutdown_timeout_secs so
-# systemd lets the daemon finish its own drain instead of SIGKILLing mid-flush.
-# If you raise shutdown_timeout_secs in weir.toml, raise this to match (+5s).
+# Graceful shutdown is BOUNDED. After SIGTERM weir:
+#   closes its listeners at once; an idle connection is closed at once, and a
+#     connection in the middle of a frame finishes it and gets its ack, for
+#     at most shutdown_timeout_secs                        (30 s in weir.toml)
+#   joins workers and flushers: active segments sealed and fsynced, each
+#     flusher waiting at most 1 s to hand its last segment to the drain
+#   lets the drain deliver for at most drain_shutdown_budget_secs (10 s)
+#   gives the drain thread 2 s to exit
+# so systemd must wait at least
+#   shutdown_timeout_secs + drain_shutdown_budget_secs + 5   = 45 s
+# before it escalates to SIGKILL. Raise TimeoutStopSec whenever you raise either
+# key in weir.toml. What the drain has not delivered when its budget runs out
+# stays sealed in the WAB and is delivered after the next start.
 KillSignal=SIGTERM
-TimeoutStopSec=35
+TimeoutStopSec=45
 
+# Exit status 1 = refused to start (wab_dir locked by another weir-server, a
+# live socket at socket_path, metrics/TCP port taken, bad TLS material). These
+# are checked BEFORE recovery, so a restart loop on them delivers nothing.
+# Exit status 3 = WAB ownership lost to another instance at runtime; the restart
+# then refuses with "locked by" until that instance stops. See README.md.
 Restart=on-failure
 RestartSec=5
+
+# Deliberately NO ExecReload=. Config is read once at startup, so
+# `systemctl reload-or-restart weir` must stay a restart. SIGHUP never stops the
+# daemon: it reloads TLS material when tcp_bind is set and is a counted no-op
+# otherwise (weir_config_reloads_total). Rotate certs with
+# `systemctl kill --signal=SIGHUP weir`.
 
 # ── Resource limits ──────────────────────────────────────────────────────────
 # weir uses one spawn_blocking slot per producer connection; max_connections
@@ -105,6 +126,10 @@ RestrictSUIDSGID=true
 LockPersonality=true
 # weir never JITs or maps W+X pages.
 MemoryDenyWriteExecute=true
+# The wab_dir lock (<wab_dir>/.weir.lock) needs flock(2). If a filter ever
+# denies it, flock fails with EPERM and the daemon refuses to start. Check with
+# `systemd-analyze syscall-filter @system-service | grep -w flock` (CI runs the
+# same check against the runner's systemd).
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
 # AF_UNIX for the producer socket; AF_INET/AF_INET6 for /metrics and outbound

@@ -25,6 +25,7 @@ pub mod mysql;
 pub mod noop;
 #[cfg(feature = "postgres-sink")]
 pub mod postgres;
+pub(crate) mod select;
 #[cfg(feature = "_sql-sink")]
 mod sql_common;
 

@@ -178,6 +178,76 @@ impl WeirServer {
         }
     }
 
+    /// Sends `sig` to the daemon and returns at once (unlike
+    /// [`sigterm`](Self::sigterm), which waits for the exit). For tests that
+    /// act on the daemon WHILE it shuts down: a second signal, a scrape
+    /// during the drain budget, a lame-duck check.
+    #[cfg(unix)]
+    pub fn signal(&self, sig: i32) {
+        let pid = self.child_pid();
+        // SAFETY: kill(2) on our own child, which has not been reaped (the
+        // handle still owns it, so the pid cannot have been reused).
+        let rc = unsafe { libc::kill(pid as libc::pid_t, sig) };
+        assert_eq!(
+            rc,
+            0,
+            "kill -{sig} {pid}: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// Like [`scrape_metrics`](Self::scrape_metrics), but `None` instead of a
+    /// panic when the endpoint is not (or no longer) reachable, with a 2 s
+    /// I/O bound. For polling during startup and shutdown.
+    pub fn try_scrape_metrics(&self) -> Option<String> {
+        use std::io::{Read, Write};
+        use std::net::{SocketAddr, TcpStream};
+        let addr = SocketAddr::from(([127, 0, 0, 1], self.metrics_port));
+        let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).ok()?;
+        s.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+        s.set_write_timeout(Some(Duration::from_secs(2))).ok()?;
+        s.write_all(b"GET /metrics HTTP/1.0\r\n\r\n").ok()?;
+        let mut response = String::new();
+        s.read_to_string(&mut response).ok()?;
+        let idx = response.find("\r\n\r\n")?;
+        Some(response[idx + 4..].to_string())
+    }
+
+    // ── Admin socket ─────────────────────────────────────────────────────────
+
+    /// The admin socket the daemon derives from its `wab_dir`
+    /// (`<parent>/<name>.admin.sock`, Foundations spec §5.9). With the
+    /// harness's default layout that is `tmp_dir/wab.admin.sock`.
+    pub fn admin_socket_path(&self) -> PathBuf {
+        let name = self
+            .wab_dir
+            .file_name()
+            .expect("wab_dir has a final component");
+        let mut file = name.to_os_string();
+        file.push(".admin.sock");
+        self.wab_dir
+            .parent()
+            .expect("wab_dir has a parent")
+            .join(file)
+    }
+
+    /// Sends one admin request `{"v":1,"id":1,"verb":<verb>,"args":<args_json>}`
+    /// on a fresh connection and returns the response line (without `\n`).
+    /// Waits up to 40 s, longer than the 30 s maximum `wait_ms`.
+    #[cfg(unix)]
+    pub fn admin(&self, verb: &str, args_json: &str) -> String {
+        use std::io::{BufRead, BufReader, Write};
+        let mut s = std::os::unix::net::UnixStream::connect(self.admin_socket_path())
+            .expect("connect to the admin socket");
+        s.set_read_timeout(Some(Duration::from_secs(40))).unwrap();
+        writeln!(s, r#"{{"v":1,"id":1,"verb":"{verb}","args":{args_json}}}"#).unwrap();
+        let mut line = String::new();
+        BufReader::new(s)
+            .read_line(&mut line)
+            .expect("read the admin response");
+        line.trim_end().to_string()
+    }
+
     // ── Lifecycle ────────────────────────────────────────────────────────────
 
     /// Kills the server immediately with SIGKILL. The socket and temp files
@@ -194,8 +264,9 @@ impl WeirServer {
     }
 
     /// Kills the server with SIGKILL then restarts it with the same config.
-    /// Simulates crash recovery: `bind_cleanup` in the socket layer detects
-    /// and removes the stale socket left behind by the crash.
+    /// Simulates crash recovery: the socket layer's startup liveness probe
+    /// finds nobody listening on the socket the crash left behind, and
+    /// removes it as stale.
     pub fn restart_in_place(&mut self) {
         self.kill_ungracefully();
 
@@ -237,6 +308,28 @@ impl WeirServer {
             self.child = None;
         }
         t.elapsed()
+    }
+
+    /// Waits up to `timeout` for the daemon to exit ON ITS OWN (no signal is
+    /// sent) and returns its exit status, or `None` if it is still running at
+    /// the deadline (or the handle no longer has a child: it was already
+    /// killed, or reaped by an earlier call). Once it has exited the handle
+    /// forgets the child, so drop
+    /// does not signal a reused pid. The temp dir stays until drop, so the
+    /// caller can still read `weir.log`.
+    pub fn wait_for_exit(&mut self, timeout: Duration) -> Option<std::process::ExitStatus> {
+        let deadline = Instant::now() + timeout;
+        let child = self.child.as_mut()?;
+        loop {
+            if let Ok(Some(status)) = child.try_wait() {
+                self.child = None;
+                return Some(status);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Sends SIGTERM, waits for the process to exit cleanly, then drops the
@@ -429,7 +522,96 @@ impl WeirServerBuilder {
     /// Spawns the server and blocks until it's ready (or panics with the
     /// captured log on failure).
     pub fn start(self) -> WeirServer {
+        let ready_timeout = self.ready_timeout;
+        let mut handle = self.spawn();
+        handle.wait_ready(ready_timeout);
+        handle
+    }
+
+    /// Spawns the server and returns at once, WITHOUT waiting for the socket.
+    /// For tests that act on the daemon during startup (recovery, the blocking
+    /// replay), before it accepts connections. Call
+    /// [`WeirServer::wait_ready`] when the test wants it up; the log is at
+    /// `tmp_dir/weir.log` meanwhile.
+    pub fn spawn(self) -> WeirServer {
         let _proc_lock = process_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (prepared, mut cmd) = self.prepare();
+        let child = cmd.spawn().expect("failed to spawn weir-server");
+
+        WeirServer {
+            child: Some(child),
+            binary_path: prepared.binary_path,
+            socket_path: prepared.socket_path,
+            wab_dir: prepared.wab_dir,
+            config_path: prepared.config_path,
+            tmp_dir: prepared.tmp_dir,
+            metrics_port: prepared.metrics_port,
+            tcp_addr: prepared.tcp_addr,
+            batch_deadline_ms: prepared.batch_deadline_ms,
+            env: prepared.env,
+            _proc_lock,
+        }
+    }
+
+    /// Spawns a daemon that is EXPECTED to exit on its own (a refused start),
+    /// waits up to `timeout` for it, and returns its exit status and combined
+    /// stdout+stderr log. Panics, after killing it, if it is still running at
+    /// the deadline: a daemon that should have refused but did not is the bug
+    /// the caller is testing for.
+    ///
+    /// [`start`](Self::start) cannot do this: `wait_ready` panics on an early
+    /// exit, which is exactly the outcome wanted here.
+    ///
+    /// The child gets its own temp dir, socket path and metrics port, and the
+    /// builder's own `wab_dir` unless [`wab_dir`](Self::wab_dir) points it at
+    /// another daemon's. Use a tag no live server uses: the temp dir is derived
+    /// from it, and it is removed (after the log is read) before this returns.
+    /// A `wab_dir` override is never removed.
+    ///
+    /// Unlike `start`, this does not WAIT for [`process_lock`]: the typical
+    /// caller already holds it through a live [`WeirServer`] on the same
+    /// thread, and a std mutex is not reentrant. It takes the lock only if it
+    /// is free.
+    pub fn spawn_expecting_exit(self, timeout: Duration) -> (std::process::ExitStatus, String) {
+        let _proc_lock = process_lock().try_lock().ok();
+        let silenced = self.silence_logs;
+        let (prepared, mut cmd) = self.prepare();
+        let mut child = cmd.spawn().expect("failed to spawn weir-server");
+
+        let read_log = || {
+            if silenced {
+                String::new()
+            } else {
+                std::fs::read_to_string(&prepared.log_path).unwrap_or_default()
+            }
+        };
+        let deadline = Instant::now() + timeout;
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("try_wait on weir-server") {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                let log = read_log();
+                let _ = std::fs::remove_dir_all(&prepared.tmp_dir);
+                panic!(
+                    "weir-server was expected to exit within {timeout:?} but was still \
+                     running (killed)\nlog:\n{log}"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let log = read_log();
+        let _ = std::fs::remove_dir_all(&prepared.tmp_dir);
+        (status, log)
+    }
+
+    /// Lays out the temp dir, writes the config and builds the command. Shared
+    /// by [`start`](Self::start) and
+    /// [`spawn_expecting_exit`](Self::spawn_expecting_exit); the caller holds
+    /// (or deliberately does not hold) the process lock.
+    fn prepare(self) -> (Prepared, Command) {
         let metrics_port = free_port();
 
         // Pre-allocate the TCP+mTLS port (if requested) under the same held
@@ -479,6 +661,13 @@ impl WeirServerBuilder {
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&wab_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            // tmp_dir is the parent of the default wab_dir, so it is where the
+            // daemon derives its admin socket (`tmp_dir/wab.admin.sock`), and
+            // that bind refuses a group- or world-writable parent. Pin it to
+            // 0755 rather than inherit the test process's umask: under a
+            // umask of 0002 `create_dir_all` makes it 0775, and every daemon
+            // would then run with admin unavailable.
+            std::fs::set_permissions(&tmp_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
 
         let mut config = format!(
@@ -551,26 +740,35 @@ impl WeirServerBuilder {
                 unsafe { cmd.pre_exec(pre_exec) };
             }
         }
-        let child = cmd.spawn().expect("failed to spawn weir-server");
 
-        let mut handle = WeirServer {
-            child: Some(child),
+        let prepared = Prepared {
             binary_path,
             socket_path,
             wab_dir,
             config_path,
+            log_path,
             tmp_dir,
             metrics_port,
             tcp_addr,
             batch_deadline_ms: self.batch_deadline_ms,
             env: self.env,
-            _proc_lock,
         };
-
-        let ready_timeout = self.ready_timeout;
-        handle.wait_ready(ready_timeout);
-        handle
+        (prepared, cmd)
     }
+}
+
+/// Everything [`WeirServerBuilder::prepare`] decided, before the spawn.
+struct Prepared {
+    binary_path: PathBuf,
+    socket_path: PathBuf,
+    wab_dir: PathBuf,
+    config_path: PathBuf,
+    log_path: PathBuf,
+    tmp_dir: PathBuf,
+    metrics_port: u16,
+    tcp_addr: Option<std::net::SocketAddr>,
+    batch_deadline_ms: u64,
+    env: Vec<(String, String)>,
 }
 
 /// Read `WEIR_BENCH_DEADLINE` from env, defaulting to 1ms. Used by

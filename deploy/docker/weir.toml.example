@@ -16,6 +16,21 @@ socket_path = "/run/weir/weir.sock"
 # Env: WEIR_WAB_DIR
 wab_dir = "/var/lib/weir/wab"
 
+# What to do when the filesystem under wab_dir cannot take an exclusive flock
+# on <wab_dir>/.weir.lock. "required" refuses to start; "best-effort" WARNs and
+# runs with no guard against a second daemon on the same wab_dir. Another
+# running weir-server holding the lock is refused under both values.
+# Values: "required" | "best-effort". Never delete .weir.lock by hand.
+# Env: WEIR_WAB_DIR_LOCK
+wab_dir_lock = "required"
+
+# Admin Unix socket for weir-ctl status / reload / drain (daemon uid and root only).
+# Default path: <parent of wab_dir>/<name of wab_dir>.admin.sock. The parent
+# directory must be writable only by the daemon user. Env: WEIR_ADMIN_SOCKET_ENABLED,
+# WEIR_ADMIN_SOCKET_PATH.
+# admin_socket_enabled = true
+# admin_socket_path = "/var/lib/weir/wab.admin.sock"
+
 # Number of WAB shards (one flusher thread per shard). Range: 1-256.
 # Default 1 is correct for single-disk deployments.
 # Env: WEIR_SHARD_COUNT
@@ -107,11 +122,27 @@ metrics_bind = "127.0.0.1"
 # Env: WEIR_METRICS_MAX_CONNECTIONS
 metrics_max_connections = 8
 
+# Checks that make GET /livez answer 503. Default [] (fails only when the
+# process stops answering). Recommended: no_live_shard, listener_down,
+# worker_exited; also drain_stopped, drain_wedged.
+# Env: WEIR_LIVEZ_CHECKS (comma-separated)
+# livez_checks = ["no_live_shard", "listener_down", "worker_exited"]
+
 # Graceful shutdown timeout in seconds. After a SIGTERM or Ctrl-C, the daemon
 # waits this long for in-flight connections to finish before aborting them.
-# Set <= the orchestrator's terminationGracePeriodSeconds minus a few seconds.
+# The orchestrator must wait at least
+# shutdown_timeout_secs + drain_shutdown_budget_secs + 5 seconds before it
+# SIGKILLs (Kubernetes terminationGracePeriodSeconds, compose stop_grace_period,
+# `docker stop -t`): 45 s with the defaults.
 # Env: WEIR_SHUTDOWN_TIMEOUT_SECS
 shutdown_timeout_secs = 30
+
+# Bounded shutdown: how long the drain keeps delivering after SIGTERM, counted
+# from the moment ingest is sealed. What is left replays on the next start.
+# Keep the orchestrator grace >= shutdown_timeout_secs + this + 5 (45 s at the
+# defaults). Range 0-3600.
+# Env: WEIR_DRAIN_SHUTDOWN_BUDGET_SECS
+drain_shutdown_budget_secs = 10
 
 # Maximum total size (bytes) of the dead-letter directory. When this cap would
 # be exceeded, the drain transitions to BlockedDeadLetterFull and pauses until

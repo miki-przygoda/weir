@@ -110,29 +110,131 @@ nested umask 0o177) is belt-and-braces on top of these directory perms.
 
 Made explicit so orchestrators that override Docker's default
 (e.g. Kubernetes' `terminationGracePeriodSeconds` flow, which sends a
-configurable signal) still get the clean shutdown path. Weir's SIGTERM
-handler unwinds the pipeline in dependency order: socket close → workers
-drain → drain task finishes → WAB flush. See
-`crates/weir-server/src/main.rs` and the recent deadlock fix in PR #10.
+configurable signal) still get the clean shutdown path. Shutdown is
+bounded: listeners close at once (the socket file is unlinked and `/readyz`
+answers 503), an idle connection is closed at once and a connection in the
+middle of a frame finishes it and gets its ack (for at most
+`shutdown_timeout_secs`), the active segments are sealed and fsynced, and the
+drain gets `drain_shutdown_budget_secs` before the rest is left sealed for
+replay. Give the container `shutdown_timeout_secs + drain_shutdown_budget_secs + 5`
+seconds (45 s at the defaults) before the SIGKILL: `docker stop -t 45`,
+compose `stop_grace_period: 45s` (the shipped compose file sets it),
+Kubernetes `terminationGracePeriodSeconds: 45`. Docker's own default is 10 s.
+
+**SIGHUP never stops the daemon.** `main` sets SIGHUP to ignored before it
+reads the config. Once the runtime is up, each SIGHUP is a reload request
+counted in `weir_config_reloads_total{trigger="sighup"}`. With `tcp_bind`
+set, it reloads the TLS material (`outcome="ok"` or `"failed"`); otherwise it
+changes nothing (`outcome="noop"`). `docker kill --signal=HUP <container>` is
+therefore safe, and is how to rotate certificates in a container (see [TCP +
+mutual TLS](../operations/tcp-mtls.md#cert-rotation-via-sighup)). In the
+shipped image weir is PID 1 (exec-form `CMD`, no init), and the kernel
+already dropped a default-disposition SIGHUP sent to it. Under
+`docker run --init`, `shareProcessNamespace: true` or a shell wrapper weir is
+not PID 1, and in 4.0.x and earlier a SIGHUP to a daemon without a TLS
+listener killed it without sealing or draining.
+
+### One daemon per WAB volume
+
+A WAB volume must be used by exactly one running daemon. The daemon enforces
+this: before it reads the WAB, it takes an exclusive `flock` on
+`<wab_dir>/.weir.lock` (in the image, `/var/lib/weir/wab/.weir.lock`, on the
+`wab_data` volume). A second container that mounts the same volume on the
+same host refuses to start, before recovery, with exit status 1:
+
+```text
+wab_dir /var/lib/weir/wab is locked by another weir-server (pid 1 on host
+<container hostname>, started …, version …, socket /run/weir/weir.sock). Two
+daemons on one wab_dir corrupt each other's segments and can lose acked
+records. Stop the other instance or point this one at a different wab_dir.
+```
+
+`host` is the holder's `gethostname(2)`: the container hostname under Docker
+and the pod name in Kubernetes. Because the holder is PID 1 in its own
+namespace, the hostname is what identifies it.
+
+What this means for orchestration:
+
+- **`docker compose up --scale weir=2`** with the shipped compose file:
+  the fixed host-port mapping `127.0.0.1:9185:9185` already makes Docker
+  refuse the second replica before weir runs. Remove the mapping and the
+  second replica starts, refuses on the lock, and `restart: unless-stopped`
+  restarts it in a loop. That is safe but noisy. Scale weir by giving each
+  instance its own WAB volume.
+- **Kubernetes.** Give each replica its own WAB volume (a StatefulSet with
+  a volume claim template). Where two pods mount one WAB volume on the same
+  node (a `hostPath`, or a `ReadWriteOnce` volume, which allows several pods
+  on one node), the lock behaves as above: one pod holds it and the others
+  refuse and crash-loop. A `RollingUpdate` that starts the new pod on the same
+  node while the old one is still draining makes the new pod refuse with
+  "locked by" until the old process exits. The old process holds the lock
+  until it exits, which can take up to
+  `shutdown_timeout_secs + drain_shutdown_budget_secs + 5` seconds after
+  SIGTERM;
+  `strategy: type: Recreate` avoids the overlap. A `ReadWriteMany` volume
+  shared across nodes is normally a network filesystem, where the lock is not
+  a supported guard (next item).
+- **Network volumes** (NFS, EFS and other shared filesystems) are not
+  supported for the WAB. The lock may be granted there with weaker semantics,
+  and it is not a guard across hosts. See the [threat
+  model](threat-model.md#residual-windows).
+- **Never delete `.weir.lock`** on a live volume. If it is deleted, a second
+  instance can start in the moment before the running daemon notices (about
+  1 s). If the running daemon then finds another instance holding the lock,
+  it Nacks every new push and exits with status **3**. Under
+  `restart: unless-stopped` it then restarts and refuses with "locked by"
+  until the other instance stops.
+- **A shared socket volume** (`/run/weir`) with a different WAB volume is
+  caught as well. Before recovery, the second daemon probes the socket path
+  and refuses with `socket_path '/run/weir/weir.sock' is in use by a running
+  process`. A stale socket left by a killed container is still removed on
+  the next start.
+
+### Admin socket
+
+In the image the admin socket lives at `/var/lib/weir/wab.admin.sock`, the
+path derived from `wab_dir = /var/lib/weir/wab`. That is inside the image's
+`/var/lib/weir` (chowned to uid 10001, not a `VOLUME`), not in the
+`/run/weir` volume that producer containers mount. A sidecar running as uid
+10001 so that `peer_uid_check` admits it to the producer socket therefore has
+no admin access: it cannot see the admin socket, and the daemon's peer check
+would only matter if it could.
+
+The shipped image contains only `weir-server`, not `weir-ctl`. In an image
+that adds `weir-ctl`, `docker exec <container> weir-ctl status` reaches the
+admin socket, since the exec runs as the image's user (uid 10001) in the
+daemon's filesystem. Without it, the read-only `/status` document on the
+metrics port is the way in from outside the container.
+
+With a read-only root filesystem (`docker run --read-only`, or Kubernetes
+`readOnlyRootFilesystem: true`), `/var/lib/weir` is not writable, so the
+bind fails, the daemon logs `admin socket unavailable` at ERROR, raises the
+`admin_unavailable` condition and carries on without it. To keep the admin
+socket, set `WEIR_ADMIN_SOCKET_PATH` to a file in a private writable mount
+(a `tmpfs` or an `emptyDir` that is not mounted into producer containers),
+whose directory is writable only by uid 10001.
 
 ### Healthcheck
 
-`HEALTHCHECK` opens a TCP connection to the metrics port (9185) using
-bash's `/dev/tcp` virtual file — no extra packages installed, no curl
-or wget needed. The check succeeds iff:
+`HEALTHCHECK` sends `GET /livez` to the metrics port (9185) over bash's
+`/dev/tcp` virtual file (no curl or wget in the image) and is healthy only on
+a `200` status line. `/livez` answers 200 whenever the daemon's runtime is
+serving HTTP: a few milliseconds after start, all through WAB recovery, and
+while shutting down. It fails only on the checks you select with
+`livez_checks` (default: none), each a state a restart fixes
+(`no_live_shard`, `listener_down`, `worker_exited`, and the opt-ins
+`drain_stopped`, `drain_wedged`). It never fails because the sink is down or
+the drain is paused, retrying or blocked, so Docker never restarts weir for a
+slow downstream.
 
-1. The daemon process is alive.
-2. The metrics HTTP server has bound the port.
+It is a liveness check, not readiness. "Can this daemon take ingest now?" is
+`GET /readyz`; see [Health and status endpoints](../monitoring.md#health-and-status-endpoints).
 
-It does not exercise the wire protocol (Unix socket) end-to-end. For a
-deeper liveness check, an operator can override `HEALTHCHECK CMD` at
-runtime with one that connects to the Unix socket and sends a
-`HealthCheck` frame.
-
-The defaults (10s interval, 3s timeout, 5s start period, 3 retries) are
-suited to development. Orchestrators (Kubernetes, ECS) usually replace
-the Dockerfile `HEALTHCHECK` with their own probes; the in-image version
-is a fallback for plain `docker run`.
+The defaults (10 s interval, 3 s timeout, 10 s start period, 3 retries) suit
+`docker run` and compose. The command hard-codes port 9185: if you change
+`metrics_port`, override `HEALTHCHECK` (or compose's `healthcheck.test`) with
+the new port. Kubernetes ignores the image's `HEALTHCHECK`; use the probe
+recipe in monitoring.md instead.
 
 ## What the image does NOT do
 
@@ -141,9 +243,13 @@ Operator hardening that **must be applied externally**:
 - **No `seccomp` / AppArmor / SELinux profile baked in.** Apply at the
   container runtime: `docker run --security-opt seccomp=…
   --security-opt apparmor=…`. A minimum seccomp profile for weir would
-  allow read/write/socket/bind/accept/fsync/openat/unlinkat/fstatat and
-  the basic process control set; everything else (especially `ptrace`,
-  `mount`, `setuid`, `clone` with namespace flags) can be denied.
+  allow read/write/socket/bind/connect/accept/fsync/openat/unlinkat/fstatat,
+  `flock` and the basic process control set; everything else (especially
+  `ptrace`, `mount`, `setuid`, `clone` with namespace flags) can be denied.
+  `flock` is load-bearing: if a profile denies it with `EPERM`, the
+  `wab_dir` lock fails and the daemon refuses to start (`cannot lock
+  wab_dir …`), whatever `wab_dir_lock` is set to. `connect` is needed by the
+  sinks and by the startup liveness probe of `socket_path`.
 - **No capability dropping.** Apply at runtime: `docker run --cap-drop=ALL`.
   Weir needs no capabilities; it does not bind privileged ports (9185 is
   unprivileged), does not need raw sockets, does not need `CAP_CHOWN` or
@@ -250,6 +356,8 @@ docker run \
     -v weir-wab:/var/lib/weir/wab \
     -v weir-run:/run/weir \
     -v $(pwd)/weir.toml:/etc/weir/weir.toml:ro \
+    --tmpfs /run/weir-admin:rw,noexec,nosuid,size=1m,uid=10001,gid=10001,mode=0700 \
+    -e WEIR_ADMIN_SOCKET_PATH=/run/weir-admin/wab.admin.sock \
     -p 127.0.0.1:9185:9185 \
     --name weir \
     weir:latest
@@ -257,7 +365,10 @@ docker run \
 
 The `127.0.0.1:9185` binding matches the recommendation in
 [`threat-model.md`](threat-model.md): the metrics port is not part of
-the trust boundary and should not be exposed publicly.
+the trust boundary and should not be exposed publicly. `--read-only`
+makes `/var/lib/weir` unwritable, so the private `/run/weir-admin` tmpfs
+holds the admin socket instead (see [Admin socket](#admin-socket)); it is
+not the `/run/weir` volume, and no producer container mounts it.
 
 ## Updating this document
 
@@ -273,6 +384,10 @@ When changing the Dockerfile, update this document if you change:
   is ever added, update the secret-handling section, which currently
   documents env as the only path.
 - The HEALTHCHECK (orchestrators may rely on the default behaviour).
+- The WAB or socket volume layout, or the compose `restart`/port mapping
+  (the one-daemon-per-volume section describes how a second replica fails),
+  or anything that moves the admin socket onto a volume producers mount
+  (the admin-socket section relies on `/var/lib/weir` being private).
 - Anything in the `What the image does NOT do` section (operators
   reading this document trust that the image leaves those concerns to
   them).

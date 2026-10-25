@@ -282,3 +282,230 @@ fn tls_handshake_timeout_drops_stalled_tcp_client() {
 
     srv.shutdown();
 }
+
+/// A counter sample from a scrape, 0 if absent.
+fn metric(srv: &weir_testkit::WeirServer, series: &str) -> u64 {
+    srv.scrape_metrics()
+        .lines()
+        .find(|l| l.starts_with(series) && l[series.len()..].starts_with(' '))
+        .and_then(|l| l.split_whitespace().next_back())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Whether a client with `cfg` completes the handshake and gets an Ack.
+fn acked(addr: SocketAddr, cfg: Arc<ClientConfig>) -> bool {
+    match tls_connect(addr, cfg) {
+        Ok(mut stream) => matches!(push_one(&mut stream, b"hello"), Ok(MessageType::Ack)),
+        Err(_) => false,
+    }
+}
+
+/// spec §3.2: SIGHUP goes through the one reload path, which still reloads the
+/// TLS material in place. Rotate the files the daemon was configured with to a
+/// whole new CA, server cert and client CA, send HUP: both counters say `ok`,
+/// a new handshake sees the new server cert, and the old identity is refused.
+#[test]
+fn sighup_reloads_tls_when_configured() {
+    let fx = TlsFixture::generate("hup_rotate_old");
+    let next = TlsFixture::generate("hup_rotate_new");
+    let mut srv = weir_server!("tls_hup").tls(&fx).log_level("info").start();
+    let addr = srv.tcp_addr();
+    let old_client =
+        client_config_with_cert(&fx.ca_cert_path, &fx.client_cert_path, &fx.client_key_path);
+    let new_client = client_config_with_cert(
+        &next.ca_cert_path,
+        &next.client_cert_path,
+        &next.client_key_path,
+    );
+    assert!(
+        acked(addr, Arc::clone(&old_client)),
+        "control: old identity"
+    );
+    assert!(
+        !acked(addr, Arc::clone(&new_client)),
+        "control: the next identity is not trusted before the rotation"
+    );
+
+    // Rotate in place: the configured paths now hold the next material.
+    for (from, to) in [
+        (&next.server_cert_path, &fx.server_cert_path),
+        (&next.server_key_path, &fx.server_key_path),
+        (&next.ca_cert_path, &fx.ca_cert_path),
+    ] {
+        std::fs::copy(from, to).unwrap();
+    }
+    // SAFETY: kill(2) on the child we spawned and still own.
+    assert_eq!(
+        unsafe { libc::kill(srv.child_pid() as libc::pid_t, libc::SIGHUP) },
+        0
+    );
+
+    let tls_ok = "weir_tls_config_reloads_total{outcome=\"ok\"}";
+    let cfg_ok = "weir_config_reloads_total{trigger=\"sighup\",outcome=\"ok\"}";
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while metric(&srv, cfg_ok) < 1 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(metric(&srv, tls_ok), 1, "{tls_ok}");
+    assert_eq!(metric(&srv, cfg_ok), 1, "{cfg_ok}");
+    assert_eq!(
+        metric(
+            &srv,
+            "weir_config_reloads_total{trigger=\"sighup\",outcome=\"noop\"}"
+        ),
+        0
+    );
+    assert!(
+        srv.wait_for_exit(Duration::from_millis(100)).is_none(),
+        "SIGHUP must not stop the daemon"
+    );
+
+    // A new handshake sees the new server cert.
+    let mut stream = tls_connect(addr, Arc::clone(&new_client)).expect("handshake after rotation");
+    assert_eq!(
+        push_one(&mut stream, b"after-rotation").unwrap(),
+        MessageType::Ack
+    );
+    let presented = stream
+        .conn
+        .peer_certificates()
+        .expect("server presented a cert")[0]
+        .clone();
+    assert_eq!(
+        presented,
+        load_certs(&next.server_cert_path)[0],
+        "the server must present the rotated cert"
+    );
+    drop(stream);
+    assert!(
+        !acked(addr, old_client),
+        "the old identity must be refused after the rotation"
+    );
+
+    srv.shutdown();
+}
+
+/// spec §16 (Admin): reload with good certificates → applied; a corrupt key
+/// → failed, and the certificates in force still handshake.
+#[test]
+fn admin_reload_applies_rotated_certs_and_keeps_them_on_a_corrupt_key() {
+    let fx = TlsFixture::generate("admin_rotate_old");
+    let next = TlsFixture::generate("admin_rotate_new");
+    // Short label: the derived <tmp>/weir_test_<label>_<pid>/wab.admin.sock
+    // must stay <= 103 bytes on macOS, or admin is disabled (path_too_long).
+    let srv = weir_server!("tls_adm_rl").tls(&fx).start();
+    let addr = srv.tcp_addr();
+    let new_client = client_config_with_cert(
+        &next.ca_cert_path,
+        &next.client_cert_path,
+        &next.client_key_path,
+    );
+    for (from, to) in [
+        (&next.server_cert_path, &fx.server_cert_path),
+        (&next.server_key_path, &fx.server_key_path),
+        (&next.ca_cert_path, &fx.ca_cert_path),
+    ] {
+        std::fs::copy(from, to).unwrap();
+    }
+
+    let r: serde_json::Value = serde_json::from_str(&srv.admin("reload", "{}")).unwrap();
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(r["result"]["outcome"], "applied", "{r}");
+    assert_eq!(r["result"]["items"][0]["item"], "tls_certificates");
+    assert_eq!(r["result"]["items"][0]["outcome"], "reloaded");
+    assert_eq!(
+        metric(
+            &srv,
+            "weir_config_reloads_total{trigger=\"admin\",outcome=\"ok\"}"
+        ),
+        1
+    );
+    assert!(
+        acked(addr, Arc::clone(&new_client)),
+        "the rotated identity is served"
+    );
+
+    std::fs::write(&fx.server_key_path, "not a key").unwrap();
+    let r: serde_json::Value = serde_json::from_str(&srv.admin("reload", "{}")).unwrap();
+    assert_eq!(
+        r["ok"], true,
+        "a failed reload is ok:true with outcome failed: {r}"
+    );
+    assert_eq!(r["result"]["outcome"], "failed");
+    assert_eq!(r["result"]["items"][0]["outcome"], "failed");
+    assert!(
+        r["result"]["items"][0]["detail"].is_string(),
+        "admin detail says why"
+    );
+    assert_eq!(
+        metric(
+            &srv,
+            "weir_config_reloads_total{trigger=\"admin\",outcome=\"failed\"}"
+        ),
+        1
+    );
+    assert!(
+        acked(addr, new_client),
+        "the certificates in force still handshake"
+    );
+    srv.shutdown();
+}
+
+/// Lame duck on the TCP side (Foundations §7): within 200 ms of SIGTERM the
+/// TCP listener refuses new connections, while the process is still alive
+/// (its drain is spending the budget on a black-holed sink), and the exit is
+/// bounded by shutdown_timeout + budget + 6 s. The 200 ms half is pinned
+/// in-process by Task 4.7's `tcp_lame_duck_closes_the_listener_before_the_connection_drain`.
+#[test]
+fn sigterm_closes_the_tcp_listener_at_once() {
+    let fx = TlsFixture::generate("tcp_lame_duck");
+    let hole = weir_testkit::RecordingSink::start_hanging();
+    let mut srv = weir_server!("tcp_lame_duck")
+        .tls(&fx)
+        .extra_config(
+            "sink_type = \"http\"\nsink_timeout_secs = 300\nwab_segment_max_bytes = 4096\n\
+             drain_shutdown_budget_secs = 4",
+        )
+        .env("WEIR_SINK_URL", hole.url())
+        .start();
+    let addr = srv.tcp_addr();
+    // A sealed segment for the drain to hang on.
+    let cfg = client_config_with_cert(&fx.ca_cert_path, &fx.client_cert_path, &fx.client_key_path);
+    let mut stream = tls_connect(addr, cfg).expect("handshake");
+    for i in 0..8 {
+        let mut p = format!("tcp-ld-{i}-").into_bytes();
+        p.resize(2048, b't');
+        assert_eq!(push_one(&mut stream, &p).unwrap(), MessageType::Ack);
+    }
+    drop(stream);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while hole.connections() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the drain never reached the sink"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let t0 = Instant::now();
+    srv.signal(libc::SIGTERM);
+    loop {
+        match TcpStream::connect_timeout(&addr, Duration::from_millis(50)) {
+            Err(_) => break,
+            Ok(_) => assert!(
+                t0.elapsed() < Duration::from_millis(200),
+                "the TCP listener must close within 200 ms of SIGTERM"
+            ),
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        srv.wait_for_exit(Duration::from_millis(100)).is_none(),
+        "the process must still be in its drain budget"
+    );
+    let status = srv
+        .wait_for_exit(Duration::from_secs(3 + 4 + 6))
+        .expect("shutdown not bounded");
+    assert!(status.success());
+}

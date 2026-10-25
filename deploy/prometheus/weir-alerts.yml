@@ -49,17 +49,23 @@ groups:
         for: 0m
         labels: { severity: critical }
         annotations:
-          summary: "weir ack timed out on {{ $labels.instance }} — flusher may be wedged"
-          description: "A record's ack never fired within the timeout without a panic — the classic wedged-flusher signature (e.g. a stuck fsync). Check fsync latency and the flusher threads."
+          summary: "weir ack timed out on {{ $labels.instance }} — check the drain hand-off before storage"
+          description: "A record's ack did not resolve within the timeout and the producer got ACK_TIMEOUT. Often this is delivery, not storage: with the drain channel full, flushers wait to hand sealed segments to the drain before the acks behind them resolve, so durable records are nacked. Check weir_wab_handoff_blocked_seconds and weir_drain_channel_depth first; only if both are idle, check fsync latency and the flusher threads."
           runbook: "docs/monitoring.md#weiracktimeout"
 
+      # On the BYTES in quarantine/, not the per-process counter: a restart
+      # resets weir_recovery_segments_quarantined_total and the counter rule
+      # went quiet while the quarantined files were still there. The gauge
+      # survives restarts and covers every quarantine path (recovery and the
+      # drain). Like WeirAttestVerifyFailed, it keeps firing until the incident
+      # is resolved, not for a window after it began.
       - alert: WeirSegmentQuarantined
-        expr: increase(weir_recovery_segments_quarantined_total{job=~"weir"}[10m]) > 0
+        expr: weir_quarantine_bytes_on_disk{job=~"weir"} > 0
         for: 0m
         labels: { severity: critical }
         annotations:
-          summary: "weir quarantined a corrupt segment on {{ $labels.instance }}"
-          description: "Crash recovery found a segment with bad magic, an unknown format version, or a CRC mismatch and moved it to the quarantine directory. Data-integrity event — inspect the quarantined file."
+          summary: "weir holds quarantined segment data on {{ $labels.instance }}"
+          description: "<wab_dir>/quarantine/ is not empty: recovery or the drain moved a segment there (or, for mid-file corruption, a copy of it) because its bytes are bad (a header it cannot parse, in recovery a newer format too; a CRC mismatch; a truncated footer), a media-class read error outlasted three strand cycles and 10 minutes, or its .confirmed sidecar failed verification. A data-integrity event. The byte gauge survives restarts, so this keeps firing until quarantine/ is empty: `weir-ctl quarantine list` and `inspect`, `requeue --yes` (it deletes each fully recovered segment), then move out what it leaves, desynced or header-corrupt segments and the .wab.confirmed sidecars it ignores (see docs/operations/quarantine-recovery.md)."
           runbook: "docs/monitoring.md#weirsegmentquarantined"
 
       - alert: WeirFsyncLatencyHigh
@@ -82,6 +88,64 @@ groups:
           summary: "weir fsync p99.9 CRITICAL on {{ $labels.instance }} ({{ $value | humanizeDuration }})"
           description: "fsync latency is an order of magnitude above any healthy local SSD. Durable-tier throughput is collapsing. Likely a failing disk or saturated/remote storage."
           runbook: "docs/monitoring.md#weirfsynclatency"
+
+      - alert: WeirWabDirUnlocked
+        # weir_wab_dir_lock_held is 1 while the daemon holds the exclusive flock
+        # on <wab_dir>/.weir.lock. Its steady 0 is `wab_dir_lock = "best-effort"`
+        # on a filesystem that cannot lock: no guard against a second daemon on
+        # the same wab_dir, whose recovery would turn this one's Durable acks
+        # into false acks. A warning, not a page: nothing has gone wrong yet,
+        # and the setting is an operator's choice.
+        #
+        # The gauge's other 0 -- ownership proven lost to another instance --
+        # lasts only until the exit with status 3 that follows it at once, and
+        # surfaces as WeirInstanceDown; `for: 5m` keeps that instant out of
+        # this rule. The gauge is set before the metrics endpoint binds, so a
+        # daemon that holds the lock never scrapes as 0.
+        expr: weir_wab_dir_lock_held{job=~"weir"} == 0
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "weir on {{ $labels.instance }} is running without its wab_dir lock"
+          description: "This daemon does not hold the exclusive lock on <wab_dir>/.weir.lock (wab_dir_lock = \"best-effort\" on a filesystem that cannot flock). Nothing stops a second weir-server from recovering its live segments, which would turn its Durable acks into false acks. Move wab_dir to a local filesystem that supports flock, or guarantee a single daemon by other means."
+          runbook: "docs/monitoring.md#weirwabdirunlocked"
+
+  # ── Readiness and conditions — the daemon's own verdicts ────────────────────
+  - name: weir-health
+    rules:
+      # weir_ready is /readyz as a gauge (1 = ready). It is 0 by design while
+      # starting and while shutting down, so those phases are excluded: a long
+      # recovery shows on weir_startup_phase, and a stop is not an incident.
+      # weir_startup_phase is one-hot with every phase pre-created, so the
+      # inactive phases are PRESENT at 0: the `== 1` inside the `unless` is
+      # load-bearing, without it any instance with the family would be excluded.
+      - alert: WeirNotReady
+        expr: |
+          weir_ready{job=~"weir"} == 0
+          unless on(instance, job)
+          (weir_startup_phase{job=~"weir", phase=~"initializing|recovering|handoff|binding|shutting_down"} == 1)
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "weir on {{ $labels.instance }} is serving but NOT READY for new ingest"
+          description: "/readyz has answered 503 for 5 minutes outside startup and shutdown: new connections are refused or pushes nack. The failing check is in `curl -s <host>:9185/readyz?verbose` or `weir-ctl status`: wab_cap_rejecting (delivery is behind and the WAB hit wab_max_bytes), no_live_shard or listener_down (restart after capturing the logs)."
+          runbook: "docs/monitoring.md#weirnotready"
+
+      # One alert per active critical condition code. The three codes excluded
+      # here have their own rules (WeirDrainStopped, WeirDrainBlocked,
+      # WeirFsyncFailure), so they would otherwise page twice. `max by` drops
+      # the series' own severity label before the rule sets it.
+      - alert: WeirConditionCritical
+        expr: |
+          max by (job, instance, code) (
+            weir_condition_active{job=~"weir", severity="critical", code!~"drain_stopped|drain_blocked_dead_letter_full|fsync_failures_recent"}
+          ) == 1
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "weir on {{ $labels.instance }} reports critical condition {{ $labels.code }}"
+          description: "The daemon's own condition evaluator reports {{ $labels.code }}, a critical condition with no dedicated rule in this file. `weir-ctl status` on the host shows it with its evidence, and the admin view adds the reason. Runbook for this code: docs/monitoring.md#cond-{{ $labels.code }}."
+          runbook: "docs/monitoring.md#weirconditioncritical"
 
   # ── Drain / dead-letter ─────────────────────────────────────────────────────
   - name: weir-drain
@@ -185,6 +249,48 @@ groups:
           description: "The drain exhausted sink_max_retries of TRANSIENT sink failures on a segment and left it on disk. The data is durable (no loss), but delivery is paused. Fix the sink (correlate with WeirSinkDown); the drain re-drains stranded segments automatically when the sink recovers (watch weir_drain_segments_resumed_total), or on restart."
           runbook: "docs/monitoring.md#weirsegmentstranded"
 
+      - alert: WeirDrainLocalIoStrands
+        # Since the safety floor, a segment the drain set aside because it could
+        # not READ the sealed segment, or could not WRITE its sink-rejected
+        # records into dead_letter/, counts here and no longer in
+        # weir_drain_segments_stranded_total -- so WeirSegmentStranded is blind
+        # to it. The family is pre-initialised (cause="read"/"write" at 0 from
+        # boot, metrics/mod.rs), so `increase()` reads a real 0 when healthy
+        # rather than an absent series. The `cause` label is kept: it names
+        # which half of the local device is in trouble.
+        #
+        # A warning, not a page: the data is on disk, the drain retries it on
+        # the idle rescan, and nothing is false-acked. A read failure that
+        # persists escalates on its own -- a permission-class error parks the
+        # segment (WeirSegmentParked) and a media-class one quarantines it
+        # (WeirSegmentQuarantined), each with its own alert.
+        expr: increase(weir_drain_local_io_strands_total{job=~"weir"}[15m]) > 0
+        for: 0m
+        labels: { severity: warning }
+        annotations:
+          summary: "weir drain stranded a segment on local I/O ({{ $labels.cause }}) on {{ $labels.instance }}"
+          description: "The drain exhausted sink_max_retries on a LOCAL failure, not a sink failure: cause=read means reading a sealed WAB segment failed, cause=write means writing sink-rejected records into dead_letter/ failed. The data is durable and the drain retries it automatically, but delivery of that segment is paused. Investigate the WAB and dead-letter device (I/O errors, ENOSPC, permissions, descriptor exhaustion), not the sink."
+          runbook: "docs/monitoring.md#weirdrainlocaliostrands"
+
+      - alert: WeirSegmentParked
+        # weir_drain_segments_parked is a GAUGE of segments the drain has set
+        # aside for the rest of this run: acked, durable, and NOT delivered
+        # until the daemon restarts (nothing re-queues a parked segment at
+        # runtime). Reasons: local_read_failed (a permission-class read error
+        # held for 3 strand cycles and 10 minutes), unsupported_version (a
+        # segment from a newer weir), drain_panic (the drain panicked twice on
+        # it). A gauge, so `> 0` on the raw value, not `increase()` -- it holds
+        # for as long as the segment stays parked, which is the incident.
+        # `for: 5m` only damps a scrape race at park time; the gauge does not
+        # fall back to 0 until a restart.
+        expr: weir_drain_segments_parked{job=~"weir"} > 0
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "weir parked {{ $value }} segment(s) on {{ $labels.instance }} ({{ $labels.reason }}) — acked data not being delivered"
+          description: "The drain has parked one or more sealed segments: they stay on disk untouched and are not delivered until the daemon restarts. reason=local_read_failed: fix the segment file's permissions or type. reason=unsupported_version: the segment was written by a newer weir; upgrade this binary. reason=drain_panic: the drain panicked twice delivering it; fix the sink or the record it trips on. Then restart the daemon, which replays parked segments from their first record. The ERROR logged at park time names the path."
+          runbook: "docs/monitoring.md#weirsegmentparked"
+
       - alert: WeirDeadLettered
         expr: increase(weir_sink_commit_records_total{job=~"weir", outcome="dead_lettered"}[15m]) > 0
         for: 0m
@@ -193,6 +299,31 @@ groups:
           summary: "weir is dead-lettering records on {{ $labels.instance }}"
           description: "The sink permanently rejected records (e.g. a 4xx). They are written to the dead-letter directory for manual handling, not retried. Inspect the dead-letter files + the sink's rejection reason."
           runbook: "docs/monitoring.md#weirdeadlettered"
+
+      # A pause is in-memory and deliberate, so its first hour is not an
+      # incident. Past that it is usually a forgotten `weir-ctl drain pause`,
+      # and with wab_max_bytes = 0 the WAB grows without bound meanwhile.
+      - alert: WeirDrainPausedLong
+        expr: weir_drain_paused{job=~"weir"} == 1
+        for: 1h
+        labels: { severity: warning }
+        annotations:
+          summary: "weir delivery on {{ $labels.instance }} has been paused for over an hour"
+          description: "An operator paused the drain (`weir-ctl drain pause`) and it is still paused. Ingest keeps buffering into the WAB, which grows until wab_max_bytes makes pushes nack, or without bound if wab_max_bytes is 0. Resume with `weir-ctl drain resume`; a restart also resumes delivery."
+          runbook: "docs/monitoring.md#weirdrainpausedlong"
+
+      # [TUNE] to your delivery SLO. The gauge is an UPPER bound: it is the age
+      # of the oldest unconfirmed sealed segment, from its header's creation
+      # time, not of its newest record. The delivery_lagging condition fires
+      # at 900 s; this pages at four times that.
+      - alert: WeirOldestUndeliveredAge
+        expr: weir_wab_oldest_undelivered_age_seconds{job=~"weir"} > 3600
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "weir on {{ $labels.instance }} holds undelivered data older than an hour"
+          description: "The oldest sealed segment the sink has not confirmed was created over an hour ago (an upper bound on the oldest record's age). Delivery is behind or stuck: `weir-ctl status` shows which (delivery_stalled, sink_down, sink_failing, drain_paused, segments_stranded, or delivery_lagging with commits succeeding)."
+          runbook: "docs/monitoring.md#weiroldestundeliveredage"
 
   # ── Ingest / backpressure ───────────────────────────────────────────────────
   - name: weir-ingest
@@ -213,8 +344,24 @@ groups:
         labels: { severity: warning }
         annotations:
           summary: "weir queue depth sustained high on {{ $labels.instance }} ({{ $value }})"
-          description: "The work queue is backing up — the WAB flushers can't keep pace with ingest (usually storage pressure). Correlate with fsync latency. Producers see backpressure (slower acks)."
+          description: "The work queue is backing up and producers see slower acks. Check weir_wab_handoff_blocked_seconds and weir_drain_channel_depth first: a full drain channel stalls the flushers, and the queue backs up behind them. If both are idle, the WAB flushers cannot keep pace with ingest (usually storage pressure); correlate with fsync latency."
           runbook: "docs/monitoring.md#weirqueuesaturation"
+
+      # weir_wab_handoff_blocked_seconds{shard} is how long that shard's flusher
+      # has been waiting to hand a sealed segment to the drain (0 when it is
+      # not). The acks of the batch behind it wait too, so producers see
+      # ACK_TIMEOUT nacks for records that are already durable. max_over_time
+      # bridges the gaps between hand-offs: under steady backpressure each
+      # wait ends when the drain takes one segment, and the next begins at the
+      # next rotation. A single short block (< 2 m of scrapes) never fires.
+      - alert: WeirDrainBackpressure
+        expr: max by (job, instance) (max_over_time(weir_wab_handoff_blocked_seconds{job=~"weir"}[2m])) > 5
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "weir on {{ $labels.instance }}: delivery is stalling ingest (drain hand-off blocked)"
+          description: "WAB flushers keep waiting to hand sealed segments to the drain because its channel is full. Acks wait behind the hand-off, so producers see ACK_TIMEOUT nacks of records that ARE durable. This is a delivery problem, not a storage one: check sink commit latency and the sink and drain conditions in `weir-ctl status`."
+          runbook: "docs/monitoring.md#weirdrainbackpressure"
 
   # ── Security / connection ───────────────────────────────────────────────────
   - name: weir-security
@@ -237,6 +384,18 @@ groups:
           summary: "weir TLS handshake failures on {{ $labels.instance }}"
           description: "(tls feature) Repeated mutual-TLS handshake failures — client-cert expiry/rotation, a CA mismatch, or a probe hitting the TCP port. Check the client certificates and the CA bundle."
           runbook: "docs/monitoring.md#weirtlshandshakefailures"
+
+      # Fires only when the admin socket is ENABLED and could not be bound: the
+      # admin_unavailable condition. weir_admin_socket_up alone is also 0 when
+      # admin_socket_enabled = false, which is a choice, not an incident.
+      - alert: WeirAdminUnavailable
+        expr: max by (job, instance) (weir_condition_active{job=~"weir", code="admin_unavailable"}) == 1
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "weir admin socket is unavailable on {{ $labels.instance }}"
+          description: "admin_socket_enabled is on but the daemon could not bind the admin socket (most often a parent directory that is group- or world-writable, or owned by another user). weir-ctl drain and weir-ctl reload do not work until it is fixed; kill -HUP still reloads TLS, and weir-ctl status falls back to HTTP and disk. The reason code is on /status under admin.reason_code."
+          runbook: "docs/monitoring.md#weiradminunavailable"
 
   # ── Integrity / tamper evidence ─────────────────────────────────────────────
   - name: weir-integrity

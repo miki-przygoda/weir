@@ -46,6 +46,77 @@ The socket layer is async (tokio). Everything downstream runs on `std::thread` w
 
 Under sustained load, if every active connection is simultaneously blocked in that `spawn_blocking` fallback waiting for a queue slot, all blocking threads fill up and new connections stall at the socket layer. `max_connections` must therefore be ≤ the tokio blocking thread pool limit (default: 512).
 
+### Startup order
+
+Ownership first, then every refuse-to-start check that can run early, then the
+health surface, and only then the WAB (`src/main.rs`; Foundations §6). Each
+step publishes a phase in `weir_startup_phase{phase}`:
+
+```
+umask 0o077 + SIGHUP ignored
+→ Config::load → tracing (colour only on a terminal; a bad log_level WARNs)
+→ "config source", "weir starting"
+                       carries version, wire_version and the effective config
+                       as a ConfigView: no secrets, sink URLs reduced to
+                       scheme://host:port                (src/status/config_view.rs)
+→ wab_dir lock         flock(LOCK_EX|LOCK_NB) on <wab_dir>/.weir.lock   (src/wab/lock.rs)
+→ Metrics::new → lock-integrity thread (1 s, from here to exit)
+→ initializing         StatusBoard                        (src/status/board.rs)
+→ preflight            socket_path format + length, non-socket refusal, connect-only
+                       liveness probe (never unlinks), metrics test-bind,
+                       [tls + tcp_bind: TLS load + TCP test-bind]       (src/preflight.rs)
+→ queue, drain channel, DrainControl (attached), Lifecycle   (src/lifecycle.rs)
+→ tokio runtime        reload loop + SIGHUP handler, SIGTERM/SIGINT task,
+                       metrics bind (answers from here), [TLS load], [admin socket]
+→ recovering           wab::recover on the main thread (HTTP keeps answering)
+→ handoff              wab::scan_replay (in memory, no sends), first WAB size +
+                       wab_max_bytes scan; a failed scan with a cap set starts
+                       rejecting                          (src/status/poll.rs)
+→ pipeline             flushers, workers, drain (replay list = its backlog), poll tasks,
+                       wait ≤ 10 s for every shard and worker to settle; routing
+                       skips a shard that has not settled
+→ binding              socket::bind_all: TCP, then the Unix socket (bind_hardened:
+                       probe, unlink only a stale socket, bind); all listeners
+                       before any accept loop
+→ serving              accept loops start; "weir serving"
+→ shutting_down        on SIGTERM/SIGINT; see "Shutdown order"
+```
+
+Any refusal up to and including preflight exits 1 before recovery has touched a
+segment. The lock comes before the other checks so that a duplicate on the same
+`wab_dir` reports `locked by` rather than a port or socket conflict. Preflight
+test-binds and releases; the real binds stay late and authoritative, so they
+can still fail, but only on a race (something binding in between). Two late
+failures remain outside preflight: a scan error in `wab::scan_replay` and a
+`bind_all` error other than a live socket; both exit before any producer is
+served. A slow or unreachable sink no longer delays the producer socket: the
+replay backlog is handed to the drain in memory and alternates with live
+segments (they share no connection, so per-connection order is unchanged). The
+producer socket still binds only after recovery has sealed the open segments,
+which keeps the segment counter safe. A signal before `serving` lets the
+current step finish (recovery is never interrupted) and skips the producer
+listeners.
+
+### Shutdown order
+
+```
+T0 first SIGTERM/SIGINT   phase shutting_down; drain absorb mode; flushers' flag;
+                          lame duck: socket unlinked (inode-checked), TCP listener closed
+   connection drain       ≤ shutdown_timeout_secs (aborted at once on a second signal)
+T1 ingest closed          queue-depth task stopped; workers joined; flushers joined
+                          (each seals, fsyncs, hands off; ≤ 1 s if the drain is stuck)
+T2 drain budget           drain_shutdown_budget_secs, then the in-flight segment is
+                          abandoned (no .confirmed); main waits ≤ budget + 2 s
+T3 exit                   one summary line (no I/O), runtime stops, exit 0
+second signal (any time)  forced: connection drains abort, the drain deadline is now;
+                          the worker and flusher joins still run
+```
+
+`/metrics` answers until T3. If the drain is inside a sink call that never
+yields, the daemon exits 0 at budget + 2 s with the segment unconfirmed; it
+replays on the next start. The kernel releases the `wab_dir` lock at exit,
+after everything above.
+
 ---
 
 ## Component responsibilities
@@ -59,21 +130,23 @@ Three-layer configuration: `CLI > env > TOML file > defaults`.
 - `validate_path(field, path)` — full four-check sequence (absolute, no `..`, no null bytes, `canonicalize()` re-validated against same checks). Used for `wab_dir`. Returns `ConfigError::PathInvalid` with field name on failure.
 - `validate_path_format(field, path)` — format-only check (no `canonicalize()`). Used for `socket_path`, which does not exist until bind time.
 - `ConfigError` — manual `impl std::error::Error`, no `thiserror`. Variants: `InvalidValue`, `ParseError`, `IoError`, `PathInvalid`.
-- Unknown TOML keys produce a `warn!` log; a missing config file is treated as an empty layer.
+- Unknown TOML keys produce a `warn!` log; a missing config file is treated as an empty layer (not an error) but logs a WARN naming the path, escalated when the resolved sink is `noop`. The startup log names the config source.
 - See `deploy/docker/weir.toml.example` for all fields, defaults, valid ranges, and `WEIR_*` env-var equivalents.
 
 ### Socket layer (`src/socket/`) — Unix only
 
 The entire socket module is gated `#[cfg(unix)]`. Unix domain sockets do not exist on Windows; `weir-core` remains cross-platform.
 
-- Binds a Unix socket with TOCTOU-hardened bind sequence (S_ISSOCK check before removing stale socket, then a tightened umask of `0o177` so `bind(2)` creates the socket inode at mode `0o600` directly — no post-bind `chmod`, which was the exact TOCTOU window the design removed). See [security/socket-bind.md](security/socket-bind.md).
+- Binds a Unix socket with TOCTOU-hardened bind sequence (S_ISSOCK check, then a non-blocking connect-only liveness probe, before removing a stale socket — a socket someone is listening on, or one the probe cannot classify, refuses startup instead; then a tightened umask of `0o177` so `bind(2)` creates the socket inode at mode `0o600` directly — no post-bind `chmod`, which was the exact TOCTOU window the design removed). `bind_hardened` returns a `BoundSocket` carrying the bound inode's identity, and shutdown unlinks the path only if it still names that socket. See [security/socket-bind.md](security/socket-bind.md).
 - Accepts connections up to `max_connections` (Semaphore-gated; over-cap streams are dropped immediately).
 - Assigns each accepted connection a `shard_id` round-robin (`accept_counter % shard_count`). Every WorkUnit pushed on that connection inherits the same shard_id, so a connection is pinned to one WAB flusher for its lifetime — no per-record routing decision on the hot path.
 - `handle_connection` parses one frame at a time in a loop. Validation order is fixed and security-critical — see [wire_protocol.md](wire_protocol.md).
 - **A second transport lives in the same module**: `tcp.rs` + `tls.rs` (behind the `tls` feature) mirror the Unix accept loop — same global connection-limit semaphore, same round-robin shard assignment, and the same `handle_connection` — so everything below the accept loop is transport-agnostic. Operator setup is in [operations/tcp-mtls.md](operations/tcp-mtls.md). The `#[cfg(unix)]` gate above still applies: the module as a whole is Unix-only, TCP included.
 - `QueueSender::push_timeout` is used with a 5-second deadline so a dead worker pool returns `InternalError` to the client instead of holding the semaphore slot open indefinitely.
 - Each accepted connection lives in a `JoinSet`; graceful shutdown drains it within `shutdown_timeout_secs` before aborting.
-- SIGTERM/Ctrl-C handling and `shutdown_timeout_secs` are wired in `src/main.rs`; the socket layer receives a `CancellationToken` and drains the `JoinSet` before returning.
+- SIGTERM/Ctrl-C handling and `shutdown_timeout_secs` are wired in `src/main.rs`; the socket layer follows a `watch<ShutdownLevel>` from `src/lifecycle.rs`: on the first signal it unlinks its socket and closes the listener at once, then drains the `JoinSet` for at most `shutdown_timeout_secs`, and aborts it on a second signal.
+- SIGHUP is ignored (`SIG_IGN`) from the top of `main` and handled once the runtime exists (right after the lock and preflight, before WAB recovery), through the one reload path in `src/reload.rs`: a TLS reload when TLS is loaded, otherwise a logged no-op. Both count in `weir_config_reloads_total{trigger,outcome}`. SIGHUP never terminates the daemon.
+- Each push checks one `AtomicBool`, `wab_ownership_lost`, before the WAB-cap check; once the lock-integrity thread has proven another daemon owns the `wab_dir`, pushes are NACKed `InternalError` and the process exits 3.
 
 ### Work queue (`src/queue.rs`)
 
@@ -99,6 +172,7 @@ Crash-safe write-ahead buffer. See [wab_format.md](wab_format.md) for the binary
 - One flusher thread per shard; each holds an active `WabSegment`.
 - Two durability tiers. `Durable` upholds "ack ⇒ durable": it group-fdatasyncs at the batch boundary before acking every record in the batch. `Buffered` trades durability for latency — it acks after the in-memory write, before any fsync, so it does **not** uphold "ack ⇒ durable" (a Buffered ack survives a process crash but not power loss). (Historically there was a third tier: `Sync` fsynced once per record while `Batched` fsynced once per batch, until both moved onto the same batch-boundary group fsync and the distinction between them stopped existing — one fsync at the end of the batch already covered every record written during it, so a single-producer serial workload saw no difference, and under concurrent producers `Sync` amortised into the group fsync just like `Batched`. weir 2.0 removed the now-redundant tier: wire byte `0x02` is retired and permanently reserved, still decodes to `Durable` for old producers, and is never emitted by the encoder. See [wire_protocol.md → Durability tiers](wire_protocol.md#durability-tiers).)
 - Segments rotate when `bytes_written >= SEGMENT_MAX_BYTES` (256 MiB). Sealed segments are forwarded to the drain channel.
+- Ownership: `src/wab/lock.rs` takes an exclusive `flock` on `<wab_dir>/.weir.lock` before anything reads the WAB, keeps the fd in a process-wide static until exit (never released explicitly, never unlinked, never re-opened), and is re-checked once a second by its own thread from right after acquisition (so through recovery too): a deleted lock file is re-created (`O_EXCL`) and re-locked, and a replacement nobody holds is re-locked unless its record names another daemon; one another instance holds, or one carrying another daemon's record, is proof of lost ownership, and the daemon exits 3 without sealing. `wab_dir_lock = "best-effort"` only covers a filesystem that cannot lock; then orphan deletion is off. File format: [wab_format.md](wab_format.md#the-wab_dir-lock-file).
 - Path validation (`validate_path`) is consolidated in `src/config/mod.rs` and used for `wab_dir` and `socket_path` at config-load time. The WAB module previously carried a local copy for belt-and-suspenders checking at flusher-spawn time; that duplicate has been removed in favour of the single source of truth.
 
 ### Sink (`src/sink/`)
@@ -127,40 +201,60 @@ load-suite scenario and is observable in production via
 
 ### Drain (`src/drain/`)
 
-Reads sealed segments via `SegmentReader`, forwards records to the sink in sub-batches respecting `Sink::max_batch_size()`, writes `.confirmed` sidecars, and deletes sealed segments after confirmation.
+Reads sealed segments via `SegmentReader`, forwards records to the sink in sub-batches respecting `Sink::max_batch_size()`, writes `.confirmed` sidecars, and deletes sealed segments after confirmation. One OS thread, with a single-threaded tokio runtime for the sink calls.
 
 **State machine** — three explicit states, one active at a time:
 
 ```
 Draining
+  │  every health_poll_interval: retry outstanding dispositions (never delivers)
+  │      → probe sink + rescan for stranded segments → refresh DL/quarantine gauges
+  │  next path (pending first, then the channel) → SegmentLedger::admit → process
+  │  Ok → write .confirmed (atomic), delete segment, stay Draining
+  │  corrupt bytes → quarantine (after delivering the readable prefix)
+  │  newer format / persistent access error / 2nd panic on it → park, stay Draining
   │  Err(Transient) → RetryingTransient
-  │  Err(Permanent) AND dead-letter cap exceeded → BlockedDeadLetterFull
-  │  Ok → write .confirmed, delete segment, stay Draining
+  │  Err(Permanent) AND dead-letter write would exceed the cap → BlockedDeadLetterFull
   ▼
 RetryingTransient
+  │  retries_left == 0 → STRAND at once (no final wait): not_before = now + next delay,
+  │      cursor kept; Sink cause counts as a sink strand, local cause does not → Draining
+  │  else wait the backoff (base × 2ⁿ, or Retry-After, capped at 300 s), retry,
+  │      resuming past the records already durably processed
   │  retry succeeds → Draining
-  │  MAX_RETRIES (3) exhausted → leave segment on disk, log, Draining
-  │  (exponential backoff: base × 2ⁿ per attempt)
   ▼
 BlockedDeadLetterFull
-  │  wake every dead_letter_check_interval; rescan dead_letter/ dir
-  │  bytes < cap → unblock; retry the SAME segment via RetryingTransient,
-  │      RESUMING past the sub-batches already durably processed (F05)
-  │  bytes ≥ cap → stay blocked
-  │  bytes ≥ cap AND channel disconnect → exit without confirming (crash recovery replays)
+  │  wake every dead_letter_check_interval; rescan dead_letter/ (re-created if deleted)
+  │  the blocked write now fits (would_exceed_cap(needed) is false) → RetryingTransient
+  │      on the SAME segment: write the carried rejects first, then resume past them
+  │  still does not fit → stay blocked
+  │  still does not fit AND channel disconnected → exit without confirming (replayed on restart)
 ```
+
+**The ledger** (`src/drain/ledger.rs`). Drain-owned, in-memory bookkeeping keyed by segment path, owned by the panic supervisor and lent to each drain incarnation, so it survives a respawn but not a restart:
+
+- **One admission filter.** A path reaches the drain from the crossbeam channel and from the in-memory `pending` queue, and the channel is not enumerable, so the same path can be in both. `admit` runs on every path from either source and drops it while it is `confirm_pending`, `quarantine_pending`, parked, or inside its `not_before` cool-down. The stranded-segment rescan applies the same predicate (`excludes`) *before* its `.confirmed` check, so a ledger-owned segment is never re-queued or quarantined by the scan.
+- **Resume cursor.** A transient or blocked attempt records how many records were durably processed, pinned to the file's `(dev, ino)`. The cursor survives the strand: when the rescan re-admits the segment in the same run, it resumes past the committed prefix (F05 across strands). A cursor whose `(dev, ino)` no longer matches is discarded, both at admission and at the start of every attempt (the retry and the unblock carry `processed` in their state and skip admission), so a replaced file starts at record 0; confirm, quarantine and park drop it. Nothing is persisted, so a restart replays from record 0.
+- **Dispositions, retried without re-delivery.** A failed sidecar write or delete puts a delivered segment in `confirm_pending`; a failed move puts it in `quarantine_pending`. Each health poll retries only that step (`ENOENT` counts as done).
+- **Dead-letter carry.** When the sink committed a sub-batch but its rejected records could not be dead-lettered (the cap blocked, or the write failed with `LocalWrite`), the rejects are carried and written first on the next attempt, which then skips the sub-batch instead of re-committing it. All carries together are capped at 64 MiB (`DL_CARRY_MAX_BYTES`); past that the segment falls back to one re-commit, with a WARN.
+- **Parking.** `unsupported_version` (a header from a newer weir), `local_read_failed` (an `Access`-class read error past the limit) and `drain_panic` (two panics while the segment was in flight, `DRAIN_PANIC_PARK_LIMIT`). A parked segment stays in place, is not retried this run, and replays on the next start.
+
+**Read errors by class.** `InvalidData` / `UnexpectedEof` are corruption: a corrupt header quarantines on the first attempt, a corrupt record quarantines after the readable prefix is delivered, a short or mismatched footer quarantines after delivery. Anything else is a local read error, a transient whose class (`ledger::classify`) decides persistence: `Process` (`EMFILE`, `ENFILE`, `ENOMEM`, `ENOBUFS`, `EAGAIN`, `EINTR`) never escalates; `Access` (`EACCES`, `EPERM`, `EISDIR`, `ENOTDIR`, `ELOOP`) parks and `Media` (everything else) quarantines once the failures reach `(max_retries + 1) × LOCAL_READ_STRAND_LIMIT` (3 strand cycles) AND the segment has been failing for `LOCAL_READ_ESCALATION_MIN_AGE` (10 minutes) since its first local read failure in the run. Both, so a device blip that burns through the cycles in a minute does not set a good segment aside; until then it keeps cycling like a `Process` error. Local strands count in `weir_drain_local_io_strands_total{cause}`, not `weir_drain_segments_stranded_total`, and do not mark the sink down.
+
+**Liveness.** `DrainHeartbeat` is bumped at the loop head, inside the long waits, after every sink commit and every `READ_HEARTBEAT_EVERY` (1024) records read. A `BusyGuard` records which blocking operation is in flight and since when (`sink_commit`, `sink_probe`, `segment_read`, `local_fsync`, `dead_letter_write`, `quarantine_move`, `dir_scan`; exported as `weir_drain_busy_seconds{kind}`). The poll task's verdict on a frozen heartbeat: `Stopped` if `drain_state` says so; a sink call within `commit_timeout + 15 s` is a slow sink (INFO); a local operation of any duration is slow I/O (WARN, no restart advice); otherwise `Wedged`.
 
 - **At-least-once delivery**: sinks must be idempotent. If the daemon crashes after a partial commit but before writing `.confirmed`, the full segment is replayed on restart.
 - **Payload clone before commit**: payloads are cloned before `Sink::commit()` so permanent errors can dead-letter records without recovering them from the error value.
-- **Segment confirmed path**: `.wab.sealed` suffix stripped, `.wab.confirmed` appended. Confirmed sidecar format: see [wab_format.md](wab_format.md).
+- **Segment confirmed path**: `.wab.sealed` suffix stripped, `.wab.confirmed` appended, written through a fsynced `.wab.confirmed.tmp` and a rename, then a directory fsync. An orphan (a sealed segment beside a valid sidecar) is deleted by the startup scan and the rescan when the `wab_dir` lock is held. Format and procedure: see [wab_format.md](wab_format.md#post-drain-steady-state).
 - **`dead_letter_full_total`** increments once per entry into `BlockedDeadLetterFull`, not per wake cycle — tracks distinct blocking events, not polling iterations.
+- **Respawn budget**: a drain panic is caught and the drain respawned, up to `MAX_DRAIN_RESPAWNS` (10) panics per process; the 10th panic stops delivery instead of respawning. Parking a segment after its second panic means one poison segment costs two panics of the budget; five distinct ones still exhaust it and stop delivery.
 
 ### Dead-letter writer (`src/drain/dead_letter.rs`)
 
 - Permanently rejected records are written to `<wab_dir>/dead_letter/` as sealed WAB segments (shard ID `0xFFFF`), so `SegmentReader` can read them without a separate parser.
 - Files named `dl_NNNNNNNN.wab.sealed`; counter increments per file, persisted across restarts by scanning on open.
-- Running `total_bytes` updated after every write; `rescan()` called on each blocked-state wake to detect files deleted by the operator outside the daemon.
-- `would_exceed_cap(additional_bytes, cap)` is checked before every write; if it would exceed, the drain enters `BlockedDeadLetterFull` instead.
+- Running `total_bytes` updated after every write; `rescan()` called on each blocked-state wake to detect files deleted by the operator outside the daemon. A `dead_letter/` directory deleted outright is re-created (total reset to 0, counter kept), by `rescan()` and by a write that meets `ENOENT`. `wab_dir` is fsynced before any record is written into a (re-)created `dead_letter/`, so a dead-lettered record, whose source segment is then confirmed and deleted, never sits in a directory whose own entry a power loss could undo.
+- `would_exceed_cap(additional_bytes, cap)` is checked before every write; if it would exceed, the drain enters `BlockedDeadLetterFull` instead, and leaves it only once that same write fits.
 
 ### Metrics (`src/metrics/`)
 
@@ -188,6 +282,16 @@ A family of Prometheus metrics registered with a `prometheus-client` registry (t
 | `weir_dead_letter_full_total` | counter | Distinct `BlockedDeadLetterFull` entries |
 | `weir_drain_state{state}` | gauge | Drain state (exactly one label = 1) |
 | `weir_dead_letter_blocked_duration_seconds` | gauge | Time in `BlockedDeadLetterFull`; alert target |
+| `weir_wab_dir_lock_held` | gauge | 1 while the `wab_dir` lock is held; 0 under the `best-effort` fallback or just before an ownership-lost exit |
+| `weir_wab_dir_lock_integrity_failures_total` | counter | Integrity checks that found `.weir.lock` deleted or replaced (then re-locked), or could not verify it |
+| `weir_config_reloads_total{trigger,outcome}` | counter | Reload requests (`sighup`; `admin` reserved) by `ok` / `failed` / `noop` / `dropped` |
+| `weir_drain_local_io_strands_total{cause}` | counter | Strands caused by local I/O (`read`, `write`), kept out of the sink-oriented stranded counter |
+| `weir_drain_segments_parked{reason}` | gauge | Parked segments (`local_read_failed`, `unsupported_version`, `drain_panic`) |
+| `weir_drain_segments_disposition_pending{kind}` | gauge | Delivered or set-aside segments with a `confirm` or `quarantine` step outstanding |
+| `weir_drain_confirm_failures_total{stage}` | counter | Failed confirm steps (`sidecar`, `delete`) |
+| `weir_drain_quarantine_failures_total` | counter | Quarantine moves that failed (retried each poll) |
+| `weir_drain_dead_letter_write_failures_total` | counter | Dead-letter writes that failed after the sink committed |
+| `weir_drain_busy_seconds{kind}` | gauge | Seconds the drain has spent in its current blocking operation, by kind |
 
 `weir_drain_state` and `weir_sink_health` are pre-initialised so all label values appear on the first scrape. The HTTP exposition server binds to `metrics_bind:metrics_port` (default `127.0.0.1:9185`, localhost only) and serves `GET /metrics` in OpenMetrics text format. Set `metrics_bind = "0.0.0.0"` to allow container-host scraping; restrict exposure via firewall / network namespace, and note that `/metrics` is unauthenticated.
 
@@ -197,7 +301,7 @@ A family of Prometheus metrics registered with a `prometheus-client` registry (t
 
 Each test spawns a real `weir-server` binary via `env!("CARGO_BIN_EXE_weir-server")` with its own temp directory, socket path, WAB directory, and metrics port. A global process mutex serialises server spawning so the suite runs safely with any `--test-threads` value. Tests are written against the client library (`weir-client`) and the raw wire protocol where needed.
 
-Coverage includes: basic push/ack round-trips, both durability tiers, multi-shard write distribution, crash recovery, graceful shutdown under load, stalled-client isolation, partial frame injection, disk-full nacks, WAB byte-level integrity after SIGKILL, socket takeover data safety, fd-limit exhaustion, per-shard record ordering, batch deadline timer accuracy, and metrics consistency across crash-restart cycles.
+Coverage includes: basic push/ack round-trips, both durability tiers, multi-shard write distribution, crash recovery, graceful shutdown under load, stalled-client isolation, partial frame injection, disk-full nacks, WAB byte-level integrity after SIGKILL, a second daemon refused on a live socket or a locked `wab_dir` (and the first one's ownership-loss exit when the lock file is stolen, at runtime or during recovery), refused duplicates delivering nothing, SIGHUP served as a reload from before recovery onward, bounded shutdown with a full drain channel, a forcing second SIGTERM, and a drain that outlives its flushers, fd-limit exhaustion, per-shard record ordering, batch deadline timer accuracy, and metrics consistency across crash-restart cycles.
 
 **Load tests** (`crates/weir-server/tests/load.rs`):
 
@@ -222,7 +326,8 @@ The crown invariant — *an ack is never a false ack; no acked record is ever lo
 | Pre-allocation DoS via large `payload_len` | Cap check (`min(config, MAX_PAYLOAD_HARD_CAP)`) before any allocation in both `handle_connection` and `SegmentReader`. `MAX_PAYLOAD_HARD_CAP` is defined once in `weir-core` and imported by every enforcement point.            |
 | Symlink TOCTOU on segment creation         | `O_CREAT \| O_EXCL \| O_NOFOLLOW` on Unix; `create_new(true)` on Windows                                                                                                                                                         |
 | Symlink TOCTOU on segment write-reopen     | `O_NOFOLLOW` on the recovery write pass                                                                                                                                                                                          |
-| Stale socket file removal                  | `symlink_metadata` + S_ISSOCK check before `remove_file`; refuses to remove a non-socket                                                                                                                                         |
+| Stale socket file removal                  | `symlink_metadata` + S_ISSOCK check, then a connect-only liveness probe, before `remove_file`; refuses to remove a non-socket or a live socket. Shutdown removes the path only if it still names the socket this daemon bound |
+| Two daemons on one `wab_dir`               | Exclusive `flock` on `<wab_dir>/.weir.lock` before recovery; contention refuses startup; proven loss of the lock while running NACKs pushes and exits 3. Not a supported guard on network filesystems |
 | Path traversal in WAB/socket paths         | Absolute-path + no-`..` + no-null-byte + `canonicalize` validation                                                                                                                                                               |
 | World-readable WAB files                   | Segment files: `0o600`; shard dirs: `0o700`; quarantine dir: `0o700` — set atomically at creation time via `OpenOptionsExt::mode` and `DirBuilderExt::mode`                                                                      |
 | Corrupt `.confirmed` sidecar               | Bad magic / unknown version / CRC mismatch quarantines both the sealed segment and sidecar                                                                                                                                       |
@@ -243,6 +348,7 @@ dependency graph, not just convention — verify with `cargo tree`.
 |-------|---------------------|-----------------------------------|
 | `weir-core` | — (just `bytes`, `crc32fast`) | The wire types + `Payload`. Build a producer or a non-Rust client against the frozen v1 wire protocol. |
 | `weir-wab` | `weir-core`, `crc32fast` | Read/inspect/recover on-disk WAB segments. No async runtime, no daemon. `SegmentReader::open(path)` streams CRC-verified records straight off disk — useful for a recovery tool, an offline inspector, or a custom reader. |
+| `weir-status` | — (just `serde`) | The `weir.status/v1` model, Conditions evaluator and probe predicates shared by the daemon and `weir-ctl`; pure Rust, no I/O. Evaluate a daemon from its metrics exposition or from disk facts without linking the daemon. |
 | `weir-sink-sdk` | `weir-core` | Implement **and unit-test** a custom `Sink` against the stable trait — no `weir-server`, no tokio required (the crate's own tests drive `commit`/`health` with a tiny `block_on`). `BasicSinkError` / `Infallible` cover quick error types. |
 | `weir-client` | `weir-core` | The synchronous producer client. Push records over the socket from your own app. |
 | `weir-ctl` | `weir-core`, `weir-client`, `weir-wab` | The admin CLI. Notably does **not** depend on `weir-server` — it's a thin tool over the wire client + the segment reader, so it (and the WAB-reading capability it's built on) work independently of the daemon binary. |

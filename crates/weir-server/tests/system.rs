@@ -33,7 +33,7 @@ use std::{
 
 use weir_client::{ClientError, WeirClient};
 use weir_core::Durability;
-use weir_testkit::{free_port, process_lock, weir_server};
+use weir_testkit::{RecordingSink, free_port, process_lock, weir_server};
 
 // Helper: sum all file bytes under a directory tree.
 fn wab_dir_bytes(dir: &Path) -> u64 {
@@ -842,6 +842,9 @@ fn metrics_all_families_registered() {
         "weir_sink_health",
         "weir_sink_info",
         "weir_queue_depth",
+        // PR 3 (Task 3.6)
+        "weir_drain_channel_depth",
+        "weir_drain_channel_capacity",
         // Recovery
         "weir_recovery_records_replayed",
         "weir_recovery_segments_quarantined",
@@ -856,6 +859,63 @@ fn metrics_all_families_registered() {
         "weir_drain_state",
         "weir_drain_panics",
         "weir_dead_letter_blocked_duration_seconds",
+        // wab_dir ownership
+        "weir_wab_dir_lock_held",
+        "weir_wab_dir_lock_integrity_failures",
+        // Config reload
+        "weir_config_reloads",
+        // Drain ledger (safety floor)
+        "weir_drain_local_io_strands",
+        "weir_drain_segments_parked",
+        "weir_drain_segments_disposition_pending",
+        "weir_drain_confirm_failures",
+        "weir_drain_quarantine_failures",
+        "weir_drain_dead_letter_write_failures",
+        // Drain liveness (safety floor)
+        "weir_drain_busy_seconds",
+        // Foundations PR 1 (status, lifecycle and conditions)
+        "weir_build_info",
+        "weir_start_time_seconds",
+        "weir_startup_phase",
+        "weir_ready",
+        "weir_live",
+        "weir_condition_active",
+        "weir_wab_shard_up",
+        "weir_wab_handoff_blocked_seconds",
+        "weir_worker_up",
+        "weir_wab_cap_rejecting",
+        "weir_wab_undelivered_segments",
+        "weir_wab_undelivered_records",
+        "weir_wab_oldest_undelivered_age_seconds",
+        "weir_wab_active_segment_age_seconds",
+        "weir_drain_pending_segments",
+        "weir_drain_replay_remaining_segments",
+        "weir_drain_heartbeat_age_seconds",
+        "weir_drain_commit_in_flight_seconds",
+        "weir_drain_paused",
+        "weir_drain_generation",
+        "weir_sink_last_success_timestamp_seconds",
+        "weir_sink_last_failure_timestamp_seconds",
+        "weir_sink_consecutive_failures",
+        "weir_config_wab_max_bytes",
+        "weir_config_dead_letter_max_bytes",
+        "weir_config_wab_segment_max_bytes",
+        "weir_config_segment_max_age_seconds",
+        "weir_config_segment_max_lifetime_seconds",
+        "weir_config_sink_max_retries",
+        "weir_config_shutdown_timeout_seconds",
+        "weir_records_nack_internal",
+        "weir_connections_refused_no_live_shard",
+        "weir_drain_segments_abandoned",
+        "weir_wab_segments_not_handed_off",
+        // Bounded shutdown (Foundations PR 4)
+        "weir_config_drain_shutdown_budget_seconds",
+        "weir_drain_shutdown_deadline_seconds",
+        // Metrics / health listener (Foundations PR 5)
+        "weir_http_requests_dropped",
+        // Admin socket (Foundations PR 6)
+        "weir_admin_requests",
+        "weir_admin_socket_up",
     ];
     // The per-stage latency histograms register only under the `bench-trace`
     // feature (which `--all-features` turns on). Include them there so the
@@ -977,6 +1037,81 @@ fn server_exits_and_socket_disappears_after_sigterm() {
         !socket_path.exists(),
         "socket should be removed after clean shutdown"
     );
+}
+
+/// Spec §16 system test 13, a gate from PR 1 onward: SIGTERM exits within
+/// shutdown_timeout + 5 s with an idle producer connection still open, and
+/// exits 0. It guards the sequencing every later Foundations PR rewrites
+/// (signal task, lame duck, joins, drain stop).
+#[test]
+fn sigterm_exits_within_the_bound_with_an_idle_connection_open() {
+    const SHUTDOWN_TIMEOUT_SECS: u64 = 2;
+    let bound = Duration::from_secs(SHUTDOWN_TIMEOUT_SECS + 5);
+    let mut srv = weir_server!("sigterm_bound")
+        .shutdown_timeout_secs(SHUTDOWN_TIMEOUT_SECS)
+        .start();
+    let mut busy = srv.client();
+    busy.push(b"acked-before-sigterm", Durability::Durable)
+        .unwrap();
+    let mut idle = srv.client();
+    idle.health_check().unwrap(); // connected, then left idle across the signal
+    let t0 = Instant::now();
+    unsafe {
+        libc::kill(srv.child_pid() as libc::pid_t, libc::SIGTERM);
+    }
+    let status = srv
+        .wait_for_exit(bound)
+        .unwrap_or_else(|| panic!("weir-server still running {bound:?} after SIGTERM"));
+    assert!(status.success(), "exit status {status}");
+    assert!(t0.elapsed() < bound, "took {:?}", t0.elapsed());
+    drop((busy, idle));
+}
+
+/// The PR 1 status gauges on a real daemon: after the first 5 s poll a
+/// serving daemon reports ready, serving, every shard up, the cap clear,
+/// and the noop sink as an active warning condition.
+#[test]
+fn a_serving_daemon_reports_ready_through_the_new_gauges() {
+    let srv = weir_server!("status_gauges").shard_count(2).start();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let body = loop {
+        let body = srv.scrape_metrics();
+        // The sample, not `contains("weir_ready 1")`: the HELP line reads
+        // "# HELP weir_ready 1 when ..." and matched before the first poll.
+        if parse_metric_f64(&body, "weir_ready ") == 1.0 {
+            break body;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "weir_ready never reached 1:\n{body}"
+        );
+        thread::sleep(Duration::from_millis(250));
+    };
+    for series in [
+        "weir_startup_phase{phase=\"serving\"} 1",
+        "weir_wab_shard_up{shard=\"0\"} 1",
+        "weir_wab_shard_up{shard=\"1\"} 1",
+        "weir_wab_cap_rejecting 0",
+        "weir_condition_active{code=\"noop_sink\",severity=\"warning\"} 1",
+        "weir_condition_active{code=\"starting\",severity=\"info\"} 0",
+    ] {
+        assert!(body.contains(series), "{series:?} missing:\n{body}");
+    }
+    assert!(
+        body.contains(&format!(
+            "weir_build_info{{version=\"{}\"",
+            env!("CARGO_PKG_VERSION")
+        )),
+        "{body}"
+    );
+    // Spec §16: weir-status's `evidence_from_metrics` is tested against a
+    // captured 4.1 exposition. This is the capture; re-bless on an intended
+    // family change and review the diff.
+    if std::env::var_os("WEIR_BLESS").is_some() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../weir-status/tests/fixtures/metrics_4_1.txt");
+        std::fs::write(&path, &body).unwrap_or_else(|e| panic!("write {}: {e}", path.display()));
+    }
 }
 
 // ── Reconnect / restart ───────────────────────────────────────────────────────
@@ -1427,7 +1562,7 @@ fn one_connection_can_interleave_both_durability_tiers() {
 fn server_restarts_after_sigkill() {
     // 10 s is generous: cold start on a fresh daemon takes well under 1 s.
     // The bound catches a regression where startup blocks on something
-    // (recovery, bind_cleanup, segment scan) for an unreasonable time.
+    // (recovery, stale-socket cleanup, segment scan) for an unreasonable time.
     const RESTART_BUDGET: Duration = Duration::from_secs(10);
 
     let mut srv = weir_server!("crash_restart").start();
@@ -1443,7 +1578,8 @@ fn server_restarts_after_sigkill() {
         "socket should remain after SIGKILL"
     );
 
-    // bind_cleanup removes the stale socket; server starts clean.
+    // Nobody listens on the stale socket, so startup's liveness probe calls
+    // it stale and removes it; the server starts clean.
     let restart_start = Instant::now();
     srv.restart_in_place();
     let restart_elapsed = restart_start.elapsed();
@@ -1668,6 +1804,99 @@ fn readonly_wab_dir_prevents_startup() {
         } else {
             "not "
         }
+    );
+}
+
+/// Spec §3.4 (D10), end to end: an env-only daemon whose `--config` names a
+/// file that does not exist still starts (the Docker image always passes
+/// `--config`), but its log now says so, naming the path and escalating for
+/// the noop sink, and logs the config source. Before this the missing file was
+/// read as an empty layer with no log line at all.
+#[test]
+fn missing_config_file_warns_and_logs_source_at_startup() {
+    use std::io::{BufRead, BufReader};
+    use std::sync::mpsc;
+
+    let _lock = process_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let tmp_dir = std::env::temp_dir().join(format!("weir_nocfg_{}", std::process::id()));
+    let wab_dir = tmp_dir.join("wab");
+    let socket_dir = tmp_dir.join("run");
+    let socket_path = socket_dir.join("weir.sock");
+    let missing = tmp_dir.join("no-such-weir.toml");
+    fs::create_dir_all(&wab_dir).unwrap();
+    fs::create_dir_all(&socket_dir).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_weir-server"))
+        .args(["--config", missing.to_str().unwrap()])
+        .env("WEIR_SOCKET_PATH", &socket_path)
+        .env("WEIR_WAB_DIR", &wab_dir)
+        .env("WEIR_METRICS_PORT", free_port().to_string())
+        .env("WEIR_LOG_LEVEL", "info")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn weir-server");
+
+    // tracing's fmt subscriber writes to stdout; read both streams so a
+    // future writer change does not silently blind this test.
+    let (tx, rx) = mpsc::channel::<String>();
+    let readers: Vec<_> = [
+        Box::new(child.stdout.take().unwrap()) as Box<dyn std::io::Read + Send>,
+        Box::new(child.stderr.take().unwrap()),
+    ]
+    .into_iter()
+    .map(|stream| {
+        let tx = tx.clone();
+        thread::spawn(move || {
+            for line in BufReader::new(stream).lines().map_while(Result::ok) {
+                let _ = tx.send(line);
+            }
+        })
+    })
+    .collect();
+    drop(tx);
+
+    let path = missing.display().to_string();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut log = Vec::new();
+    let (mut warned, mut sourced) = (None, false);
+    while Instant::now() < deadline && !(warned.is_some() && sourced) {
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) => {
+                if line.contains(&path) && line.contains("does not exist") {
+                    warned = Some(line.clone());
+                }
+                if line.contains("config source") {
+                    sourced = true;
+                }
+                log.push(line);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    let still_running = child.try_wait().ok().flatten().is_none();
+    let _ = child.kill();
+    let _ = child.wait();
+    for r in readers {
+        let _ = r.join();
+    }
+    fs::remove_dir_all(&tmp_dir).ok();
+
+    let warned = warned.unwrap_or_else(|| panic!("no missing-config WARN naming {path}: {log:#?}"));
+    assert!(warned.contains("WARN"), "must be a WARN: {warned}");
+    assert!(
+        warned.contains("--config"),
+        "explicit --config named: {warned}"
+    );
+    assert!(
+        warned.contains("DISCARDED"),
+        "noop sink escalation: {warned}"
+    );
+    assert!(sourced, "no 'config source' INFO line: {log:#?}");
+    assert!(
+        still_running,
+        "a missing config file must not stop the daemon: {log:#?}"
     );
 }
 
@@ -2165,43 +2394,787 @@ fn wab_data_integrity_after_crash() {
     }
 }
 
-// ── Socket takeover data safety ───────────────────────────────────────────────
+// ── Socket ownership (safety floor, spec §3.3) ────────────────────────────────
 
-/// `bind_cleanup` removes the socket file (even if another process is
-/// listening) so that crash-recovery always succeeds. When a second server
-/// takes the socket path the first server's WAB files must be left entirely
-/// untouched — the socket file and the WAB are independent resources.
+/// A second daemon pointed at a LIVE daemon's socket path must refuse to
+/// start, not unlink the socket and take the path over. (Until the safety
+/// floor, startup removed any socket file at the path, even one another
+/// process was listening on, and A silently lost every new producer.)
+///
+/// B has its own `wab_dir` and metrics port, so nothing but the socket is
+/// shared. B must exit 1 naming the conflict, and must do so in preflight
+/// (spec §3.0), before it recovers anything or binds its metrics endpoint. A's
+/// socket must be the same inode, A must still ack a Durable push on a NEW
+/// connection, and A's WAB must be byte-identical.
 #[test]
-fn socket_takeover_does_not_corrupt_wab_data() {
-    const N: usize = 20;
+fn second_daemon_refuses_a_live_socket() {
+    use std::os::unix::fs::MetadataExt;
 
-    let srv_a = weir_server!("socket_takeover").start();
+    let srv_a = weir_server!("live_socket_a").start();
     let mut client = srv_a.client();
-
-    for i in 0..N {
+    for i in 0..20 {
         client
             .push(format!("srv-a-{i}").as_bytes(), Durability::Durable)
             .expect("push to server A failed");
     }
+    let socket_inode = fs::symlink_metadata(&srv_a.socket_path).unwrap().ino();
+    let wab_before = tree_snapshot(&srv_a.wab_dir);
 
-    let wab_before = wab_dir_bytes(&srv_a.wab_dir);
-    assert!(wab_before > 0, "server A must have written WAB bytes");
+    let (status, log) = weir_server!("live_socket_b")
+        .env("WEIR_SOCKET_PATH", srv_a.socket_path.to_str().unwrap())
+        .log_level("info")
+        .spawn_expecting_exit(Duration::from_secs(10));
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "B must refuse to start on A's live socket; it exited {status}\nlog:\n{log}"
+    );
+    assert!(
+        log.contains("in use by a running process"),
+        "B must say why it refused\nlog:\n{log}"
+    );
+    // At info, these absences prove the refusal came from preflight: the late
+    // bind in socket::bind runs only after recovery and the metrics bind.
+    assert!(
+        log.contains("weir starting"),
+        "B's log must be at info\nlog:\n{log}"
+    );
+    for late in ["recover", "metrics and health endpoint listening"] {
+        assert!(
+            !log.contains(late),
+            "B must refuse in preflight, before {late:?}\nlog:\n{log}"
+        );
+    }
+    assert_eq!(
+        tree_snapshot(&srv_a.wab_dir),
+        wab_before,
+        "B's refused start must not touch a byte of A's WAB"
+    );
 
-    // Spawn server B at the same socket path (it will call bind_cleanup and
-    // take over the socket). Use Command directly — we hold the process lock
-    // via srv_a and need two processes alive at once intentionally.
-    let second_tmp =
-        std::env::temp_dir().join(format!("weir_sys_takeover_b_{}", std::process::id()));
-    let second_wab = second_tmp.join("wab");
-    let second_config = second_tmp.join("weir.toml");
+    assert_eq!(
+        fs::symlink_metadata(&srv_a.socket_path)
+            .expect("A's socket file must still exist")
+            .ino(),
+        socket_inode,
+        "A's socket must be the same inode: B must not unlink or replace it"
+    );
+    srv_a
+        .client()
+        .push(b"after-b-refused", Durability::Durable)
+        .expect("A must still accept and ack on a new connection");
+    client
+        .push(b"after-b-refused-old-conn", Durability::Durable)
+        .expect("A's existing connection must still ack");
+}
 
-    fs::create_dir_all(&second_wab).unwrap();
+/// Shutdown removes the socket file only if it is still the inode this
+/// daemon bound. Here a successor has replaced A's socket at the same path
+/// while A runs; A's SIGTERM must leave the successor's socket alone.
+#[test]
+fn shutdown_leaves_a_successor_socket_alone() {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut srv_a = weir_server!("successor_socket_a").start();
+    fs::remove_file(&srv_a.socket_path).expect("unlink A's socket");
+    let successor = std::os::unix::net::UnixListener::bind(&srv_a.socket_path)
+        .expect("bind the successor's socket at A's path");
+    let successor_inode = fs::symlink_metadata(&srv_a.socket_path).unwrap().ino();
+
+    srv_a.sigterm();
+
+    let meta = fs::symlink_metadata(&srv_a.socket_path)
+        .expect("A's shutdown must not unlink the successor's socket");
+    assert_eq!(meta.ino(), successor_inode);
+    let _c = std::os::unix::net::UnixStream::connect(&srv_a.socket_path)
+        .expect("the successor must still accept connections");
+    let log = fs::read_to_string(srv_a.tmp_dir.join("weir.log")).unwrap_or_default();
+    assert!(
+        log.contains("another instance replaced it"),
+        "A must say why it left the socket\nlog:\n{log}"
+    );
+    drop(successor);
+}
+
+/// Review Focus 4 (stale-socket half): upgrading from 4.0.1, or any restart
+/// after SIGKILL, finds the dead daemon's socket file still on disk. Nothing
+/// listens on it (ECONNREFUSED), so the new daemon must remove it as stale,
+/// bind, recover the WAB and deliver both the records acked before the kill
+/// and the ones acked after the restart.
+#[test]
+fn starts_cleanly_over_a_stale_socket_left_by_sigkill() {
+    use std::os::unix::fs::FileTypeExt;
+
+    let sink = RecordingSink::start();
+    let mut srv = weir_server!("stale_socket_sigkill")
+        .extra_config("sink_type = \"http\"")
+        .env("WEIR_SINK_URL", sink.url())
+        .log_level("info")
+        .start();
+    let mut client = srv.client();
+    for i in 0..10 {
+        client
+            .push(format!("stale-pre-{i:02}").as_bytes(), Durability::Durable)
+            .expect("push before the kill");
+    }
+    drop(client);
+
+    srv.kill_ungracefully();
+    let meta = fs::symlink_metadata(&srv.socket_path).expect("SIGKILL leaves the socket file");
+    assert!(meta.file_type().is_socket());
+    let refused = std::os::unix::net::UnixStream::connect(&srv.socket_path)
+        .expect_err("nobody listens on a dead daemon's socket");
+    assert_eq!(refused.kind(), io::ErrorKind::ConnectionRefused);
+
+    // Same config, same paths: the new process must clear the stale file.
+    srv.restart_in_place();
+    let mut client = srv.client();
+    for i in 0..10 {
+        client
+            .push(format!("stale-post-{i:02}").as_bytes(), Durability::Durable)
+            .expect("push after the restart");
+    }
+    drop(client);
+    srv.sigterm();
+
+    let log = fs::read_to_string(srv.tmp_dir.join("weir.log")).unwrap_or_default();
+    assert!(
+        log.contains("removed stale socket"),
+        "the restart must log the stale-socket removal\nlog:\n{log}"
+    );
+    let delivered: std::collections::HashSet<String> = sink
+        .bodies()
+        .into_iter()
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .collect();
+    let missing: Vec<String> = (0..10)
+        .flat_map(|i| [format!("stale-pre-{i:02}"), format!("stale-post-{i:02}")])
+        .filter(|p| !delivered.contains(p))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "every acked record must reach the sink across the SIGKILL; missing {missing:?}"
+    );
+}
+
+// ── Preflight (safety floor, spec §3.0) ───────────────────────────────────────
+
+/// The payloads [`seed_sealed_backlog`] leaves on disk.
+const SEEDED_RECORDS: usize = 12;
+
+fn seeded_payload(i: usize) -> Vec<u8> {
+    let mut p = format!("seeded-{i:02}-").into_bytes();
+    p.resize(1024, b'x');
+    p
+}
+
+/// Fills `wab_dir` with a backlog of SEALED, UNCONFIRMED segments: exactly
+/// what a restarted daemon recovers, replays and delivers first.
+///
+/// A seeding daemon runs on `wab_dir` with the smallest legal segment size
+/// (4096 bytes, so a few 1 KiB pushes roll a segment) and an HTTP sink on port
+/// 1, which is privileged and never bound by an unprivileged process: every
+/// delivery attempt is refused, so with `sink_max_retries = 0` each sealed
+/// segment is stranded on disk (connection-refused is transient, so nothing is
+/// dead-lettered). A graceful SIGTERM then seals the active segment too.
+/// Returns the number of sealed segments, asserted to be at least 3.
+fn seed_sealed_backlog(tag: &str, wab_dir: &Path) -> usize {
+    let mut seeder = weir_server!(tag)
+        .wab_dir(wab_dir)
+        .extra_config(
+            "wab_segment_max_bytes = 4096\n\
+             sink_type = \"http\"\n\
+             sink_max_retries = 0",
+        )
+        .env("WEIR_SINK_URL", "http://127.0.0.1:1/sink")
+        .start();
+    let mut client = seeder.client();
+    for i in 0..SEEDED_RECORDS {
+        client
+            .push(seeded_payload(i), Durability::Durable)
+            .expect("seeding push");
+    }
+    drop(client);
+    seeder.sigterm();
+    drop(seeder);
+
+    let sealed = count_wab_files(wab_dir, ".wab.sealed");
+    assert!(
+        sealed >= 3,
+        "the seed must leave at least 3 sealed segments, found {sealed}: {:?}",
+        tree_snapshot(wab_dir)
+    );
+    assert_eq!(
+        count_wab_files(wab_dir, ".wab"),
+        0,
+        "SIGTERM must have sealed the active segment"
+    );
+    assert_eq!(
+        count_wab_files(wab_dir, ".confirmed"),
+        0,
+        "nothing may be confirmed: the sink was unreachable"
+    );
+    sealed
+}
+
+/// Which resource the refused duplicate shares with the running daemon.
+#[derive(Clone, Copy, Debug)]
+enum SharedResource {
+    Socket,
+    MetricsPort,
+}
+
+/// spec §3.0: a duplicate daemon that must refuse to start has to refuse
+/// BEFORE recovery. Until preflight existed, B recovered and replayed its own
+/// backlog, started its drain, and only then hit the conflicting socket or
+/// metrics port and returned through `?` with the drain mid-commit. Under
+/// `Restart=on-failure` that re-delivered the head of B's oldest unconfirmed
+/// segment on every restart, unboundedly.
+///
+/// B gets its own `wab_dir`, pre-seeded with a sealed backlog, and a recording
+/// sink; it shares exactly one resource with a running A. B must exit 1 within
+/// 5 s naming the conflict, the sink must see not one connection, and B's WAB
+/// must be byte-identical. Then, as a positive control, the same B started
+/// without the conflict delivers the whole backlog to the same sink: the
+/// backlog was real, so "0 connections" above is not vacuous.
+fn refused_duplicate_never_delivers(shared: SharedResource) {
+    // Short: the socket path is derived from the tag and must fit sun_path
+    // (104 bytes on macOS, including the temp dir).
+    let tag = match shared {
+        SharedResource::Socket => "sock",
+        SharedResource::MetricsPort => "metr",
+    };
+    let b_wab =
+        std::env::temp_dir().join(format!("weir_sys_refused_dup_{tag}_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&b_wab);
+    fs::create_dir_all(&b_wab).unwrap();
+    seed_sealed_backlog(&format!("rdup_seed_{tag}"), &b_wab);
+    // B takes the wab_dir lock before preflight, legitimately rewriting the
+    // holder record in `.weir.lock`; every other byte must stay put.
+    let segments = |dir: &Path| {
+        let mut t = tree_snapshot(dir);
+        t.remove(Path::new(".weir.lock"));
+        t
+    };
+    let seeded = segments(&b_wab);
+
+    let sink = RecordingSink::start();
+    let srv_a = weir_server!(&format!("rdup_a_{tag}")).start();
+    let b = weir_server!(&format!("rdup_b_{tag}"))
+        .wab_dir(&b_wab)
+        .extra_config("sink_type = \"http\"")
+        .env("WEIR_SINK_URL", sink.url())
+        .log_level("info");
+    let (b, expected) = match shared {
+        SharedResource::Socket => (
+            b.env("WEIR_SOCKET_PATH", srv_a.socket_path.to_str().unwrap()),
+            "in use by a running process",
+        ),
+        SharedResource::MetricsPort => (
+            b.env("WEIR_METRICS_PORT", srv_a.metrics_port.to_string()),
+            "failed to bind metrics endpoint",
+        ),
+    };
+
+    let started = Instant::now();
+    let (status, log) = b.spawn_expecting_exit(Duration::from_secs(5));
+    let took = started.elapsed();
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "B must refuse to start ({shared:?}); it exited {status}\nlog:\n{log}"
+    );
+    assert!(
+        took < Duration::from_secs(5),
+        "B must fail fast, took {took:?}"
+    );
+    assert!(
+        log.contains(expected),
+        "B must name the conflict\nlog:\n{log}"
+    );
+    // The log is at info, so the absences below are evidence, not silence.
+    assert!(
+        log.contains("weir starting"),
+        "B's log must be at info\nlog:\n{log}"
+    );
+    for late in [
+        "recovering",
+        "queuing segment for drain replay",
+        "metrics and health endpoint listening",
+    ] {
+        assert!(
+            !log.contains(late),
+            "B must refuse in preflight, before {late:?}\nlog:\n{log}"
+        );
+    }
+    // Anything B sent before exiting is already queued at the sink's listener;
+    // give its accept thread a moment to count it.
+    thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        sink.connections(),
+        0,
+        "a refused duplicate must never reach the sink (bodies: {})",
+        sink.bodies().len()
+    );
+    assert_eq!(
+        segments(&b_wab),
+        seeded,
+        "B's refused start must not recover, seal, confirm or delete anything"
+    );
+
+    // A is unaffected.
+    srv_a
+        .client()
+        .push(b"a-after-refusal", Durability::Durable)
+        .expect("A must still ack");
+    drop(srv_a);
+
+    // Positive control: without the conflict, B delivers the seeded backlog.
+    let srv_b = weir_server!(&format!("rdup_ok_{tag}"))
+        .wab_dir(&b_wab)
+        .extra_config("sink_type = \"http\"")
+        .env("WEIR_SINK_URL", sink.url())
+        .start();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let missing = loop {
+        let delivered: std::collections::HashSet<Vec<u8>> = sink.bodies().into_iter().collect();
+        let missing: Vec<usize> = (0..SEEDED_RECORDS)
+            .filter(|&i| !delivered.contains(&seeded_payload(i)))
+            .collect();
+        if missing.is_empty() || Instant::now() >= deadline {
+            break missing;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(
+        missing.is_empty(),
+        "control: the seeded backlog must be deliverable; missing records {missing:?}"
+    );
+    drop(srv_b);
+    let _ = fs::remove_dir_all(&b_wab);
+}
+
+#[test]
+fn refused_duplicate_never_delivers_shared_socket() {
+    refused_duplicate_never_delivers(SharedResource::Socket);
+}
+
+#[test]
+fn refused_duplicate_never_delivers_shared_metrics_port() {
+    refused_duplicate_never_delivers(SharedResource::MetricsPort);
+}
+
+// ── wab_dir ownership (safety floor, spec §3.1) ───────────────────────────────
+
+/// Every file under `dir`, keyed by its path relative to `dir`, with its size
+/// and a content hash. Two snapshots compare equal only if no file was
+/// created, removed, renamed, resized or rewritten in between.
+fn tree_snapshot(dir: &Path) -> std::collections::BTreeMap<PathBuf, (u64, u64)> {
+    use std::hash::{Hash, Hasher};
+    fn walk(root: &Path, dir: &Path, out: &mut std::collections::BTreeMap<PathBuf, (u64, u64)>) {
+        let Ok(rd) = fs::read_dir(dir) else { return };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                walk(root, &p, out);
+            } else {
+                let bytes = fs::read(&p).unwrap_or_default();
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                bytes.hash(&mut h);
+                out.insert(
+                    p.strip_prefix(root).unwrap().to_path_buf(),
+                    (bytes.len() as u64, h.finish()),
+                );
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(dir, dir, &mut out);
+    out
+}
+
+/// The owner's reproduction (2026-10-04), as a regression. Daemon B was started
+/// on the same `wab_dir` as a running daemon A, with its own socket and metrics
+/// port. B recovered and sealed A's ACTIVE segment, delivered, confirmed and
+/// deleted it, and A then acked 50 more Durable records into the unlinked
+/// inode: none were delivered and nothing remained on disk, and A's shutdown
+/// seal logged `No such file or directory`.
+///
+/// With the lock, B must refuse before reading a byte of the WAB, A's tree must
+/// be byte-identical afterwards, and every one of A's 70 acked records must
+/// reach the sink. A recording HTTP sink is used because graceful shutdown
+/// deletes every delivered segment, so WAB bytes after SIGTERM prove nothing.
+#[test]
+fn second_daemon_on_same_wab_dir_is_refused_and_first_keeps_acking() {
+    let sink = RecordingSink::start();
+    let mut srv_a = weir_server!("lock_owner_a")
+        .extra_config("sink_type = \"http\"")
+        .env("WEIR_SINK_URL", sink.url())
+        .start();
+    let mut client = srv_a.client();
+    for i in 0..20 {
+        client
+            .push(format!("lock-rec-{i:03}").as_bytes(), Durability::Durable)
+            .expect("push to A before B starts");
+    }
+
+    let lock_path = srv_a.wab_dir.join(".weir.lock");
+    let record = fs::read_to_string(&lock_path).expect("A holds a lock file with its record");
+    assert!(
+        record.contains(&format!("pid={}", srv_a.child_pid())),
+        "A's holder record must name A: {record:?}"
+    );
+    let before = tree_snapshot(&srv_a.wab_dir);
+    assert!(
+        before.keys().any(|k| k.to_string_lossy().ends_with(".wab")),
+        "A must have an ACTIVE segment for B to (wrongly) recover: {before:?}"
+    );
+
+    let started = Instant::now();
+    let (status, log) = weir_server!("lock_contender_b")
+        .wab_dir(&srv_a.wab_dir)
+        .spawn_expecting_exit(Duration::from_secs(5));
+    assert!(
+        !status.success(),
+        "B must refuse to start on A's wab_dir; it exited {status}\nlog:\n{log}"
+    );
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "a startup refusal exits 1\nlog:\n{log}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "B must fail fast, took {:?}",
+        started.elapsed()
+    );
+    assert!(log.contains("locked by"), "B must say why\nlog:\n{log}");
+    assert!(
+        log.contains(&format!("pid {}", srv_a.child_pid())),
+        "B must name A's pid\nlog:\n{log}"
+    );
+    assert_eq!(
+        tree_snapshot(&srv_a.wab_dir),
+        before,
+        "B must not touch a byte of A's WAB (no recovery, no seal, no record rewrite)"
+    );
+
+    for i in 20..70 {
+        client
+            .push(format!("lock-rec-{i:03}").as_bytes(), Durability::Durable)
+            .expect("A keeps acking after B is refused");
+    }
+    drop(client);
+    srv_a.sigterm();
+
+    let delivered: std::collections::HashSet<String> = sink
+        .bodies()
+        .into_iter()
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .collect();
+    let missing: Vec<String> = (0..70)
+        .map(|i| format!("lock-rec-{i:03}"))
+        .filter(|p| !delivered.contains(p))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "every record A acked must reach the sink; missing {} of 70: {missing:?}",
+        missing.len()
+    );
+
+    let log_a = fs::read_to_string(srv_a.tmp_dir.join("weir.log")).unwrap_or_default();
+    assert!(
+        !log_a.contains("No such file or directory"),
+        "A's shutdown seal must find its own segment\nlog:\n{log_a}"
+    );
+}
+
+/// Review Focus 1: systemd restarts a daemon immediately after the previous
+/// one was SIGKILLed. The kernel releases an flock when the last fd on the open
+/// file description closes, i.e. at process death, so the successor must
+/// acquire the lock with no wait and no manual cleanup of `.weir.lock`.
+#[test]
+fn lock_is_released_when_the_holder_is_sigkilled() {
+    let shared = std::env::temp_dir().join(format!("weir_sys_lock_sigkill_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&shared);
+    fs::create_dir_all(&shared).unwrap();
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&second_wab, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o700)).unwrap();
     }
+
+    let mut srv_a = weir_server!("lock_sigkill_a").wab_dir(&shared).start();
+    let mut client = srv_a.client();
+    for i in 0..5 {
+        client
+            .push(format!("before-kill-{i}").as_bytes(), Durability::Durable)
+            .unwrap();
+    }
+    drop(client);
+    let pid_a = srv_a.child_pid();
+    srv_a.kill_ungracefully();
+    // Releases the harness process lock and A's temp dir; the shared wab_dir
+    // (an override) and its stale `.weir.lock` stay exactly as SIGKILL left them.
+    drop(srv_a);
+    let stale = fs::read_to_string(shared.join(".weir.lock")).unwrap();
+    assert!(stale.contains(&format!("pid={pid_a}")), "{stale:?}");
+
+    let srv_b = weir_server!("lock_sigkill_b")
+        .wab_dir(&shared)
+        .ready_timeout(Duration::from_secs(10))
+        .start();
+    let record = fs::read_to_string(shared.join(".weir.lock")).unwrap();
+    assert!(
+        record.contains(&format!("pid={}", srv_b.child_pid())),
+        "B must have taken the lock and rewritten the record: {record:?}"
+    );
+    let body = srv_b.scrape_metrics();
+    assert!(
+        body.lines()
+            .any(|l| l.starts_with("weir_wab_dir_lock_held 1")),
+        "B must report the lock as held:\n{body}"
+    );
+
+    drop(srv_b);
+    let _ = fs::remove_dir_all(&shared);
+}
+
+/// Review Focus 2: an operator runs `weir-ctl segments` / `dl list` against a
+/// LIVE daemon's wab_dir. weir-ctl must not report `.weir.lock`, must not
+/// rewrite it, and must not disturb the lock: a second daemon started
+/// afterwards is still refused.
+#[test]
+fn weir_ctl_beside_a_live_daemon_neither_sees_nor_disturbs_the_lock() {
+    let srv = weir_server!("lock_ctl_beside").start();
+    let mut client = srv.client();
+    client.push(b"ctl-beside", Durability::Durable).unwrap();
+    drop(client);
+    let lock_path = srv.wab_dir.join(".weir.lock");
+    let record_before = fs::read(&lock_path).unwrap();
+
+    let ctl = weir_ctl_binary();
+    for args in [
+        &["--json", "segments", "--wab-dir"][..],
+        &["--json", "dl", "list", "--wab-dir"][..],
+    ] {
+        let out = Command::new(&ctl)
+            .args(args)
+            .arg(&srv.wab_dir)
+            .output()
+            .expect("run weir-ctl");
+        assert!(
+            out.status.success(),
+            "weir-ctl {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !stdout.contains(".weir.lock"),
+            "weir-ctl {args:?} must not report the lock file: {stdout}"
+        );
+    }
+    assert_eq!(fs::read(&lock_path).unwrap(), record_before);
+
+    let (status, log) = weir_server!("lock_ctl_contender")
+        .wab_dir(&srv.wab_dir)
+        .spawn_expecting_exit(Duration::from_secs(5));
+    assert_eq!(status.code(), Some(1), "log:\n{log}");
+    assert!(
+        log.contains("locked by"),
+        "the daemon must still hold its lock after weir-ctl ran\nlog:\n{log}"
+    );
+}
+
+/// Foundations §16 system test 9: `weir-ctl status --json` via the admin
+/// socket, GET /status and offline (disk), and the exit agrees with /readyz:
+/// exit ∈ {0,3} ⇔ /readyz 200.
+#[test]
+fn weir_ctl_status_via_admin_http_and_offline_agrees_with_readyz() {
+    let mut srv = weir_server!("ctl_status").start();
+    let ctl = weir_ctl_binary();
+    let wab = srv.wab_dir.clone();
+    let addr = format!("127.0.0.1:{}", srv.metrics_port);
+    let run = |source: &str| -> (Option<i32>, serde_json::Value) {
+        let out = Command::new(&ctl)
+            .args([
+                "--json",
+                "status",
+                "--source",
+                source,
+                "--addr",
+                &addr,
+                "--wab-dir",
+            ])
+            .arg(&wab)
+            .env_remove("WEIR_ADMIN_SOCKET_PATH")
+            .output()
+            .expect("run weir-ctl");
+        let v = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+            panic!(
+                "status --source {source}: {e}\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            )
+        });
+        (out.status.code(), v)
+    };
+    let readyz_200 = || match ureq::get(&format!("http://{addr}/readyz")).call() {
+        Ok(r) => r.status() == 200,
+        Err(ureq::Error::Status(_, _)) => false,
+        Err(e) => panic!("/readyz: {e}"),
+    };
+
+    assert!(readyz_200(), "a started daemon is ready");
+
+    let (code, v) = run("admin");
+    assert_eq!(v["source"], "admin", "{v}");
+    assert_eq!(v["view"], "admin");
+    assert_eq!(v["schema"], "weir.status/v1");
+    assert!(
+        v["instance"]["wab_dir_ino"].is_u64(),
+        "the admin view names its wab_dir: {v}"
+    );
+    assert_eq!(
+        matches!(code, Some(0) | Some(3)),
+        readyz_200(),
+        "parity (admin): exit {code:?}"
+    );
+
+    let (code, v) = run("http");
+    assert_eq!(v["source"], "http");
+    assert_eq!(v["view"], "public");
+    assert!(
+        v.get("instance").is_none(),
+        "the public document carries no instance"
+    );
+    assert_eq!(
+        matches!(code, Some(0) | Some(3)),
+        readyz_200(),
+        "parity (http): exit {code:?}"
+    );
+
+    let (_, v) = run("auto");
+    assert_eq!(v["source"], "admin", "auto prefers the admin socket");
+
+    srv.sigterm();
+    let (code, v) = run("auto");
+    assert_eq!(
+        code,
+        Some(1),
+        "no daemon answers, disk facts printed: exit 1 (README Q9)\n{v}"
+    );
+    assert_eq!(v["source"], "disk");
+    assert_eq!(v["conditions"][0]["code"], "daemon_unreachable");
+    let tried: Vec<&str> = v["sources_tried"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["source"].as_str().unwrap())
+        .collect();
+    assert_eq!(tried, ["admin", "http", "metrics", "disk"]);
+    assert!(v["backlog"]["undelivered_segments"].is_u64());
+}
+
+/// The admin verbs end to end through the CLI against a real daemon: pause is
+/// observed and says it is in-memory only, status shows drain_paused, resume
+/// is observed, retry-stranded returns a ticket, reload on a non-TLS daemon is
+/// a noop (exit 0).
+#[test]
+fn weir_ctl_drain_and_reload_round_trip_over_the_admin_socket() {
+    let srv = weir_server!("ctl_drain").start();
+    let ctl = weir_ctl_binary();
+    let wab = srv.wab_dir.clone();
+    let run = |args: &[&str]| -> (Option<i32>, String, String) {
+        let out = Command::new(&ctl)
+            .args(args)
+            .arg("--wab-dir")
+            .arg(&wab)
+            .env_remove("WEIR_ADMIN_SOCKET_PATH")
+            .output()
+            .expect("run weir-ctl");
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+
+    let (code, out, err) = run(&["drain", "pause", "--wait=10"]);
+    assert_eq!(
+        code,
+        Some(0),
+        "pause observed within 10 s\nstdout: {out}\nstderr: {err}"
+    );
+    assert!(
+        out.contains("in-memory only; a daemon restart resumes delivery"),
+        "{out}"
+    );
+
+    let mut client = srv.client();
+    for i in 0..50 {
+        client
+            .push(format!("paused-{i}").as_bytes(), Durability::Durable)
+            .unwrap();
+    }
+    let (_, out, _) = run(&["--json", "status", "--source", "admin"]);
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(
+        v["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["code"] == "drain_paused"),
+        "a paused drain shows drain_paused: {v}"
+    );
+
+    let (code, out, err) = run(&["drain", "resume", "--wait=10"]);
+    assert_eq!(
+        code,
+        Some(0),
+        "resume observed\nstdout: {out}\nstderr: {err}"
+    );
+
+    let (code, out, err) = run(&["drain", "retry-stranded", "--wait=10"]);
+    assert!(
+        matches!(code, Some(0) | Some(4)),
+        "exit {code:?}\nstdout: {out}\nstderr: {err}"
+    );
+    assert!(
+        out.contains("segments still inside their cool-down are skipped"),
+        "the PR 6 follow-up: the human output names the cool-down skip: {out}"
+    );
+
+    let (code, out, _) = run(&["--json", "drain", "retry-stranded", "--wait=10"]);
+    assert!(matches!(code, Some(0) | Some(4)), "exit {code:?}: {out}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(v.get("ticket").is_some(), "{v}");
+
+    let (code, out, err) = run(&["--json", "reload"]);
+    assert_eq!(
+        code,
+        Some(0),
+        "no TLS listener configured: noop, exit 0\nstdout: {out}\nstderr: {err}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["outcome"], "noop", "{v}");
+}
+
+/// Deletes the running daemon's `<wab_dir>/.weir.lock` and starts a second
+/// daemon B on the same `wab_dir` (its own socket, metrics port and log under
+/// a fresh temp dir, returned) until B holds the lock. Returns B still running.
+///
+/// The running daemon's integrity check re-creates and re-locks a deleted lock
+/// file on its next tick (D4a). A B spawned just after that tick is refused,
+/// and the precondition ("B acquires the lock") did not happen; retry. B is
+/// spawned with `Command` directly: the running daemon holds the harness
+/// process lock, and B must stay up beside it.
+fn steal_wab_dir_lock(tag: &str, wab_dir: &Path) -> (std::process::Child, PathBuf) {
+    let lock_path = wab_dir.join(".weir.lock");
+    let b_tmp = std::env::temp_dir().join(format!("weir_sys_{tag}_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&b_tmp);
+    fs::create_dir_all(&b_tmp).unwrap();
+    let b_config = b_tmp.join("weir.toml");
     fs::write(
-        &second_config,
+        &b_config,
         format!(
             "[server]\n\
              socket_path           = \"{}\"\n\
@@ -2209,50 +3182,905 @@ fn socket_takeover_does_not_corrupt_wab_data() {
              metrics_port          = {}\n\
              shard_count           = 1\n\
              worker_count          = 2\n\
-             batch_size            = 100\n\
-             batch_deadline_ms     = 20\n\
              shutdown_timeout_secs = 3\n\
-             log_level             = \"warn\"\n",
-            srv_a.socket_path.display(),
-            second_wab.display(),
+             log_level             = \"info\"\n",
+            b_tmp.join("weir.sock").display(),
+            wab_dir.display(),
             free_port(),
         ),
     )
     .unwrap();
 
-    let binary = env!("CARGO_BIN_EXE_weir-server");
-    let mut child_b = Command::new(binary)
-        .args(["--config", second_config.to_str().unwrap()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("failed to spawn server B");
+    for attempt in 0..10 {
+        match fs::remove_file(&lock_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!("unlink {}: {e}", lock_path.display()),
+        }
+        let b_log = b_tmp.join(format!("weir_b_{attempt}.log"));
+        let log = fs::File::create(&b_log).unwrap();
+        let mut c = Command::new(env!("CARGO_BIN_EXE_weir-server"))
+            .args(["--config", b_config.to_str().unwrap()])
+            .stdout(Stdio::from(log.try_clone().unwrap()))
+            .stderr(Stdio::from(log))
+            .spawn()
+            .expect("spawn B");
+        // B writes its record only after its flock succeeded, so its pid in
+        // the record means B holds the lock.
+        let b_marker = format!("pid={}\n", c.id());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let acquired = loop {
+            if fs::read_to_string(&lock_path).is_ok_and(|r| r.contains(&b_marker)) {
+                break true;
+            }
+            if let Ok(Some(_)) = c.try_wait() {
+                break false; // refused: the running daemon re-locked first
+            }
+            if Instant::now() >= deadline {
+                let _ = c.kill();
+                let _ = c.wait();
+                panic!(
+                    "B neither took the lock nor exited\nB log:\n{}",
+                    fs::read_to_string(&b_log).unwrap_or_default()
+                );
+            }
+            thread::sleep(Duration::from_millis(2));
+        };
+        if acquired {
+            return (c, b_tmp);
+        }
+    }
+    panic!("B never acquired the lock in 10 attempts");
+}
 
-    // Give server B time to start and take the socket.
-    thread::sleep(Duration::from_millis(500));
+/// Spec §3.1 integrity, D4b. Someone deletes a live daemon's `.weir.lock`, and
+/// a second daemon B starts on the same `wab_dir` and takes a fresh lock. That
+/// is proof another writer owns the directory, so A must stop acking and exit
+/// with status 3 at its next integrity tick, logging CRITICAL with B's holder
+/// record, and without sealing.
+///
+/// Between B's lock and A's next tick, A can still ack (the residual window the
+/// threat model states; only "never delete `.weir.lock`" closes it). What A
+/// must never do is ack AFTER it started refusing. The test pushes Durable
+/// records back to back on one connection from B's lock until A is gone, and
+/// requires that the connection ends in a refusal (a Nack, or the connection
+/// closing under it) that no ack ever follows (conf-tests-14: this used to be
+/// checked only if a Nack happened to be seen).
+#[test]
+fn lock_file_stolen_by_second_daemon_fails_closed() {
+    let mut srv_a = weir_server!("lock_stolen_a").start();
+    let mut client = srv_a.client();
+    client
+        .push(b"before-steal", Durability::Durable)
+        .expect("A acks while it owns the lock");
 
-    // Server A's WAB files must be completely untouched.
-    let wab_after = wab_dir_bytes(&srv_a.wab_dir);
-    assert_eq!(
-        wab_before, wab_after,
-        "server B startup modified server A's WAB bytes ({wab_before} → {wab_after})"
-    );
+    let (mut child_b, b_tmp) = steal_wab_dir_lock("lock_stolen_b", &srv_a.wab_dir);
+    let b_pid = child_b.id();
+    let b_acquired_at = Instant::now();
 
-    // Verify payload bytes are still present.
-    let wab_bytes = read_wab_bytes(&srv_a.wab_dir);
-    for i in 0..N {
-        let payload = format!("srv-a-{i}").into_bytes();
-        assert!(
-            wab_bytes
-                .windows(payload.len())
-                .any(|w| w == payload.as_slice()),
-            "payload srv-a-{i} missing from server A's WAB after socket takeover"
-        );
+    // The spec bound is one 1 s tick; the deadline is wider so a loaded CI
+    // runner does not flake it (cont-tests-4). The exit status, the CRITICAL
+    // line and B's pid prove the behaviour; this only proves it happens.
+    const EXIT_DEADLINE: Duration = Duration::from_secs(10);
+    let gone =
+        |o: &Result<(), ClientError>| matches!(o, Err(e) if !matches!(e, ClientError::Nack(_)));
+    let mut outcomes: Vec<Result<(), ClientError>> = Vec::new();
+    let status = loop {
+        if !outcomes.last().is_some_and(gone) {
+            outcomes.push(
+                client
+                    .push(b"during-steal", Durability::Durable)
+                    .map(|_| ()),
+            );
+        } else {
+            thread::sleep(Duration::from_millis(5));
+        }
+        if let Some(status) = srv_a.wait_for_exit(Duration::ZERO) {
+            break status;
+        }
+        if b_acquired_at.elapsed() > EXIT_DEADLINE {
+            let _ = child_b.kill();
+            let _ = child_b.wait();
+            panic!(
+                "A is still running {EXIT_DEADLINE:?} after B took its wab_dir\nA log:\n{}",
+                fs::read_to_string(srv_a.tmp_dir.join("weir.log")).unwrap_or_default()
+            );
+        }
+    };
+    let exited_after = b_acquired_at.elapsed();
+    // A is gone. If the last push raced the exit and was acked, the next one on
+    // the same connection must see it closed; it must never be acked.
+    if !outcomes.last().is_some_and(gone) {
+        outcomes.push(client.push(b"after-exit", Durability::Durable).map(|_| ()));
     }
 
     let _ = child_b.kill();
     let _ = child_b.wait();
-    let _ = fs::remove_dir_all(&second_tmp);
+    let log_a = fs::read_to_string(srv_a.tmp_dir.join("weir.log")).unwrap_or_default();
+
+    assert_eq!(
+        status.code(),
+        Some(3),
+        "proven ownership loss exits 3 (got {status})\nA log:\n{log_a}"
+    );
+    assert!(
+        exited_after <= EXIT_DEADLINE,
+        "A must exit at its next integrity tick after B took the lock; took {exited_after:?}"
+    );
+    assert!(
+        log_a.contains("CRITICAL") && log_a.contains("ownership lost"),
+        "A must log CRITICAL\nA log:\n{log_a}"
+    );
+    assert!(
+        log_a.contains(&format!("pid {b_pid}")),
+        "A's CRITICAL line must name B (pid {b_pid})\nA log:\n{log_a}"
+    );
+
+    // The connection ended in a refusal. No minimum push count: if A's tick
+    // lands between B's lock and the first push, that first push already
+    // finds A gone, and a single refusal is the correct outcome.
+    let first_refusal = outcomes
+        .iter()
+        .position(Result::is_err)
+        .unwrap_or_else(|| panic!("A was never seen refusing a push: {outcomes:?}"));
+    // Once A refused a push, it never acked another one: every later outcome
+    // is an InternalError Nack or the connection being gone.
+    for o in &outcomes[first_refusal..] {
+        match o {
+            Ok(()) => panic!("A acked after it started refusing: {outcomes:?}"),
+            Err(ClientError::Nack(r)) => assert_eq!(
+                *r,
+                weir_client::NackReason::InternalError,
+                "ownership loss Nacks InternalError (no wire change): {outcomes:?}"
+            ),
+            Err(_) => {} // A is gone
+        }
+    }
+    assert!(
+        outcomes.last().is_some_and(gone),
+        "the connection must end closed once A exited: {outcomes:?}"
+    );
+
+    let _ = fs::remove_dir_all(&b_tmp);
+}
+
+/// A fresh, empty wab_dir outside the harness temp dir, so it survives a
+/// restart with a second `WeirServer`.
+fn fresh_wab_dir(tag: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("weir_sys_{tag}_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&d);
+    fs::create_dir_all(&d).unwrap();
+    d
+}
+
+/// Polls `/metrics` until `weir_startup_phase{phase="recovering"}` reads 1, or
+/// panics after `within`. The test-hooks startup delay holds the phase.
+#[cfg(feature = "test-hooks")]
+fn wait_for_phase_recovering(srv: &weir_testkit::WeirServer, within: Duration) {
+    let t0 = Instant::now();
+    loop {
+        if let Some(b) = srv.try_scrape_metrics()
+            && parse_metric_f64(&b, "weir_startup_phase{phase=\"recovering\"} ") == 1.0
+        {
+            return;
+        }
+        assert!(
+            t0.elapsed() < within,
+            "never observed phase recovering\nlog:\n{}",
+            read_log(srv)
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// conf-durability-3, after Foundations §6: the lock-integrity thread runs
+/// from acquisition to exit, so a steal while recovery is still running (A is
+/// held in `recovering` by the test-hooks startup delay) is seen within a
+/// tick: A exits 3 and never binds or serves its producer socket. Replaces
+/// `lock_stolen_during_startup_replay_fails_closed_before_serving`, whose
+/// blocking replay no longer exists. B gets its own socket and metrics port
+/// (`steal_wab_dir_lock`), so A's early `/metrics` bind does not refuse it.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn lock_stolen_during_startup_recovery_fails_closed_before_serving() {
+    let wab = fresh_wab_dir("lock_recovery");
+    let mut srv_a = weir_server!("lock_recovery_a")
+        .wab_dir(&wab)
+        .env("WEIR_TEST_HOOKS", "1")
+        .env("WEIR_TEST_STARTUP_DELAY_MS", "10000")
+        .log_level("info")
+        .spawn();
+    wait_for_phase_recovering(&srv_a, Duration::from_secs(5));
+
+    let (mut child_b, b_tmp) = steal_wab_dir_lock("lock_recovery_b", &wab);
+    let b_pid = child_b.id();
+    let status = srv_a.wait_for_exit(Duration::from_secs(10));
+    let _ = child_b.kill();
+    let _ = child_b.wait();
+    let log_a = read_log(&srv_a);
+    let Some(status) = status else {
+        panic!(
+            "A is still running 10 s after B took its wab_dir during A's recovery \
+             (the integrity thread is not running yet)\nA log:\n{log_a}"
+        );
+    };
+    assert_eq!(
+        status.code(),
+        Some(3),
+        "proven ownership loss during recovery exits 3 (got {status})\nA log:\n{log_a}"
+    );
+    assert!(
+        !log_a.contains("weir serving"),
+        "A must exit before it serves anything\nA log:\n{log_a}"
+    );
+    assert!(
+        !srv_a.socket_path.exists(),
+        "A never bound its producer socket\nA log:\n{log_a}"
+    );
+    assert!(
+        log_a.contains("CRITICAL")
+            && log_a.contains("ownership lost")
+            && log_a.contains(&format!("pid {b_pid}")),
+        "A's CRITICAL line must name B (pid {b_pid})\nA log:\n{log_a}"
+    );
+
+    drop(srv_a);
+    let _ = fs::remove_dir_all(&b_tmp);
+    let _ = fs::remove_dir_all(&wab);
+}
+
+// ── SIGHUP (safety floor, spec §3.2) ──────────────────────────────────────────
+
+fn send_sighup(pid: u32) {
+    // SAFETY: kill(2) with a pid we spawned and still own (not yet reaped).
+    let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGHUP) };
+    assert_eq!(rc, 0, "kill -HUP {pid}: {}", io::Error::last_os_error());
+}
+
+/// `weir_config_reloads_total{trigger="sighup",outcome=<outcome>}`, 0 if absent.
+fn sighup_reloads(srv: &weir_testkit::WeirServer, outcome: &str) -> u64 {
+    parse_metric(
+        &srv.scrape_metrics(),
+        &format!("weir_config_reloads_total{{trigger=\"sighup\",outcome=\"{outcome}\"}} "),
+    )
+}
+
+/// Polls `sighup_reloads` until it reaches `want` or 5 s pass; returns the last
+/// value. The reload runs on the reload loop after the signal, so the counter
+/// lags the `kill` by a scheduling hop.
+fn wait_for_sighup_reloads(srv: &weir_testkit::WeirServer, outcome: &str, want: u64) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let got = sighup_reloads(srv, outcome);
+        if got >= want || Instant::now() >= deadline {
+            return got;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn read_log(srv: &weir_testkit::WeirServer) -> String {
+    fs::read_to_string(srv.tmp_dir.join("weir.log")).unwrap_or_default()
+}
+
+/// Asserts the daemon survived: still running 300 ms later, and acking.
+fn assert_alive_and_acking(srv: &mut weir_testkit::WeirServer, what: &str) {
+    if let Some(status) = srv.wait_for_exit(Duration::from_millis(300)) {
+        panic!(
+            "{what} killed the daemon ({status})\nlog:\n{}",
+            read_log(srv)
+        );
+    }
+    srv.client()
+        .push(b"after-sighup", Durability::Durable)
+        .unwrap_or_else(|e| panic!("a Durable push after {what} must ack: {e:?}"));
+}
+
+/// spec §3.2: a daemon without TLS used to have no SIGHUP handler at all, so
+/// `kill -HUP` (a `systemctl reload`, a log-rotation script) killed it with the
+/// default disposition. Now it is a counted, logged noop.
+#[test]
+fn sighup_is_a_counted_noop_on_a_default_daemon() {
+    let mut srv = weir_server!("sighup_noop").log_level("info").start();
+    send_sighup(srv.child_pid());
+    assert_alive_and_acking(&mut srv, "SIGHUP");
+    assert_eq!(wait_for_sighup_reloads(&srv, "noop", 1), 1);
+    for outcome in ["ok", "failed", "dropped"] {
+        assert_eq!(sighup_reloads(&srv, outcome), 0, "outcome={outcome}");
+    }
+    let log = read_log(&srv);
+    assert!(
+        log.contains(
+            "SIGHUP received: nothing reloadable in this build/config (config is read once at \
+             startup); nothing changed"
+        ),
+        "the noop must say so\nlog:\n{log}"
+    );
+    srv.shutdown();
+}
+
+/// Review Focus 5: 100 SIGHUPs in a burst neither kill the daemon nor wedge
+/// the reload path. Every HUP that got through is accounted for as served
+/// (noop) or dropped by the bounded queue, and a later HUP is still served.
+#[test]
+fn sighup_flood_does_not_kill_or_wedge() {
+    let mut srv = weir_server!("sighup_flood").start();
+    let pid = srv.child_pid();
+    for _ in 0..100 {
+        send_sighup(pid);
+    }
+    assert_alive_and_acking(&mut srv, "a SIGHUP flood");
+
+    // tokio coalesces pending signals, so fewer than 100 may be seen; at least
+    // one is, and none is counted twice.
+    let served = wait_for_sighup_reloads(&srv, "noop", 1);
+    let dropped = sighup_reloads(&srv, "dropped");
+    assert!(served >= 1, "the flood must be served, not lost");
+    assert!(
+        served + dropped <= 100,
+        "100 HUPs, but served {served} + dropped {dropped}"
+    );
+
+    // Not wedged: once the flood has settled, one more HUP is served.
+    thread::sleep(Duration::from_millis(200));
+    let before = sighup_reloads(&srv, "noop");
+    send_sighup(pid);
+    assert_eq!(
+        wait_for_sighup_reloads(&srv, "noop", before + 1),
+        before + 1,
+        "a HUP after the flood must still be served"
+    );
+    assert_alive_and_acking(&mut srv, "the HUP after the flood");
+    srv.shutdown();
+}
+
+/// Copies the first sealed segment in `wab_dir/shard_00` under fresh counters
+/// until the shard holds `total` sealed segments. Returns `total`.
+fn pad_sealed_backlog(wab_dir: &Path, total: usize) -> usize {
+    let shard = wab_dir.join("shard_00");
+    let counter = |p: &Path| -> u64 {
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        name.trim_start_matches("seg_")
+            .split('.')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    let mut sealed: Vec<PathBuf> = fs::read_dir(&shard)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.to_string_lossy().ends_with(".wab.sealed"))
+        .collect();
+    sealed.sort_by_key(|p| counter(p));
+    let template = sealed[0].clone();
+    let first_free = counter(sealed.last().unwrap()) + 1;
+    for next in (first_free..).take(total.saturating_sub(sealed.len())) {
+        fs::copy(&template, shard.join(format!("seg_{next:08}.wab.sealed"))).unwrap();
+    }
+    assert_eq!(count_wab_files(wab_dir, ".wab.sealed"), total);
+    total
+}
+
+/// The per-segment "recovery complete sealed=<path>" lines of
+/// `recover_open_segments`, one per unsealed segment it sealed. The `sealed=`
+/// field keeps `wab::recover`'s one-off "WAB recovery complete" summary out of
+/// the count.
+fn segments_recovered(log: &str) -> usize {
+    log.matches("recovery complete sealed=").count()
+}
+
+/// spec §3.2, the recovery-phase variant, after Foundations §6: the runtime
+/// and its SIGHUP handler now exist BEFORE recovery, so a HUP while
+/// `wab::recover` is sealing a pile of unsealed segments is served as a
+/// (noop) reload instead of being dropped, and recovery is not disturbed.
+#[test]
+fn sighup_during_startup_recovery_is_served() {
+    const TOTAL: usize = 400;
+    let wab = std::env::temp_dir().join(format!("weir_sys_hup_recov_{}", std::process::id()));
+    let _ = fs::remove_dir_all(&wab);
+    fs::create_dir_all(&wab).unwrap();
+
+    // One unsealed segment: acked Durable records, then SIGKILL (no seal).
+    let mut seeder = weir_server!("hup_recov_seed").wab_dir(&wab).start();
+    let mut client = seeder.client();
+    for i in 0..32 {
+        let mut p = format!("recov-{i:02}-").into_bytes();
+        p.resize(4096, b'r');
+        client.push(p, Durability::Durable).expect("seeding push");
+    }
+    drop(client);
+    seeder.kill_ungracefully();
+    drop(seeder);
+    let shard = wab.join("shard_00");
+    let active: Vec<PathBuf> = fs::read_dir(&shard)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.to_string_lossy().ends_with(".wab"))
+        .collect();
+    assert_eq!(active.len(), 1, "the seed must leave one unsealed segment");
+    for n in 2..=TOTAL {
+        fs::copy(&active[0], shard.join(format!("seg_{:08}.wab", 1000 + n))).unwrap();
+    }
+    assert_eq!(count_wab_files(&wab, ".wab"), TOTAL);
+
+    let mut srv = weir_server!("hup_recov")
+        .wab_dir(&wab)
+        .log_level("info")
+        .spawn();
+    let started = |log: &str| log.contains("recovering unsealed WAB segment");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !started(&read_log(&srv)) {
+        assert!(
+            Instant::now() < deadline,
+            "recovery never started\nlog:\n{}",
+            read_log(&srv)
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    send_sighup(srv.child_pid());
+    // A log read now that still shows recovery unfinished proves the HUP
+    // landed during it.
+    let log = read_log(&srv);
+    let done = segments_recovered(&log);
+    assert!(
+        done < TOTAL,
+        "the HUP must land during recovery, but all {TOTAL} segments were already \
+         recovered; seed more"
+    );
+
+    srv.wait_ready(Duration::from_secs(60));
+    assert_alive_and_acking(&mut srv, "the SIGHUP during recovery");
+    let log = read_log(&srv);
+    assert_eq!(
+        segments_recovered(&log),
+        TOTAL,
+        "every unsealed segment must be recovered\nlog:\n{log}"
+    );
+    assert!(
+        log.lines()
+            .any(|l| l.contains("WAB recovery complete") && l.contains("quarantined=0 failed=0")),
+        "recovery must report no quarantined or failed segment\nlog:\n{log}"
+    );
+    assert_eq!(
+        wait_for_sighup_reloads(&srv, "noop", 1),
+        1,
+        "the HUP during recovery is served exactly once (it used to be dropped)"
+    );
+    drop(srv);
+    let _ = fs::remove_dir_all(&wab);
+}
+
+// ── Observable startup (Foundations §6) ───────────────────────────────────────
+
+/// Spec §16 system test 2: the metrics listener answers DURING recovery,
+/// before the producer socket exists, and reports the phase.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn metrics_answer_during_recovery_before_the_socket_binds() {
+    let mut srv = weir_server!("startup_recovering")
+        .env("WEIR_TEST_HOOKS", "1")
+        .env("WEIR_TEST_STARTUP_DELAY_MS", "3000")
+        .spawn();
+    let t0 = Instant::now();
+    let body = loop {
+        if let Some(b) = srv.try_scrape_metrics() {
+            break b;
+        }
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "/metrics must answer within 2 s of start, during recovery\nlog:\n{}",
+            read_log(&srv)
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        parse_metric_f64(&body, "weir_startup_phase{phase=\"recovering\"} "),
+        1.0,
+        "{body}"
+    );
+    assert!(
+        !srv.socket_path.exists(),
+        "the producer socket must not exist before recovery has finished"
+    );
+    srv.wait_ready(Duration::from_secs(15));
+    let body = srv.scrape_metrics();
+    assert_eq!(
+        parse_metric_f64(&body, "weir_startup_phase{phase=\"serving\"} "),
+        1.0
+    );
+    srv.shutdown();
+}
+
+/// Spec §16 system test 1: a 300-segment backlog behind a 100 ms/POST sink
+/// (README Q13) does not hold the producer socket: it accepts within 3 s while
+/// nearly the whole backlog is still undelivered (`sink_http_concurrency = 1`
+/// and the sink's delay is a floor: ~3 records per segment is ~300 ms per
+/// segment, so at most ~10 segments can be delivered in those 3 s on any
+/// machine), a live push is acked, and a SIGHUP in that window is served (the
+/// runtime now exists before recovery). Everything is delivered eventually:
+/// 141 s when this test ran alone on an i9-9900K, longer beside the rest of
+/// the suite (the old 150 s bound failed there), so the delivery bound is a
+/// generous 5 minutes. Only the 3 s socket bound is the property under test.
+#[test]
+fn a_slow_sink_backlog_does_not_delay_the_producer_socket() {
+    const TOTAL: usize = 300;
+    let wab = fresh_wab_dir("backlog_socket");
+    seed_sealed_backlog("backlog_socket_seed", &wab);
+    pad_sealed_backlog(&wab, TOTAL);
+    let sink = RecordingSink::start_slow(Duration::from_millis(100));
+    let mut srv = weir_server!("backlog_socket")
+        .wab_dir(&wab)
+        .extra_config("sink_type = \"http\"\nsink_http_concurrency = 1")
+        .env("WEIR_SINK_URL", sink.url())
+        .log_level("info")
+        .spawn();
+    let t0 = Instant::now();
+    srv.wait_ready(Duration::from_secs(3));
+    let ready_after = t0.elapsed();
+    let undelivered = count_wab_files(&wab, ".wab.sealed");
+    assert!(
+        undelivered > 250,
+        "the socket must accept while the backlog is still undelivered: only {undelivered} \
+         of {TOTAL} left after {ready_after:?}"
+    );
+    srv.client()
+        .push(b"live-during-backlog", Durability::Durable)
+        .expect("a live push must ack while the backlog drains");
+    send_sighup(srv.child_pid());
+    assert!(
+        wait_for_sighup_reloads(&srv, "noop", 1) >= 1,
+        "a HUP during the backlog must be served as a reload, not dropped"
+    );
+    let deadline = Instant::now() + Duration::from_secs(300);
+    while count_wab_files(&wab, ".wab.sealed") > 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the backlog was not delivered within 300 s: {} sealed left",
+            count_wab_files(&wab, ".wab.sealed")
+        );
+        thread::sleep(Duration::from_millis(250));
+    }
+    srv.shutdown();
+    assert!(
+        sink.bodies()
+            .iter()
+            .any(|b| b.as_slice() == b"live-during-backlog"),
+        "the live record must be delivered too"
+    );
+    let _ = fs::remove_dir_all(&wab);
+}
+
+/// Spec §6 "A signal before serving": SIGTERM while recovery runs lets the
+/// step finish, never binds or serves the producer socket, and exits 0
+/// within the bound. Before this test only the chaos campaign (PR 9,
+/// `sigterm_in_recovery`) exercised this path.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn sigterm_during_recovery_exits_zero_without_ever_serving() {
+    let mut srv = weir_server!("sigterm_recovering")
+        .env("WEIR_TEST_HOOKS", "1")
+        .env("WEIR_TEST_STARTUP_DELAY_MS", "2000")
+        .log_level("info")
+        .spawn();
+    wait_for_phase_recovering(&srv, Duration::from_secs(5));
+    srv.signal(libc::SIGTERM);
+    // §6: a SECOND signal during recovery is logged and forces, but recovery
+    // still finishes and the joins still run.
+    thread::sleep(Duration::from_millis(200));
+    srv.signal(libc::SIGTERM);
+    let status = srv
+        .wait_for_exit(Duration::from_secs(2 + 10 + 6))
+        .unwrap_or_else(|| panic!("a pre-serving shutdown must exit\nlog:\n{}", read_log(&srv)));
+    assert!(status.success(), "{status}");
+    assert!(
+        !srv.socket_path.exists(),
+        "the producer socket was never served, so no socket file may remain"
+    );
+    let log = read_log(&srv);
+    assert!(!log.contains("weir serving"), "{log}");
+    assert!(log.contains("shutdown requested during startup"), "{log}");
+    assert!(
+        log.contains("forced shutdown"),
+        "the second signal must force\n{log}"
+    );
+    assert!(
+        log.contains("WAB recovery complete"),
+        "a forced shutdown must not interrupt recovery\n{log}"
+    );
+}
+
+// ── HTTP health routes (Foundations, spec §10) ────────────────────────────────
+
+/// One raw HTTP exchange against the metrics/health listener: (status, head, body).
+fn http_exchange(port: u16, request: &str) -> (u16, String, Vec<u8>) {
+    use std::io::{Read, Write};
+    let mut s =
+        std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect metrics listener");
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    s.write_all(request.as_bytes()).unwrap();
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw)
+        .expect("a full response, not a reset");
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("a response head");
+    let head = String::from_utf8_lossy(&raw[..split]).into_owned();
+    let status = head
+        .split(' ')
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .expect("a status code");
+    (status, head, raw[split + 4..].to_vec())
+}
+
+fn http_get(port: u16, path: &str) -> (u16, String, String) {
+    let (s, h, b) = http_exchange(port, &format!("GET {path} HTTP/1.0\r\n\r\n"));
+    (s, h, String::from_utf8_lossy(&b).into_owned())
+}
+
+#[test]
+fn health_routes_answer_on_a_serving_daemon() {
+    let srv = weir_server!("health_routes").start();
+    let p = srv.metrics_port;
+
+    let (s, h, b) = http_get(p, "/livez");
+    assert_eq!((s, b.as_str()), (200, "ok\n"));
+    assert!(
+        h.contains("Cache-Control: no-store") && h.contains("Connection: close"),
+        "{h}"
+    );
+
+    // `serving` is stored after the listener stores (spec §6 step 12), a
+    // hair after wait_ready's connect can succeed: poll briefly.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let (s, _, b) = http_get(p, "/readyz");
+        if s == 200 {
+            assert_eq!(b, "ok\n");
+            break;
+        }
+        assert!(Instant::now() < deadline, "/readyz never became 200: {b}");
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(http_get(p, "/startupz").2, "ok\n");
+
+    let (s, h, b) = http_get(p, "/status");
+    assert_eq!(s, 200);
+    assert!(
+        h.contains("Content-Type: application/json; charset=utf-8"),
+        "{h}"
+    );
+    let doc: serde_json::Value = serde_json::from_str(&b).unwrap();
+    assert_eq!(doc["schema"], "weir.status/v1");
+    assert_eq!(doc["view"], "public");
+    assert_eq!(doc["verdict"]["ready"], true);
+    assert!(
+        doc.get("pid").is_none() && doc.get("instance").is_none(),
+        "{doc}"
+    );
+
+    for path in ["/metrics", "/", "/foo", "/READYZ", "/readyz/"] {
+        let (s, h, b) = http_get(p, path);
+        assert_eq!(s, 200, "{path}");
+        assert!(
+            h.contains("Content-Type: application/openmetrics-text; version=1.0.0; charset=utf-8"),
+            "{path}: {h}"
+        );
+        assert!(
+            !h.contains("Cache-Control"),
+            "metrics head is byte-identical to 4.0: {h}"
+        );
+        assert!(b.contains("weir_records_accepted"), "{path}");
+    }
+
+    let (s, h, b) = http_exchange(p, "HEAD /readyz HTTP/1.0\r\n\r\n");
+    assert_eq!(s, 200);
+    assert!(h.contains("Content-Length: 3") && b.is_empty(), "{h}");
+    let (s, h, _) = http_exchange(p, "POST /status HTTP/1.0\r\nContent-Length: 0\r\n\r\n");
+    assert_eq!(s, 405);
+    assert!(h.contains("Allow: GET, HEAD"), "{h}");
+}
+
+/// §16 system test 3, the /readyz half (PR 4 owns the socket-gone and
+/// acks half): /readyz answers 503 within 200 ms of SIGTERM, and /livez and
+/// /metrics stay up until exit. A hanging sink keeps the drain inside its
+/// 10 s shutdown budget (spec §7), so the daemon is still running while the
+/// probes are asked. An idle producer connection would not hold it: under
+/// Decision Q5 it gets EOF at the lame duck.
+#[test]
+fn readyz_goes_503_within_200ms_of_sigterm_while_metrics_stay_up() {
+    let hole = RecordingSink::start_hanging();
+    let mut srv = weir_server!("readyz_sigterm")
+        .shutdown_timeout_secs(5)
+        .extra_config(
+            "sink_type = \"http\"\nsink_timeout_secs = 300\nwab_segment_max_bytes = 4096\n\
+             drain_shutdown_budget_secs = 10",
+        )
+        .env("WEIR_SINK_URL", hole.url())
+        .start();
+    let p = srv.metrics_port;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while http_get(p, "/readyz").0 != 200 {
+        assert!(Instant::now() < deadline, "never ready");
+        thread::sleep(Duration::from_millis(20));
+    }
+    // 8 x 2 KiB durable records over 4 KiB segments: sealed segments reach
+    // the drain, whose commit hangs (the same setup as PR 4's system test 3).
+    let mut c = srv.client();
+    for i in 0..8 {
+        let mut payload = format!("rz-{i}-").into_bytes();
+        payload.resize(2048, b'r');
+        c.push(payload, Durability::Durable).unwrap();
+    }
+    drop(c);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while hole.connections() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the drain never reached the sink"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    // SAFETY: kill(2) with a pid we spawned and still own (not yet reaped).
+    let rc = unsafe { libc::kill(srv.child_pid() as libc::pid_t, libc::SIGTERM) };
+    assert_eq!(rc, 0);
+    let t = Instant::now();
+    let body = loop {
+        let (s, _, b) = http_get(p, "/readyz");
+        if s == 503 {
+            break b;
+        }
+        assert!(
+            t.elapsed() < Duration::from_secs(2),
+            "/readyz still 200 after SIGTERM"
+        );
+        thread::sleep(Duration::from_millis(5));
+    };
+    assert!(
+        t.elapsed() < Duration::from_millis(200),
+        "/readyz took {:?} to fail",
+        t.elapsed()
+    );
+    assert!(body.contains("shutting_down"), "{body}");
+    assert_eq!(
+        http_get(p, "/livez").0,
+        200,
+        "liveness never fails on shutdown (spec §10)"
+    );
+    assert!(
+        http_get(p, "/metrics").2.contains("weir_"),
+        "/metrics stays up until exit (spec §7 T1)"
+    );
+
+    // shutdown_timeout 5 s + drain budget 10 s + DRAIN_EXIT_GRACE 2 s, well inside 30 s.
+    assert!(
+        srv.wait_for_exit(Duration::from_secs(30)).is_some(),
+        "daemon exits after SIGTERM"
+    );
+}
+
+/// The public surface never shows a secret or free text (spec §9.1, §16
+/// sentinel test; the board-level half is in status::http's unit tests).
+#[test]
+fn public_status_and_verbose_probes_carry_no_secrets() {
+    let wab = std::env::temp_dir().join(format!("weir-SENTINELWABDIR-{}", std::process::id()));
+    fs::create_dir_all(&wab).unwrap();
+    let srv = weir_server!("public_status_secrets")
+        .wab_dir(&wab)
+        .extra_config(
+            "sink_type = \"http\"\n\
+             sink_max_retries = 0\n\
+             health_poll_interval_secs = 1\n\
+             wab_segment_max_age_secs = 1",
+        )
+        // Port 1 refuses at once, so the probe and the commits fail with
+        // errors that name the URL; the admin side would carry them.
+        .env(
+            "WEIR_SINK_URL",
+            "http://SENTINELUSER:SENTINELPASS@127.0.0.1:1/SENTINELPATH?token=SENTINELQUERY",
+        )
+        .env("WEIR_SINK_BEARER_TOKEN", "SENTINELBEARER")
+        .start();
+    let p = srv.metrics_port;
+    srv.client()
+        .push(b"one record to fail delivery", Durability::Durable)
+        .unwrap();
+
+    // Wait until the sink is known down, so every sink field is populated.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let doc: serde_json::Value = serde_json::from_str(&http_get(p, "/status").2).unwrap();
+        if doc["sink"]["health"] == "down" && !doc["sink"]["last_failure"].is_null() {
+            assert_eq!(doc["sink"]["type"], "http");
+            break;
+        }
+        assert!(Instant::now() < deadline, "sink never reported down: {doc}");
+        thread::sleep(Duration::from_millis(200));
+    }
+    for path in ["/status", "/livez?verbose", "/readyz?verbose", "/startupz"] {
+        let (_, h, b) = http_get(p, path);
+        for text in [&h, &b] {
+            assert!(!text.contains("SENTINEL"), "{path} leaked: {text}");
+            assert!(
+                !text.contains("127.0.0.1:1"),
+                "{path} leaked the sink endpoint: {text}"
+            );
+        }
+    }
+    drop(srv);
+    let _ = fs::remove_dir_all(&wab);
+}
+
+/// Spec §16 system test 10: a restart over `wab_max_bytes` is not ready from
+/// the first answer after startup (the synchronous cap gate), and becomes
+/// ready again without a single push once the drain brings the WAB below
+/// the low-water mark (the 5 s poll task's cap refresh).
+#[test]
+fn a_restart_over_the_cap_is_not_ready_at_once_and_recovers_with_zero_pushes() {
+    let wab = fresh_wab_dir("cap_restart");
+    seed_sealed_backlog("cap_restart_seed", &wab);
+    pad_sealed_backlog(&wab, 60);
+    let on_disk = wab_dir_bytes(&wab);
+    // Legal for one shard of 4096-byte segments (minimum 4560), and well
+    // under what is on disk.
+    let cap = (on_disk / 2).max(8192);
+    assert!(
+        on_disk > cap,
+        "the seeded backlog ({on_disk} B) must exceed the cap ({cap} B)"
+    );
+    let sink = RecordingSink::start_slow(Duration::from_millis(200));
+    let srv = weir_server!("cap_restart")
+        .wab_dir(&wab)
+        .shard_count(1)
+        .extra_config(format!(
+            "sink_type = \"http\"\nwab_segment_max_bytes = 4096\nwab_max_bytes = {cap}"
+        ))
+        .env("WEIR_SINK_URL", sink.url())
+        .spawn();
+    let port = srv.metrics_port;
+    let readyz = || -> Option<(u16, String)> {
+        use std::io::{Read, Write};
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).ok()?;
+        s.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+        s.write_all(b"GET /readyz HTTP/1.0\r\n\r\n").ok()?;
+        let mut raw = String::new();
+        s.read_to_string(&mut raw).ok()?;
+        let (head, body) = raw.split_once("\r\n\r\n")?;
+        Some((head.split(' ').nth(1)?.parse().ok()?, body.to_string()))
+    };
+
+    // The first answer past startup names the cap; it is never a 200.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let (status, body) = loop {
+        if let Some((s, b)) = readyz()
+            && !b.contains("starting")
+        {
+            break (s, b);
+        }
+        assert!(Instant::now() < deadline, "the daemon never left startup");
+        thread::sleep(Duration::from_millis(20));
+    };
+    assert_eq!(
+        status, 503,
+        "a restart over the cap must not be ready: {body}"
+    );
+    assert!(body.contains("wab_cap_rejecting"), "{body}");
+
+    // No client ever connects: the poll task alone clears the cap.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while readyz().map(|(s, _)| s) != Some(200) {
+        assert!(
+            Instant::now() < deadline,
+            "readiness never recovered without pushes; {} B on disk, cap {cap} B",
+            wab_dir_bytes(&wab)
+        );
+        thread::sleep(Duration::from_millis(250));
+    }
+    drop(srv);
+    let _ = fs::remove_dir_all(&wab);
 }
 
 // ── File descriptor limit exhaustion ─────────────────────────────────────────
@@ -2892,8 +4720,8 @@ fn quarantined_records_after_a_corruption_can_be_recovered() {
 
     srv.restart_in_place();
 
-    // Crash recovery runs synchronously during startup — `wab::spawn`'s
-    // "Phase 1 (calling thread): crash recovery", BEFORE the socket is bound
+    // Crash recovery runs synchronously during startup — `wab::recover`, on
+    // the main thread before any flusher exists, BEFORE the socket is bound
     // — so by the time `restart_in_place` returns (it waits for the socket to
     // accept connections), the quarantine copy already exists on disk.
     assert!(
@@ -3473,6 +5301,108 @@ fn sql_sink_content_keyed_schema_loses_a_distinct_duplicate_record() {
              and docs/operations/configuration.md's warning needs re-reading — do not simply \
              update this number."
         );
+    }
+}
+
+/// Spec §4.7 (D6), through the daemon: in `insert_mode = "plain"` a segment
+/// whose records are already in the table used to livelock the drain. The
+/// multi-row INSERT is all-or-nothing, the duplicate key was transient, and the
+/// identical statement was re-sent forever. Now the sink bisects (no
+/// `id_column` here) and the drain receives a proper partition: the new record
+/// is committed and the two duplicates are dead-lettered, losslessly.
+///
+/// Payloads carry a per-run nonce so a re-run does not collide with rows a
+/// previous run left in the rig's `weir_records` (UNIQUE on the payload).
+///
+/// The id-column half of §4.7 needs a replay of the same WAB coordinates, which
+/// the daemon only produces after a crash, so it is pinned at the sink level by
+/// the `live_` tests in `sink/mysql.rs` and `sink/postgres.rs`.
+#[test]
+#[ignore = "requires the docker-compose test stack (see deploy/run-sink-integration-tests.sh)"]
+fn sql_sink_plain_mode_duplicate_keys_do_not_livelock_the_drain() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    for (engine, url_var, table_cfg, mode_cfg) in [
+        (
+            "postgres",
+            "WEIR_TEST_POSTGRES_URL",
+            "sink_postgres_table",
+            "sink_postgres_insert_mode",
+        ),
+        (
+            "mysql",
+            "WEIR_TEST_MYSQL_URL",
+            "sink_mysql_table",
+            "sink_mysql_insert_mode",
+        ),
+    ] {
+        let url = std::env::var(url_var)
+            .unwrap_or_else(|_| panic!("{url_var} not set — see the test docstring"));
+        let srv = weir_server!(&format!("{engine}_plain_dup"))
+            .batch_size(200)
+            .batch_deadline_ms(5)
+            .shutdown_timeout_secs(5)
+            .env("WEIR_SINK_URL", &url)
+            .extra_config(format!("sink_type = \"{engine}\""))
+            .extra_config(format!("{table_cfg} = \"weir_records\""))
+            .extra_config(format!("{mode_cfg} = \"plain\""))
+            .extra_config("wab_segment_max_age_secs = 1")
+            .start();
+        let rec = |name: &str| format!("plain-dup-{engine}-{nonce}-{name}");
+        let outcome = |body: &str, o: &str| {
+            parse_metric(
+                body,
+                &format!("weir_sink_commit_records_total{{outcome=\"{o}\"}}"),
+            )
+        };
+        let wait_for = |what: &str, done: &dyn Fn(&str) -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                let body = srv.scrape_metrics();
+                if done(&body) {
+                    return body;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "{engine}: timed out waiting for {what}\n{}",
+                    body.lines()
+                        .filter(|l| l.starts_with("weir_sink_"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                );
+                thread::sleep(Duration::from_millis(200));
+            }
+        };
+
+        // First segment: a and b, delivered normally.
+        let mut client = srv.client();
+        for name in ["a", "b"] {
+            client
+                .push(rec(name).as_bytes(), Durability::Durable)
+                .expect("push");
+        }
+        wait_for("the first segment", &|b| outcome(b, "committed") >= 2);
+
+        // Second segment: a and b again, plus c. Before the fix this segment
+        // never left the drain: committed stayed at 2, retried climbed forever.
+        for name in ["a", "b", "c"] {
+            client
+                .push(rec(name).as_bytes(), Durability::Durable)
+                .expect("push");
+        }
+        drop(client);
+        let body = wait_for("the second segment to resolve", &|b| {
+            outcome(b, "committed") + outcome(b, "dead_lettered") >= 5
+        });
+        assert_eq!(outcome(&body, "committed"), 3, "{engine}: a, b, then c");
+        assert_eq!(
+            outcome(&body, "dead_lettered"),
+            2,
+            "{engine}: the replayed a and b, kept in the dead-letter store"
+        );
+        drop(srv);
     }
 }
 
@@ -4078,4 +6008,717 @@ fn the_client_refuses_a_locally_invalid_batch_without_poisoning() {
     client
         .push(b"still works", Durability::Durable)
         .expect("push after refusals");
+}
+
+/// SP-D (spec §5.13): the startup line names the version, the wire version
+/// and the effective config, and a log redirected to a file carries no
+/// ANSI escape codes.
+#[test]
+fn startup_log_names_version_and_config_and_carries_no_ansi() {
+    let srv = weir_server!("startup_line").log_level("info").start();
+    let log = fs::read_to_string(srv.tmp_dir.join("weir.log")).unwrap();
+    let line = log
+        .lines()
+        .find(|l| l.contains("weir starting"))
+        .unwrap_or_else(|| panic!("no startup line:\n{log}"));
+    assert!(
+        line.contains(&format!("version={}", env!("CARGO_PKG_VERSION"))),
+        "{line}"
+    );
+    assert!(line.contains("wire_version=1"), "{line}");
+    assert!(
+        line.contains("\"wab_dir_lock\": \"required\""),
+        "the ConfigView rides the line: {line}"
+    );
+    assert!(!log.contains('\u{1b}'), "no ANSI escapes in a file:\n{log}");
+}
+
+/// Spec §16 system test 8: a shard whose counter scan fails goes
+/// Offline(CounterScanFailed), and new connections are routed around it.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn routing_avoids_a_shard_whose_counter_scan_failed() {
+    let srv = weir_server!("route_offline")
+        .shard_count(2)
+        .env("WEIR_TEST_HOOKS", "1")
+        .env("WEIR_TEST_FAIL_SHARD_COUNTER_SCAN", "1")
+        .start();
+    // One push per fresh connection: round-robin would put half on shard 1.
+    for i in 0..20 {
+        let mut c = srv.client();
+        c.push(format!("r{i}").as_bytes(), Durability::Durable)
+            .unwrap_or_else(|e| panic!("connection {i} was routed to the offline shard: {e}"));
+    }
+    assert!(wab_dir_bytes(&srv.wab_dir.join("shard_00")) > 0);
+    assert_eq!(
+        wab_dir_bytes(&srv.wab_dir.join("shard_01")),
+        0,
+        "nothing may be routed to the offline shard"
+    );
+    // Spec §16: a test-hooks build says so at startup, and that it is armed.
+    let log = fs::read_to_string(srv.tmp_dir.join("weir.log")).unwrap();
+    assert!(
+        log.contains("THIS BINARY CONTAINS TEST HOOKS") && log.contains("armed=true"),
+        "no test-hooks startup WARN:\n{log}"
+    );
+}
+
+/// With every shard offline, a connection is closed at accept and counted.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn no_live_shard_refuses_connections_and_counts_them() {
+    let srv = weir_server!("route_none_live")
+        .shard_count(1)
+        .env("WEIR_TEST_HOOKS", "1")
+        .env("WEIR_TEST_FAIL_SHARD_COUNTER_SCAN", "0")
+        .start();
+    let mut c = srv.client();
+    assert!(
+        c.push(b"x", Durability::Durable).is_err(),
+        "no shard can take the record"
+    );
+    let metrics = srv.scrape_metrics();
+    let refused: f64 = metrics
+        .lines()
+        .find_map(|l| l.strip_prefix("weir_connections_refused_no_live_shard_total "))
+        .expect("the refusal counter is exported")
+        .trim()
+        .parse()
+        .unwrap();
+    // wait_ready's own probe connection is refused too.
+    assert!(refused >= 2.0, "refused = {refused}");
+}
+
+/// A binary built with the hooks says so loudly at startup, armed or not.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_binary_with_test_hooks_announces_them() {
+    let srv = weir_server!("hooks_announce").log_level("info").start();
+    let log = read_log(&srv);
+    assert!(
+        log.contains("THIS BINARY CONTAINS TEST HOOKS"),
+        "the startup WARN is missing\nlog:\n{log}"
+    );
+    srv.shutdown();
+}
+
+// ── Bounded shutdown (Foundations §7, PR 4 Task 4.11) ─────────────────────────
+
+/// Every tag in `wanted` (a fixed-length prefix of each payload) shows up in
+/// `sink`'s POST bodies within `within`. At-least-once: duplicates allowed.
+fn assert_all_delivered(sink: &RecordingSink, wanted: &[String], within: Duration) {
+    let len = wanted.first().map_or(0, String::len);
+    let deadline = Instant::now() + within;
+    loop {
+        let got: std::collections::HashSet<String> = sink
+            .bodies()
+            .iter()
+            .filter_map(|b| std::str::from_utf8(b.get(..len)?).ok().map(str::to_owned))
+            .collect();
+        let missing: Vec<&String> = wanted.iter().filter(|w| !got.contains(*w)).collect();
+        if missing.is_empty() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{} of {} acked records were never delivered, e.g. {:?}",
+            missing.len(),
+            wanted.len(),
+            &missing[..missing.len().min(5)]
+        );
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Spec §16 system test 3: SIGTERM with an idle open connection. Within 200 ms
+/// the socket is gone and new connects fail; the idle connection is closed
+/// cleanly (EOF); /metrics keeps answering, reporting `shutting_down`, until
+/// the process exits. (PR 5 adds the `/readyz` 503 assertion here.)
+#[test]
+fn sigterm_unlinks_the_socket_at_once_and_metrics_stay_up_until_exit() {
+    use std::io::Read;
+    let hole = RecordingSink::start_hanging();
+    let mut srv = weir_server!("lame_duck")
+        .extra_config(
+            "sink_type = \"http\"\nsink_timeout_secs = 300\nwab_segment_max_bytes = 4096\n\
+             drain_shutdown_budget_secs = 4",
+        )
+        .env("WEIR_SINK_URL", hole.url())
+        .log_level("info")
+        .start();
+    let mut c = srv.client();
+    for i in 0..8 {
+        let mut p = format!("ld-{i}-").into_bytes();
+        p.resize(2048, b'l');
+        c.push(p, Durability::Durable).unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while hole.connections() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the drain never reached the sink"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let idle = std::os::unix::net::UnixStream::connect(&srv.socket_path).unwrap();
+    idle.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+
+    let t0 = Instant::now();
+    srv.signal(libc::SIGTERM);
+    while srv.socket_path.exists() {
+        assert!(
+            t0.elapsed() < Duration::from_millis(200),
+            "lame duck: the socket must be unlinked within 200 ms of SIGTERM"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        std::os::unix::net::UnixStream::connect(&srv.socket_path).is_err(),
+        "new connects must fail fast"
+    );
+    let mut buf = [0u8; 1];
+    assert_eq!(
+        (&idle)
+            .read(&mut buf)
+            .expect("a clean close, not a reset or a hang"),
+        0,
+        "the idle connection must see EOF"
+    );
+    let body = srv
+        .try_scrape_metrics()
+        .expect("/metrics must answer during shutdown");
+    assert_eq!(
+        parse_metric_f64(&body, "weir_startup_phase{phase=\"shutting_down\"} "),
+        1.0,
+        "{body}"
+    );
+    thread::sleep(Duration::from_secs(1));
+    let body = srv
+        .try_scrape_metrics()
+        .expect("/metrics must stay up while the drain spends its budget");
+    // T2 publishes the deadline in force (spec §13), once the joins are done:
+    // the connection drain here is clean (both connections are idle).
+    assert!(
+        parse_metric_f64(&body, "weir_drain_shutdown_deadline_seconds ") > 0.0,
+        "T2 must publish the drain deadline\n{body}"
+    );
+    let status = srv
+        .wait_for_exit(Duration::from_secs(3 + 4 + 6))
+        .unwrap_or_else(|| panic!("shutdown not bounded\nlog:\n{}", read_log(&srv)));
+    assert!(status.success(), "{status}");
+    drop(c);
+}
+
+/// Spec §16 system test 4: bounded shutdown under a black-holed sink WITH THE
+/// DRAIN CHANNEL FULL at SIGTERM (a flusher is blocked in its hand-off). Exit
+/// within shutdown_timeout + budget + 6 s; nothing is confirmed; a restart
+/// against a working sink delivers every acked record.
+#[test]
+fn bounded_shutdown_with_a_full_drain_channel_loses_no_acked_record() {
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+    let wab = fresh_wab_dir("bounded_full");
+    let hole = RecordingSink::start_hanging();
+    let mut srv = weir_server!("bounded_full")
+        .wab_dir(&wab)
+        .extra_config(
+            "sink_type = \"http\"\nsink_timeout_secs = 300\nwab_segment_max_bytes = 4096\n\
+             drain_shutdown_budget_secs = 2",
+        )
+        .env("WEIR_SINK_URL", hole.url())
+        .log_level("info")
+        .start();
+    let acked = Arc::new(Mutex::new(Vec::<String>::new()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let pusher = {
+        let (path, acked, stop) = (
+            srv.socket_path.clone(),
+            Arc::clone(&acked),
+            Arc::clone(&stop),
+        );
+        thread::spawn(move || {
+            let Ok(mut c) = WeirClient::connect(&path) else {
+                return;
+            };
+            let mut i = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                let tag = format!("full-{i:06}");
+                let mut p = tag.clone().into_bytes();
+                p.resize(1024, b'f');
+                match c.push(p, Durability::Durable) {
+                    Ok(()) => acked.lock().unwrap().push(tag),
+                    Err(_) => break,
+                }
+                i += 1;
+            }
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let depth = parse_metric_f64(&srv.scrape_metrics(), "weir_drain_channel_depth ");
+        if depth >= 256.0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the drain channel never filled (depth {depth})"
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    srv.signal(libc::SIGTERM);
+    let status = srv
+        .wait_for_exit(Duration::from_secs(3 + 2 + 6))
+        .unwrap_or_else(|| panic!("shutdown not bounded\nlog:\n{}", read_log(&srv)));
+    stop.store(true, Ordering::Relaxed);
+    pusher.join().unwrap();
+    assert!(status.success(), "{status}");
+    let log = read_log(&srv);
+    assert!(log.contains("left sealed+unconfirmed for replay"), "{log}");
+    assert_eq!(
+        count_wab_files(&wab, ".confirmed"),
+        0,
+        "nothing reached the sink, so nothing may be confirmed"
+    );
+    drop(srv);
+    drop(hole);
+
+    let acked = acked.lock().unwrap().clone();
+    assert!(
+        acked.len() > 256,
+        "the channel cannot fill with {} records",
+        acked.len()
+    );
+    let sink = RecordingSink::start();
+    let srv2 = weir_server!("bounded_full_2")
+        .wab_dir(&wab)
+        .extra_config("sink_type = \"http\"")
+        .env("WEIR_SINK_URL", sink.url())
+        .start();
+    assert_all_delivered(&sink, &acked, Duration::from_secs(120));
+    drop(srv2);
+    let _ = fs::remove_dir_all(&wab);
+}
+
+/// Spec §16 system test 5: with a 120 s budget one SIGTERM keeps waiting on a
+/// black-holed sink; a second forces the exit within the drain-exit grace, exit
+/// status 0, and a restart still delivers every acked record.
+#[test]
+fn a_second_sigterm_forces_a_prompt_exit_and_loses_nothing() {
+    let wab = fresh_wab_dir("second_sigterm");
+    let hole = RecordingSink::start_hanging();
+    let mut srv = weir_server!("second_sigterm")
+        .wab_dir(&wab)
+        .extra_config(
+            "sink_type = \"http\"\nsink_timeout_secs = 300\nwab_segment_max_bytes = 4096\n\
+             drain_shutdown_budget_secs = 120",
+        )
+        .env("WEIR_SINK_URL", hole.url())
+        .log_level("info")
+        .start();
+    let mut c = srv.client();
+    let mut acked = Vec::new();
+    for i in 0..20 {
+        let tag = format!("force-{i:04}");
+        let mut p = tag.clone().into_bytes();
+        p.resize(1024, b'q');
+        c.push(p, Durability::Durable).unwrap();
+        acked.push(tag);
+    }
+    drop(c);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while hole.connections() == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the drain never reached the sink"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+
+    srv.signal(libc::SIGTERM);
+    assert!(
+        srv.wait_for_exit(Duration::from_secs(5)).is_none(),
+        "with a 120 s budget one SIGTERM must not exit within 5 s"
+    );
+    srv.signal(libc::SIGTERM);
+    let status = srv
+        .wait_for_exit(Duration::from_secs(2 + 1 + 3))
+        .unwrap_or_else(|| {
+            panic!(
+                "the second SIGTERM did not force an exit\nlog:\n{}",
+                read_log(&srv)
+            )
+        });
+    assert!(
+        status.success(),
+        "a forced exit is still exit 0 (owner decision): {status}"
+    );
+    assert!(read_log(&srv).contains("forced shutdown"));
+    assert_eq!(count_wab_files(&wab, ".confirmed"), 0);
+    drop(srv);
+    drop(hole);
+
+    let sink = RecordingSink::start();
+    let srv2 = weir_server!("second_sigterm_2")
+        .wab_dir(&wab)
+        .extra_config("sink_type = \"http\"")
+        .env("WEIR_SINK_URL", sink.url())
+        .start();
+    assert_all_delivered(&sink, &acked, Duration::from_secs(60));
+    drop(srv2);
+    let _ = fs::remove_dir_all(&wab);
+}
+
+// ── No zombie drain, and a zero budget (PR 4 Task 4.12) ───────────────────────
+
+/// Behaviour change "no more zombie drain" (Foundations §5.4, §17 item 8):
+/// shard_count = 1 and its only flusher goes offline at startup (the
+/// counter-scan hook), so every drain-channel Sender is dropped. The attached
+/// drain must keep delivering the on-disk backlog and stay alive afterwards;
+/// before, it exited on Disconnected and reported `stopped` while the daemon
+/// kept running.
+#[cfg(feature = "test-hooks")]
+#[test]
+fn a_dead_only_flusher_does_not_stop_the_drain() {
+    let wab = fresh_wab_dir("zombie");
+    seed_sealed_backlog("zombie_seed", &wab);
+    let sink = RecordingSink::start();
+    let mut srv = weir_server!("zombie")
+        .wab_dir(&wab)
+        .shard_count(1)
+        .extra_config("sink_type = \"http\"")
+        .env("WEIR_SINK_URL", sink.url())
+        .env("WEIR_TEST_HOOKS", "1")
+        .env("WEIR_TEST_FAIL_SHARD_COUNTER_SCAN", "0")
+        .log_level("info")
+        .spawn();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while count_wab_files(&wab, ".wab.sealed") > 0 {
+        assert!(
+            Instant::now() < deadline,
+            "the backlog must be delivered with the only flusher offline\nlog:\n{}",
+            read_log(&srv)
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+    // The WARN lands at the drain's next wait slice, which can be after the
+    // last segment went; read the log only after the 2 s settle.
+    thread::sleep(Duration::from_secs(2));
+    let log = read_log(&srv);
+    assert!(
+        log.contains("segment-counter scan failed repeatedly"),
+        "the hook did not fire\n{log}"
+    );
+    assert!(
+        log.contains("all flushers gone; continuing to deliver the on-disk backlog"),
+        "{log}"
+    );
+    let body = srv.try_scrape_metrics().expect("metrics up");
+    assert_eq!(
+        parse_metric_f64(&body, "weir_drain_state{state=\"stopped\"} "),
+        0.0,
+        "zombie: the drain stopped while the daemon runs\n{body}"
+    );
+    srv.signal(libc::SIGTERM);
+    let status = srv
+        .wait_for_exit(Duration::from_secs(3 + 10 + 6))
+        .expect("an attached drain with no flushers must still stop on SIGTERM");
+    assert!(status.success());
+    let _ = fs::remove_dir_all(&wab);
+}
+
+/// Spec §16 system test 11: the ordinary SIGTERM path with a ZERO budget is
+/// prompt and loses nothing: what the drain abandons replays on the next start.
+/// `sink_http_concurrency = 1` serializes the POSTs (60 records at 500 ms is
+/// ~30 s), so a drain that ignores the budget cannot pass by luck.
+#[test]
+fn sigterm_with_a_zero_budget_is_prompt_and_loses_nothing() {
+    let wab = fresh_wab_dir("budget_zero");
+    let slow = RecordingSink::start_slow(Duration::from_millis(500));
+    let mut srv = weir_server!("budget_zero")
+        .wab_dir(&wab)
+        .extra_config(
+            "sink_type = \"http\"\nwab_segment_max_bytes = 4096\nsink_http_concurrency = 1\n\
+             drain_shutdown_budget_secs = 0",
+        )
+        .env("WEIR_SINK_URL", slow.url())
+        .start();
+    let mut c = srv.client();
+    let tags: Vec<String> = (0..60).map(|i| format!("zero-budget-{i:03}")).collect();
+    for t in &tags {
+        let mut p = t.clone().into_bytes();
+        p.resize(1024, b'z');
+        c.push(p, Durability::Durable).unwrap();
+    }
+    drop(c);
+    let took = srv.sigterm();
+    assert!(
+        // shutdown_timeout (3) + the budget (0) + 6 s.
+        took < Duration::from_secs(3 + 6),
+        "budget 0: SIGTERM must not wait on a 500 ms/POST sink, took {took:?}"
+    );
+    drop(srv);
+
+    let sink = RecordingSink::start();
+    let srv2 = weir_server!("budget_zero_2")
+        .wab_dir(&wab)
+        .extra_config("sink_type = \"http\"")
+        .env("WEIR_SINK_URL", sink.url())
+        .start();
+    // Delivered across both runs: whatever run 1 confirmed is gone from disk.
+    let mut seen: Vec<Vec<u8>> = slow.bodies();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        seen.extend(sink.bodies());
+        let missing = tags
+            .iter()
+            .filter(|t| !seen.iter().any(|b| b.starts_with(t.as_bytes())))
+            .count();
+        if missing == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{missing} acked records were lost"
+        );
+        thread::sleep(Duration::from_millis(250));
+    }
+    drop(srv2);
+    let _ = fs::remove_dir_all(&wab);
+}
+
+// ── Admin socket (Foundations PR 6, spec §5.9 / §11) ─────────────────────────
+
+fn admin_json(srv: &weir_testkit::WeirServer, verb: &str, args: &str) -> serde_json::Value {
+    let line = srv.admin(verb, args);
+    serde_json::from_str(&line).unwrap_or_else(|e| panic!("not one JSON line ({e}): {line:?}"))
+}
+
+/// A counter or gauge sample from a scrape; 0 if absent.
+fn scrape_value(srv: &weir_testkit::WeirServer, series: &str) -> f64 {
+    srv.scrape_metrics()
+        .lines()
+        .find(|l| l.starts_with(series) && l[series.len()..].starts_with(' '))
+        .and_then(|l| l.split_whitespace().next_back())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.0)
+}
+
+#[test]
+fn admin_socket_serves_status_at_the_derived_path_and_is_removed_at_exit() {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let mut srv = weir_server!("admin_status").start();
+    let path = srv.admin_socket_path();
+    let meta = fs::symlink_metadata(&path).expect("the admin socket exists at the derived path");
+    assert!(meta.file_type().is_socket());
+    assert_eq!(meta.mode() & 0o777, 0o600);
+
+    let r = admin_json(&srv, "status", "{}");
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(r["instance"]["pid"], srv.child_pid());
+    assert_eq!(
+        r["instance"]["wab_dir"],
+        fs::canonicalize(&srv.wab_dir)
+            .unwrap()
+            .display()
+            .to_string()
+    );
+    assert_eq!(r["result"]["schema"], "weir.status/v1");
+    assert_eq!(r["result"]["view"], "admin");
+    assert_eq!(scrape_value(&srv, "weir_admin_socket_up"), 1.0);
+
+    srv.sigterm();
+    assert!(
+        !path.exists(),
+        "a clean exit removes the admin socket (inode-checked)"
+    );
+}
+
+/// spec §5.10: SIGHUP and the admin verb are one reload path.
+#[test]
+fn admin_reload_and_sighup_share_one_reload_path() {
+    let srv = weir_server!("admin_reload").start();
+    let r = admin_json(&srv, "reload", "{}");
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(r["result"]["trigger"], "admin");
+    assert_eq!(r["result"]["outcome"], "noop");
+    assert_eq!(
+        scrape_value(
+            &srv,
+            "weir_config_reloads_total{trigger=\"admin\",outcome=\"noop\"}"
+        ),
+        1.0
+    );
+    send_sighup(srv.child_pid());
+    assert_eq!(wait_for_sighup_reloads(&srv, "noop", 1), 1);
+    let s = admin_json(&srv, "status", "{}");
+    assert_eq!(s["result"]["reload"]["last"]["trigger"], "sighup", "{s}");
+}
+
+/// spec §6 step 7: an explicitly configured admin path that cannot be
+/// bound safely is fatal, before recovery.
+#[test]
+fn an_explicit_admin_path_in_a_shared_directory_refuses_to_start() {
+    use std::os::unix::fs::PermissionsExt;
+    let shared = std::env::temp_dir().join(format!("weir_admin_shared_{}", std::process::id()));
+    fs::create_dir_all(&shared).unwrap();
+    fs::set_permissions(&shared, fs::Permissions::from_mode(0o770)).unwrap();
+    let sock = shared.join("a.sock");
+    let (status, log) = weir_server!("admin_explicit_shared")
+        .extra_config(format!("admin_socket_path = \"{}\"", sock.display()))
+        .spawn_expecting_exit(Duration::from_secs(15));
+    assert_eq!(status.code(), Some(1), "{log}");
+    assert!(log.contains("group- or world-writable"), "{log}");
+    assert!(!sock.exists(), "nothing was bound");
+    let _ = fs::remove_dir_all(&shared);
+}
+
+/// spec §6 step 7: the derived default failing disables admin, not the
+/// daemon (and raises admin_unavailable).
+#[test]
+fn a_derived_admin_path_in_a_shared_parent_disables_admin_not_the_daemon() {
+    use std::os::unix::fs::PermissionsExt;
+    // Short label: <canonical temp dir>/…/wab.admin.sock must stay <= 103
+    // bytes on macOS, or the derived path is path_too_long instead.
+    let shared = std::env::temp_dir().join(format!("weir_adm_sh_{}", std::process::id()));
+    let wab = shared.join("wab");
+    fs::create_dir_all(&wab).unwrap();
+    fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+    let srv = weir_server!("admin_derived_shared")
+        .wab_dir(wab.clone())
+        .log_level("info")
+        .start();
+    let mut c = srv.client();
+    c.push(b"still-serving", Durability::Durable)
+        .expect("ingest is unaffected");
+    drop(c);
+    assert!(!shared.join("wab.admin.sock").exists());
+    assert_eq!(scrape_value(&srv, "weir_admin_socket_up"), 0.0);
+    let log = fs::read_to_string(srv.tmp_dir.join("weir.log")).unwrap_or_default();
+    assert!(log.contains("admin socket unavailable"), "{log}");
+    assert!(log.contains("parent_insecure"), "{log}");
+    drop(srv);
+    let _ = fs::remove_dir_all(&shared);
+}
+
+/// spec §16 system test 6: pause, then 1,000 pushes, then resume. Ingest
+/// keeps acking while delivery holds; everything arrives after resume.
+#[test]
+fn admin_pause_holds_delivery_while_ingest_acks_and_resume_delivers_all() {
+    let sink = RecordingSink::start();
+    let mut srv = weir_server!("admin_pause")
+        .extra_config("sink_type = \"http\"")
+        // Small segments, so sealed segments exist during the pushes and
+        // an unpaused drain WOULD deliver them.
+        .extra_config("wab_segment_max_bytes = 4096")
+        .env("WEIR_SINK_URL", sink.url())
+        .start();
+    let r = admin_json(&srv, "drain.pause", r#"{"wait_ms":5000}"#);
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(
+        r["result"]["paused"], true,
+        "an idle drain observes a pause within a 50 ms slice: {r}"
+    );
+
+    let before = sink.bodies().len();
+    let payloads: Vec<String> = (0..1000)
+        .map(|i| format!("paused-{i:04}-{}", "x".repeat(48)))
+        .collect();
+    let mut c = srv.client();
+    for p in &payloads {
+        c.push(p.as_bytes(), Durability::Durable)
+            .expect("ingest keeps acking while paused");
+    }
+    drop(c);
+    thread::sleep(Duration::from_secs(1));
+    assert_eq!(
+        sink.bodies().len(),
+        before,
+        "nothing is delivered while paused"
+    );
+    assert_eq!(
+        admin_json(&srv, "status", "{}")["result"]["drain"]["paused"],
+        true
+    );
+
+    let r = admin_json(&srv, "drain.resume", r#"{"wait_ms":5000}"#);
+    assert_eq!(r["result"]["was_paused"], true, "{r}");
+    assert_eq!(r["result"]["resumed"], true, "{r}");
+
+    // SIGTERM seals the active segment; the drain budget (10 s default)
+    // covers 1,000 local POSTs with room to spare.
+    srv.sigterm();
+    let delivered: std::collections::HashSet<String> = sink
+        .bodies()
+        .into_iter()
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .collect();
+    let missing: Vec<&String> = payloads
+        .iter()
+        .filter(|p| !delivered.contains(*p))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "{} of 1000 never delivered, e.g. {:?}",
+        missing.len(),
+        missing.first()
+    );
+}
+
+/// spec §16 system test 7: a stranded segment is redelivered by
+/// drain.retry_stranded, without waiting for the (here hour-long) health
+/// poll that would otherwise resume it.
+#[test]
+fn admin_retry_stranded_redelivers_without_waiting_for_the_health_poll() {
+    let port = free_port(); // nothing listens yet: every delivery is refused
+    let srv = weir_server!("admin_retry")
+        .extra_config("sink_type = \"http\"")
+        .extra_config("sink_max_retries = 0")
+        .extra_config("health_poll_interval_secs = 3600")
+        // A strand holds its segment off for the backoff it would have
+        // served (the safety floor's `not_before` cool-down, which the rescan
+        // honours so a Retry-After is never violated): 100 ms here.
+        .extra_config("sink_retry_base_delay_ms = 100")
+        .extra_config("wab_segment_max_bytes = 4096")
+        .env("WEIR_SINK_URL", format!("http://127.0.0.1:{port}/sink"))
+        .start();
+    let mut c = srv.client();
+    for i in 0..40 {
+        c.push(
+            format!("stranded-{i:02}-{}", "y".repeat(200)).as_bytes(),
+            Durability::Durable,
+        )
+        .unwrap();
+    }
+    drop(c);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while scrape_value(&srv, "weir_drain_segments_stranded_total") < 1.0
+        && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        scrape_value(&srv, "weir_drain_segments_stranded_total") >= 1.0,
+        "nothing stranded"
+    );
+    // Let every sealed segment strand and every 100 ms cool-down elapse: the
+    // verb rescans the WAB, and a segment still cooling down is (rightly)
+    // excluded from it. Nothing else re-queues it: the next health poll is
+    // an hour away.
+    thread::sleep(Duration::from_secs(1));
+
+    let sink = RecordingSink::start_on(port);
+    let r = admin_json(&srv, "drain.retry_stranded", r#"{"wait_ms":10000}"#);
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(r["result"]["completed"], true, "{r}");
+    assert!(r["result"]["requeued"].as_u64().unwrap_or(0) >= 1, "{r}");
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while sink.bodies().is_empty() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        sink.bodies().iter().any(|b| b.starts_with(b"stranded-")),
+        "the requeued segment reached the recovered sink"
+    );
 }

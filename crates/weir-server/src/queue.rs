@@ -15,12 +15,17 @@ pub const QUEUE_CAPACITY: usize = 65_536;
 /// every worker `Receiver`.
 pub struct QueueSender<T> {
     txs: Vec<Sender<T>>,
+    /// One strong count per live sender; the receiver holds the `Weak`.
+    /// Touched only on clone/drop, never per push.
+    alive: std::sync::Arc<()>,
 }
 
 /// Receive half of the work queue. One `Receiver` per partition; each worker
 /// owns one partition's receiver and never sees records from any other.
 pub struct QueueReceiver<T> {
     rxs: Vec<Receiver<T>>,
+    /// Observes the senders' shared `Arc` without keeping it alive.
+    alive: std::sync::Weak<()>,
 }
 
 /// Creates a bounded partitioned work queue with `partitions` independent
@@ -46,7 +51,12 @@ pub fn new<T>(partitions: usize) -> (QueueSender<T>, QueueReceiver<T>) {
         txs.push(tx);
         rxs.push(rx);
     }
-    (QueueSender { txs }, QueueReceiver { rxs })
+    let alive = std::sync::Arc::new(());
+    let weak = std::sync::Arc::downgrade(&alive);
+    (
+        QueueSender { txs, alive },
+        QueueReceiver { rxs, alive: weak },
+    )
 }
 
 impl<T> QueueSender<T> {
@@ -121,6 +131,7 @@ impl<T> Clone for QueueSender<T> {
     fn clone(&self) -> Self {
         QueueSender {
             txs: self.txs.clone(),
+            alive: std::sync::Arc::clone(&self.alive),
         }
     }
 }
@@ -137,6 +148,15 @@ impl<T> QueueReceiver<T> {
 
     pub fn partitions(&self) -> usize {
         self.rxs.len()
+    }
+
+    /// How many `QueueSender` clones are alive. Main waits for 0 before
+    /// joining the workers: a sender that outlives ingest keeps every worker
+    /// in `recv` and the join never returns (the deadlock main.rs documents
+    /// above its pipeline joins). Reads the `Arc` strong count, so nothing is
+    /// added to the push path.
+    pub fn live_senders(&self) -> usize {
+        self.alive.strong_count()
     }
 }
 
@@ -160,7 +180,12 @@ mod tests {
             txs.push(tx);
             rxs.push(rx);
         }
-        (QueueSender { txs }, QueueReceiver { rxs })
+        let alive = std::sync::Arc::new(());
+        let weak = std::sync::Arc::downgrade(&alive);
+        (
+            QueueSender { txs, alive },
+            QueueReceiver { rxs, alive: weak },
+        )
     }
 
     #[test]
@@ -332,6 +357,24 @@ mod tests {
             tx.try_push(0, 99),
             Err(99),
             "a disconnected partition must hand the unit back"
+        );
+    }
+
+    #[test]
+    fn live_senders_counts_clones_and_reaches_zero() {
+        let (tx, rx) = new::<u32>(2);
+        assert_eq!(rx.live_senders(), 1);
+        let tx2 = tx.clone();
+        let tx3 = tx2.clone();
+        assert_eq!(rx.live_senders(), 3);
+        drop(tx);
+        drop(tx3);
+        assert_eq!(rx.live_senders(), 1);
+        drop(tx2);
+        assert_eq!(
+            rx.live_senders(),
+            0,
+            "0 is what main waits for before joining the workers (Foundations §5.7)"
         );
     }
 }
