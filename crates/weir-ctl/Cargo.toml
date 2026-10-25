@@ -36,6 +36,12 @@ serde_json = "1"
 # weir-ctl must evaluate offline without depending on weir-server.
 weir-status = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+# Peer credentials of the admin socket (SO_PEERCRED / getpeereid) and geteuid,
+# for the client-side identity check (spec §11). std's UnixStream::peer_cred is
+# still unstable at MSRV 1.88; libc is already in the lock tree via weir-server.
+libc = "0.2"
+
 [dev-dependencies]
 # Test-only: the requeue tests hand-build dead-letter segment fixtures and need
 # to compute the per-record CRC32 that SegmentReader verifies. Same crate +

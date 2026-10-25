@@ -2727,6 +2727,7 @@ version = "4.0.1"
 dependencies = [
  "clap",
  "crc32fast",
+ "libc",
  "serde_json",
  "weir-attest",
  "weir-client",
