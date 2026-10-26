@@ -20,9 +20,9 @@
 //!
 //! ```toml
 //! # just the wire types
-//! weir-rs = "2.0"
+//! weir-rs = "4.1"
 //! # an app that talks to the daemon
-//! weir-rs = { version = "1.3", features = ["client"] }
+//! weir-rs = { version = "4.1", features = ["client"] }
 //! ```
 //!
 //! The daemon (`weir-server`) and the admin CLI (`weir-ctl`) are **binaries**, not

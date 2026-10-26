@@ -612,9 +612,9 @@ pub(crate) struct Metrics {
     /// for the deployment's tail latency.
     pub connections_aborted_at_shutdown: Counter<u64, AtomicU64>,
     /// Counts pushes that were nacked because the WAB ack channel did not
-    /// fire within `ACK_TIMEOUT`. Triggered by a wedged flusher (stuck on
-    /// a slow fsync, lock contention, etc.) — not by a normal slow disk.
-    /// Any non-zero value indicates a shard is unhealthy even if it hasn't
+    /// fire within `ACK_TIMEOUT`. Usually a flusher blocked handing a sealed
+    /// segment to a full drain channel (`weir_drain_channel_depth`), else one
+    /// stuck on a slow fsync — not a normal slow disk. Any non-zero value indicates a shard is unhealthy even if it hasn't
     /// panicked; check `weir_wab_fsync_duration_seconds` for tail latency
     /// and `weir_wab_flusher_panics` for hard failures.
     pub ack_timeout: Counter<u64, AtomicU64>,
@@ -959,8 +959,9 @@ impl Metrics {
             Counter::<u64, AtomicU64>::default(),
             "weir_ack_timeout",
             "Pushes nacked because the WAB ack channel did not fire within \
-             ACK_TIMEOUT. Indicates a wedged flusher (slow fsync, lock contention) \
-             that hasn't panicked. Investigate alongside weir_wab_fsync_duration_seconds"
+             ACK_TIMEOUT. Usually a full drain channel blocking the flusher's hand-off \
+             (see weir_drain_channel_depth), else a slow fsync. Investigate alongside \
+             weir_wab_fsync_duration_seconds"
         );
         let tls_handshake_failures = reg!(
             Family::<TlsHandshakeFailureLabel, Counter<u64, AtomicU64>>::default(),

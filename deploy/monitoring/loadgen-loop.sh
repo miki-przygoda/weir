@@ -1,5 +1,5 @@
 #!/bin/sh
-# Wait for weir's socket, then push records across all durability tiers in a
+# Wait for weir's socket, then push records across both durability tiers in a
 # loop so the dashboard has live data.
 #
 # Intensity is set by WEIR_LOAD_LEVEL (min | med | high | max). Each level maps
@@ -13,7 +13,7 @@ SOCK="${WEIR_SOCKET:-/run/weir/weir.sock}"
 LEVEL="${WEIR_LOAD_LEVEL:-}"
 
 # Map the level to (COUNT, SLEEP). push_simple pushes COUNT records per tier
-# across 3 tiers (sync/batched/buffered), each awaiting its ack, so the sync
+# across 2 tiers (durable/buffered), each awaiting its ack, so the durable
 # tier (fsync-bound) dominates wall-clock — higher COUNT + lower SLEEP = more
 # offered load and a visibly higher ingest rate on the dashboard.
 case "${LEVEL}" in

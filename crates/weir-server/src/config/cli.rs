@@ -23,6 +23,8 @@ OPTIONS:
                                                [default: 268435456 (256 MiB)]
     --wab-segment-max-age-secs <n>           Idle-seal threshold secs, 0=disabled (0-86400)
                                                [default: 0]
+    --wab-segment-max-lifetime-secs <n>      Seal a segment this long after it was
+                                               created, 0=disabled (0-86400) [default: 0]
     --wab-max-bytes <n>                      Soft cap on live WAB bytes [default: 0]
                                                0=disabled; else its resume threshold,
                                                n/10*9, must exceed
@@ -30,7 +32,7 @@ OPTIONS:
     --wab-compression <none|zstd>            WAB payload compression (default: none).
                                                zstd writes v2 segments a 1.x daemon
                                                cannot read
-    --wab-compression-level <n>              zstd level 1-19 (default: 3), ignored
+    --wab-compression-level <n>              zstd level 1-19 (default: 1), ignored
                                                unless --wab-compression=zstd
     --wab-dir-lock <required|best-effort>    On a filesystem that cannot flock the
                                                wab_dir lock: refuse to start, or warn
@@ -38,6 +40,7 @@ OPTIONS:
                                                A held lock always refuses
     --max-connections <n>                    Connection cap (1-512) [default: 256]
     --max-payload-bytes <n>                  Payload cap in bytes [default: 16777216]
+    --max-batch-records <n>                  Records per PushBatch frame (1-2048) [default: 1024]
     --connection-read-timeout-secs <n>       Slowloris guard (1-600) [default: 30]
     --metrics-port <port>                    Prometheus metrics port [default: 9185]
     --metrics-bind <addr>                    Metrics bind IP (use 0.0.0.0 to expose
@@ -57,7 +60,7 @@ OPTIONS:
     --drain-shutdown-budget-secs <secs>      Drain delivery budget after SIGTERM, once
                                                ingest is sealed (0-3600) [default: 10]
     --sink-type <type>                       Sink: noop | http | mysql | postgres |
-                                               clickhouse [default: noop]
+                                               clickhouse | s3 [default: noop]
     --sink-url <url>                         Sink URL (required for http/mysql/postgres/
                                                clickhouse)
     --sink-timeout-secs <secs>               Per-request sink timeout (1-300) [default: 10]
@@ -97,7 +100,7 @@ OPTIONS:
     --tls-cert <path>                        Path to the server TLS certificate (PEM)
     --tls-key <path>                         Path to the server TLS private key (PEM)
     --tls-client-ca <path>                   Path to the client CA certificate for mTLS (PEM)
-    --tls-handshake-timeout-secs <n>         TLS handshake timeout in seconds [default: 10]
+    --tls-handshake-timeout-secs <n>         TLS handshake timeout secs (1-300) [default: 10]
     -h, --help                               Print this help and exit
     -V, --version                            Print version and exit
 
