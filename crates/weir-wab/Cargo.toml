@@ -17,4 +17,4 @@ crc32fast = "1.4"
 # needs a C toolchain at build time — already required by a default weir-server
 # build via ring (rustls, pulled by both reqwest and mysql_async), so it adds no
 # new class of build requirement. Resolved in the 2.0 design spec, §12.1.
-zstd = "0.13"
+zstd = "0.14"

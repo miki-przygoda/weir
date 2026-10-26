@@ -569,6 +569,21 @@ Behaviour an operator can notice on upgrade:
   (const mask helpers and `u128` comparisons were not constant-time). Every
   new version builds on the 1.88 MSRV.
 
+### Dependencies
+
+- **`zstd` 0.13 -> 0.14** in `weir-wab`, `weir-server` and `weir-sink-s3`
+  (0.13.3 -> 0.14.3, with `zstd-safe` 7.2.4 -> 8.2.0 and `zstd-sys` 2.0.16 ->
+  2.1.2). Both bundle libzstd 1.5.7. On a fixed corpus, the calls weir makes
+  (`bulk::compress` at levels 1, 3 and 19, and `encode_all`) write
+  byte-identical frames under both versions, and each version decodes the
+  other's. So WAB segments and S3 objects read back unchanged across an
+  upgrade or a downgrade. 0.14's breaking changes (the
+  `with_prepared_dictionary()` borrow, and `Decoder::finish()` reading to the
+  end of the frame) are in APIs weir does not call, and no zstd type appears
+  in a weir public API. The three zstd crates are now BSD-3-Clause, where they
+  were MIT (`zstd`) and MIT or Apache-2.0; `deny.toml` already allows it. They
+  build on the 1.88 MSRV (zstd 0.14 needs Rust 1.64).
+
 ### Upgrading from 4.0.x
 
 Each refusal below exits with status 1 **before recovery reads the WAB**, so
