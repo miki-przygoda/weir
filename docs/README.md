@@ -24,7 +24,7 @@ source.
 Two short docs to get you from zero to a running daemon with records flowing.
 
 - [**install.md**](getting-started/install.md) — Build from source,
-  container, or `cargo install` (all nine crates are published).
+  container, or `cargo install` (all ten crates are published).
   Verification + uninstall.
 - [**quickstart.md**](getting-started/quickstart.md) — 5-minute hello
   world: run the daemon, push a record from a tiny Rust client,
@@ -43,8 +43,11 @@ Documentation for running weir in production.
 - [**tcp-mtls.md**](operations/tcp-mtls.md) — The optional TCP + mutual-TLS
   listener for cross-host producers (behind the `tls` feature): certificate
   setup, config keys, and live cert reload on `SIGHUP`.
-- [**monitoring.md**](monitoring.md) — Prometheus metrics at `/metrics`,
-  the per-alert runbook, and the Grafana dashboard. Turnkey monitoring stack
+- [**monitoring.md**](monitoring.md) — Prometheus metrics at `/metrics`;
+  the health routes (`/livez`, `/readyz`, `/startupz`) and the `/status`
+  document; the admin socket behind `weir-ctl status`, `reload` and
+  `drain pause|resume|retry-stranded`; the Conditions catalogue that says
+  *why* a daemon is not ready; the per-alert runbook; and the Grafana dashboard. Turnkey monitoring stack
   (weir + Prometheus + Grafana) under [`deploy/monitoring/`](https://github.com/miki-przygoda/weir/tree/main/deploy/monitoring).
 - *Tuning guide* and *disaster-recovery runbook* — operator-facing guides.
   *(planned)*

@@ -16,6 +16,7 @@ convention — see [Architecture → Workspace & crate boundaries](../architectu
 | Forward records to a custom destination | `weir-sink-sdk` (implement `Sink`) | no (to author + test) |
 | Read / inspect / recover WAB segments off disk | `weir-wab` | no |
 | Operate a running daemon from the shell | `weir-ctl` | no |
+| Read a daemon's health in your own tooling (parse `/status`, evaluate Conditions, apply the probe rules) | `weir-status` | no |
 | Build a producer/client in another language | the [wire protocol](../wire_protocol.md) (no Rust dep at all) | no |
 
 The crates this guide covers are sibling directories under `crates/` — `weir-client`,
@@ -23,7 +24,9 @@ The crates this guide covers are sibling directories under `crates/` — `weir-c
 `path` dependency points at `crates/<name>` (e.g.
 `weir-client = { path = "../weir/crates/weir-client" }`).
 
-`crates/` also holds `weir-attest` (tamper-evidence over sealed segments),
+`crates/` also holds `weir-status` (the `weir.status/v1` model, Conditions
+evaluator and probe predicates that the daemon and `weir-ctl` share; pure
+Rust, no I/O), `weir-attest` (tamper-evidence over sealed segments),
 `weir-sink-s3` (the S3-API sink), `weir-rs` (a single-crate facade that
 re-exports core/client/sink-sdk/wab behind features) and `weir-testkit`
 (`publish = false`, test harness only).
