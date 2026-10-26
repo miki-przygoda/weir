@@ -362,7 +362,7 @@ older releases warn about and ignore the new config keys, and never read
   - `weir_wab_dir_lock_integrity_failures_total`: lock-file checks that found
     it deleted, replaced or unreadable.
   - `weir_config_reloads_total{trigger,outcome}`: `trigger` is `sighup`
-    (`admin` is reserved); `outcome` is `ok`, `failed`, `noop` or `dropped`.
+    or `admin` (`weir-ctl reload`); `outcome` is `ok`, `failed`, `noop` or `dropped`.
   - `weir_drain_local_io_strands_total{cause}`: strands caused by local I/O,
     `cause="read"` (reading the sealed segment) or `cause="write"` (the
     dead-letter write).

@@ -13,7 +13,7 @@ constraint (or, for ClickHouse, the per-batch
 For that, we ship `#[ignore]`-marked tests in
 `crates/weir-server/tests/system.rs`:
 
-- `mysql_sink_end_to_end` — pushes 100 Sync records, verifies the sink
+- `mysql_sink_end_to_end` — pushes 100 Durable records, verifies the sink
   committed them all and did so as ≥10 records per `commit()` call
   (the IOPS-compression claim).
 - `postgres_sink_end_to_end` — same assertion shape for the Postgres
@@ -61,22 +61,27 @@ Every test above is `#[ignore]`-marked because it needs a real backend:
 `WEIR_TEST_MYSQL_URL` / `WEIR_TEST_POSTGRES_URL` /
 `WEIR_TEST_CLICKHOUSE_URL` / `WEIR_TEST_S3_ENDPOINT`. The runner script
 below brings up **all four** backends in containers — MySQL, Postgres,
-ClickHouse and MinIO — and runs every one of these tests in one shot,
-nine in total plus `sql_sink_content_keyed_schema_loses_a_distinct_duplicate_record`.
+ClickHouse and MinIO — and runs every one of these tests in one shot:
+the three SQL end-to-end tests, the five S3 tests,
+`sql_sink_content_keyed_schema_loses_a_distinct_duplicate_record`,
+`sql_sink_plain_mode_duplicate_keys_do_not_livelock_the_drain`, and the
+binary's `live_` unit tests in `sink::mysql` and `sink::postgres` (also
+`#[ignore]`d; they drive plain-mode duplicate keys at the sink level).
 
 ## Quick start
 
 ```sh
 # Pre-requisite: Docker installed, `docker compose` plugin available.
-# Brings up the stack, waits for healthchecks, runs all three tests, tears down.
+# Brings up the stack, waits for healthchecks, runs every sink test, tears down.
 bash deploy/run-sink-integration-tests.sh
 
 # Release build (matches CI):
 RELEASE=1 bash deploy/run-sink-integration-tests.sh
 ```
 
-The script exits 0 iff all three tests pass. The ClickHouse test is run
-with `--features clickhouse-sink` so its sink is compiled in. The
+The script exits 0 iff every sink test passes. The ClickHouse test is run
+with `--features clickhouse-sink` and the S3 group with
+`--features s3-sink`, so those sinks are compiled in. The
 container stack is torn down on exit (including failures), so the runner
 is safe to re-invoke without leftover state.
 
@@ -91,15 +96,21 @@ is safe to re-invoke without leftover state.
    - `clickhouse/clickhouse-server:24-alpine` on `127.0.0.1:18123`
      (HTTP), with the schema from
      `deploy/docker/test/init-clickhouse.sql` pre-seeded.
+   - `bitnamilegacy/minio` on `127.0.0.1:19000` (S3 API), plus a
+     one-shot `minio-init` container that creates the `weir-test` and
+     `weir-test-restricted` buckets.
 2. Waits up to 120 s per service for the compose healthchecks
-   (`mysqladmin ping`, `pg_isready`, and ClickHouse's HTTP `/ping`) to
-   report `healthy`. Each container entrypoint gates the external
+   (`mysqladmin ping`, `pg_isready`, ClickHouse's HTTP `/ping`, and
+   `mc ready local` for MinIO) to report `healthy`. Each container entrypoint gates the external
    listener on init-script completion, so a healthy status implies the
    `weir_records` table exists.
-3. Exports the three `WEIR_TEST_*_URL` env vars pointing at the
-   containers' published ports.
-4. Runs the three ignored tests via `cargo test -- --ignored --exact`,
-   adding `--features clickhouse-sink` for the ClickHouse test.
+3. Exports the three `WEIR_TEST_*_URL` env vars and
+   `WEIR_TEST_S3_ENDPOINT` pointing at the containers' published ports,
+   plus the MinIO credentials as `AWS_ACCESS_KEY_ID` /
+   `AWS_SECRET_ACCESS_KEY`.
+4. Runs the ignored tests via `cargo test -- --ignored`, one invocation
+   per group, adding `--features clickhouse-sink` for the ClickHouse test
+   and `--features s3-sink` for the S3 group.
 5. Tears down with `docker compose down -v` on exit.
 
 ## Schemas
@@ -164,13 +175,13 @@ WEIR_TEST_MYSQL_URL=mysql://root:test@127.0.0.1:3306/weir_test \
 
 ## Out of scope
 
-- **CI.** The runner script ships locally-runnable. Wiring this into
-  GitHub Actions needs a service-container setup and is enough
-  complexity that it deserves its own PR — `.github/workflows/sink-integration.yml`
-  is a clean follow-up when someone wants it.
+- **A separate CI rig.** CI does run these tests: the `sink-integration`
+  job in `.github/workflows/ci.yml` invokes this same script (it has since
+  2.1.0), rather than reimplementing the stack with `services:`, so there
+  is one code path to keep working.
 - **TLS-enabled containers.** The Postgres sink supports TLS via
   `?sslmode=require` (see
-  [Configuration → Postgres](../operations/configuration.md), but
+  [Configuration → Postgres](../operations/configuration.md)), but
   the test compose stack runs without TLS so the runner doesn't
   need a CA-trusted cert. A TLS-enabled `postgres-tls` service
   alongside the existing `postgres` one is a clean follow-up

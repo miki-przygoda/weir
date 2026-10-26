@@ -51,7 +51,15 @@ journalctl -u weir -t weir          # filter by the syslog tag
 sudo systemctl reload-or-restart weir   # restart (config is read once at startup)
 sudo systemctl kill --signal=SIGHUP weir  # reload TLS material; a counted no-op otherwise
 sudo systemctl stop weir            # graceful SIGTERM shutdown (see below)
+sudo weir-ctl status                # ready / not ready, and the active conditions
+sudo weir-ctl drain pause           # stop delivery; ingest keeps buffering
+sudo weir-ctl drain resume          # (or `drain retry-stranded`, `reload`)
 ```
+
+The `weir-ctl` verbs talk to the admin socket the daemon binds beside its
+`wab_dir`, here `/var/lib/weir/wab.admin.sock` (mode `0600`, inside the `0700`
+`StateDirectory`). Only the daemon's uid or root may use it, hence `sudo`. A
+pause lives in memory only: a restart resumes delivery.
 
 Config is read **once at startup** — there is no hot reload (SIGHUP reloads TLS
 material only). Editing `weir.toml` or `weir.env` requires a restart.

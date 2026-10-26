@@ -30,6 +30,7 @@ Offset  Size  Field          Value
  0       4    magic          b"WEIR"
  4       1    version        WIRE_VERSION = 1
  5       1    message_type    Push=0x01 / Ack=0x02 / Nack=0x03 / HealthCheck=0x04 / HealthCheckResponse=0x05
+                              (additive in v1: PushTracked=0x06 / AckTracked=0x07 / PushBatch=0x08 / AckBatch=0x09)
  6       1    durability      Durable=0x01 / Batched=0x02 (retired, decodes to Durable) / Buffered=0x03
  7       1    flags          reserved; must be 0 on write
  8       4    payload_len    u32 little-endian (struct "<I")
@@ -47,7 +48,10 @@ zlib/PNG variant, **not** CRC-32C. The header CRC covers exactly bytes `[0..12]`
 `WeirClient.push(payload, durability=Durability.DURABLE)` (in
 `src/weir_wire/client.py`) encodes a `Push` frame, `sendall`s it, then reads the
 response frame and returns a `PushResult(acked, durability_used)`. An `Ack`
-response means the record is accepted; a `Nack` raises `NackError`. The client
+response means the record is accepted; a `Nack` raises `NackError`.
+`push_tracked(...)` sends a `PushTracked` instead and returns the
+`RecordCoordinate` from the `AckTracked`; a daemon without the extension
+answers `Nack(UnknownMessage)`, which sets `NackError.means_no_tracked_support`. The client
 guards locally against zero-length payloads (weir Nacks those with
 `EmptyPayload`) and over-cap payloads before sending.
 
@@ -67,9 +71,11 @@ payload CRC (`PayloadCrcMismatch`). Each failure raises `DecodeError` whose
 `WeirClient.connect()` opens a single `socket.AF_UNIX` / `SOCK_STREAM`
 connection — there is no in-band handshake; you connect and send. Responses are
 framed by hand: `_read_response_frame()` reads the 16-byte header, takes
-`payload_len`, then reads exactly `payload_len + 4` more bytes and hands that
-single frame to `decode_frame` (it never feeds a multi-frame buffer to one
-decode call). A `Nack` surfaces as `NackError`, which decodes the first payload
+`payload_len`, bounds it by the declared message type before reading anything
+more (`max_response_payload`: 2 bytes for most responses, the coordinate cap for
+`AckTracked`, the bitmap cap for `AckBatch`), then reads exactly
+`payload_len + 4` more bytes and hands that single frame to `decode_frame` (it
+never feeds a multi-frame buffer to one decode call). A `Nack` surfaces as `NackError`, which decodes the first payload
 byte via `NackReason` and exposes `.retryable` (true only for `InternalError`
 and unknown reasons; the eight permanent reasons are not retryable). A
 mid-stream socket close raises `ConnectionClosed` ("in-flight outcome unknown;
@@ -87,11 +93,21 @@ overridable with the `WEIR_CONFORMANCE_VECTORS` environment variable. It is a
 plain script (a `__main__` guard, not pytest) and exits non-zero on any
 mismatch.
 
+`tests/test_tracked.py` runs the same codec against
+`docs/conformance/wire_v1_tracked_vectors.json` (`PushTracked`/`AckTracked`
+frames and the `RecordCoordinate` codec), and `tests/test_batch.py` against
+`docs/conformance/wire_v1_batch_vectors.json` (`PushBatch` bodies and the
+`AckBatch` bitmap). Both extensions are additive within wire v1, so the 30
+frozen vectors are untouched by them.
+
 ## Run it
 
 ```bash
 # Offline codec conformance — no daemon needed (run from the repo root)
 python3 demos/py-wire-client/tests/test_conformance.py     # -> "30/30 vectors passed"
+python3 demos/py-wire-client/tests/test_tracked.py         # -> "33/33 tracked-extension checks passed"
+python3 demos/py-wire-client/tests/test_batch.py           # -> "56/56 batch-extension checks passed"
+python3 demos/py-wire-client/tests/test_response_cap.py    # -> "1/1 checks passed"
 
 # Live: start an isolated daemon, then validate against it
 bash demos/py-wire-client/scripts/run_daemon.sh            # writes daemon.pid; socket = weir.sock
@@ -117,11 +133,12 @@ Stdlib only (`socket`, `zlib`, `struct`, `enum`, `dataclasses`) — no
 | Path | What it holds |
 |------|---------------|
 | `src/weir_wire/codec.py`      | The wire codec: `encode_frame` / `decode_frame`, the `Frame` dataclass, `DecodeError` tags, and the `MessageType` / `Durability` / `NackReason` enums (CRC via `zlib.crc32`). |
-| `src/weir_wire/client.py`     | `WeirClient`: AF_UNIX producer with `push()` (Push→Ack) and `health_check()`; surfaces rejections as `NackError` / `ConnectionClosed`. |
+| `src/weir_wire/client.py`     | `WeirClient`: AF_UNIX producer with `push()` (Push→Ack), `push_tracked()` (PushTracked→AckTracked) and `health_check()`; surfaces rejections as `NackError` / `ConnectionClosed`. |
 | `src/weir_wire/__init__.py`   | Package facade re-exporting the public API. |
 | `examples/produce.py`         | End-to-end demo: health-check, then push five JSON `signup` events; takes an optional socket-path arg. |
 | `tests/test_conformance.py`   | Runs the codec against the 30 canonical vectors (decode + fields for all, byte-exact re-encode for valid frames); plain script. |
+| `tests/test_tracked.py`       | The tracked-extension vectors: `PushTracked`/`AckTracked` frames and `RecordCoordinate` decoding. |
+| `tests/test_batch.py`         | The batch-extension vectors: `PushBatch` bodies and `AckBatch` bitmaps. |
+| `tests/test_response_cap.py`  | A fake peer declaring an 8 MiB response; asserts the client refuses it before allocating. |
 | `tests/test_live.py`          | Validates the client against a running daemon: happy path, pipelining, and every rejection path. |
 | `scripts/run_daemon.sh`       | Launches an isolated `weir-server` (socket `weir.sock`, `wab/` dir, metrics port), writes `daemon.pid`. |
-</content>
-</invoke>

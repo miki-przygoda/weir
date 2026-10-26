@@ -21,7 +21,7 @@ source.
 
 ## Getting started
 
-Two short docs to get you from zero to a running daemon with records flowing.
+Short docs to get you from zero to a running daemon with records flowing.
 
 - [**install.md**](getting-started/install.md) — Build from source,
   container, or `cargo install` (all ten crates are published).
@@ -29,6 +29,11 @@ Two short docs to get you from zero to a running daemon with records flowing.
 - [**quickstart.md**](getting-started/quickstart.md) — 5-minute hello
   world: run the daemon, push a record from a tiny Rust client,
   verify the metrics endpoint, troubleshoot common issues.
+- [**integrating.md**](getting-started/integrating.md) — Which crate you
+  need, producing from an async runtime, building a custom sink, reading
+  the WAB directly.
+- [**platform-support.md**](platform-support.md) — What runs where, what is
+  tested, and what is not.
 
 ---
 
@@ -39,10 +44,13 @@ Documentation for running weir in production.
 - [**configuration.md**](operations/configuration.md) — Every config
   option: default, range, CLI flag, env var, TOML key, what it
   controls, and when to tune. Plus minimal-config and production-config
-  examples. *(canonical reference; ~470 lines)*
+  examples. *(canonical reference)*
 - [**tcp-mtls.md**](operations/tcp-mtls.md) — The optional TCP + mutual-TLS
   listener for cross-host producers (behind the `tls` feature): certificate
   setup, config keys, and live cert reload on `SIGHUP`.
+- [**quarantine-recovery.md**](operations/quarantine-recovery.md) — How to
+  notice, triage and recover the records in segments that crash recovery or
+  the drain set aside under `<wab_dir>/quarantine/`.
 - [**monitoring.md**](monitoring.md) — Prometheus metrics at `/metrics`;
   the health routes (`/livez`, `/readyz`, `/startupz`) and the `/status`
   document; the admin socket behind `weir-ctl status`, `reload` and

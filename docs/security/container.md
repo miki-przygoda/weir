@@ -98,7 +98,7 @@ daemon's. You have two options:
 
 ### Filesystem permissions baked into the image
 
-The startup `chmod 0o700` on `/run/weir` and `/var/lib/weir/wab` matches
+The build-time `chmod 0700` on `/run/weir` and `/var/lib/weir/wab` matches
 the operational assumption documented in
 [`socket-bind.md`](socket-bind.md): the bind-time TOCTOU race window is
 closed by parent-directory permissions.
@@ -256,8 +256,9 @@ Operator hardening that **must be applied externally**:
   `CAP_DAC_OVERRIDE` (its files are created by its own uid).
 - **No filesystem read-only constraints.** Apply at runtime:
   `docker run --read-only --tmpfs /tmp` with volume mounts for the WAB
-  and socket directories. Weir does not write outside `wab_dir`,
-  `dead_letter_dir`, and the socket parent. Note on testing the
+  and socket directories. Weir does not write outside `wab_dir`
+  (which holds `dead_letter/`, `quarantine/` and `.weir.lock`), the socket
+  parent, and the admin socket's parent (see [Admin socket](#admin-socket)). Note on testing the
   restart-recovery guarantee: un-drained records survive a restart on a
   persistent WAB volume, but that is only **observable** when a segment is
   genuinely undrained (sink down / stranded). With the `noop` sink or a healthy
@@ -282,7 +283,7 @@ Operator hardening that **must be applied externally**:
   on every rebuild.
 - **No file-based secret indirection (`*_FILE`).** Weir's sink credentials
   — the bearer token (`WEIR_SINK_BEARER_TOKEN`, read from env at startup in
-  `crates/weir-server/src/main.rs`) and the sink URL, which may carry a
+  `crates/weir-server/src/sink/select.rs`) and the sink URL, which may carry a
   password (`WEIR_SINK_URL`) — are **env-only**. There is currently no
   `WEIR_SINK_BEARER_TOKEN_FILE` (or equivalent) that would read the secret
   from a mounted file; see the gap note below. Operators who want to keep
@@ -358,12 +359,17 @@ docker run \
     -v $(pwd)/weir.toml:/etc/weir/weir.toml:ro \
     --tmpfs /run/weir-admin:rw,noexec,nosuid,size=1m,uid=10001,gid=10001,mode=0700 \
     -e WEIR_ADMIN_SOCKET_PATH=/run/weir-admin/wab.admin.sock \
+    -e WEIR_METRICS_BIND=0.0.0.0 \
+    --stop-timeout 45 \
     -p 127.0.0.1:9185:9185 \
     --name weir \
     weir:latest
 ```
 
-The `127.0.0.1:9185` binding matches the recommendation in
+`WEIR_METRICS_BIND=0.0.0.0` binds the container's own interface, without
+which the port mapping cannot reach the daemon (it defaults to the
+container's loopback); the host side stays on loopback. `--stop-timeout 45`
+matches the shipped 45 s grace. The `127.0.0.1:9185` binding matches the recommendation in
 [`threat-model.md`](threat-model.md): the metrics port is not part of
 the trust boundary and should not be exposed publicly. `--read-only`
 makes `/var/lib/weir` unwritable, so the private `/run/weir-admin` tmpfs

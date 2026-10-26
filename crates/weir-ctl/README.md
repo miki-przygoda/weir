@@ -10,13 +10,16 @@ ingest, and why not — admin socket, then `/status`, then `/metrics` plus disk,
 then disk alone; exit 0 ready, 1 not ready (including a dead daemon whose
 `wab_dir` was read from disk), 2 unreachable with no offline facts, or identity
 mismatch, 3 ready with a critical condition), `reload` (TLS certificates, the
-same path as SIGHUP), `drain` (`pause` / `resume` / `retry-stranded`; pause is
-in-memory only, and retry-stranded skips segments still inside their
-cool-down), `health`, `push`, `metrics`, `segments` (per-shard WAB inspect,
-`--files` for every segment file), `dl` (dead-letter `list` / `drop` /
-`requeue`), and `quarantine` (`list` / `inspect` / `requeue`) for segments
-that crash recovery set aside after a corrupt read, and `attest` (`seal` /
-`verify` / `head`) over a sealed segment's `weir-attest` hash chain.
+same path as SIGHUP; exit 0 applied or no-op, 1 failed, 2 no admin socket, no
+reply or identity mismatch), `drain` (`pause` / `resume` / `retry-stranded`;
+pause is in-memory only, and retry-stranded skips segments still inside their
+cool-down; `--wait[=SECS]`, at most 30, waits for the drain to act; exit 0
+done, 4 requested but not yet in effect, 1 error, 2 as for `reload`),
+`health`, `push`, `metrics`, `segments` (per-shard WAB inspect, `--files` for
+every segment file), `dl` (dead-letter `list` / `drop` / `requeue`),
+`quarantine` (`list` / `inspect` / `requeue`) for segments that crash recovery
+set aside after a corrupt read, and `attest` (`seal` / `verify` / `head`) over
+a sealed segment's `weir-attest` hash chain.
 
 The admin socket defaults to `WEIR_ADMIN_SOCKET_PATH`, then to
 `<parent(wab_dir)>/<basename(wab_dir)>.admin.sock` derived from `--wab-dir` /

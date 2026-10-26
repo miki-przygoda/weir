@@ -168,8 +168,8 @@ crash between that ack and the next fsync would destroy the record for good
 with nothing left to recover it from. Dead-lettered records don't carry that
 same stake (dead-letter usually isn't the last copy of anything), which is
 why `dl requeue` documents the risk instead of refusing it. Use `durable`
-(the canonical spelling; `sync` and `batched` are still accepted as legacy
-aliases, and remain the flag's literal default) for `quarantine requeue`.
+(the flag's default; `sync` and `batched` are still accepted as legacy
+aliases for it) for `quarantine requeue`.
 
 ---
 

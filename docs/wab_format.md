@@ -30,6 +30,8 @@ mkdir -p /path/to/wab && chmod 700 /path/to/wab
     └── shard_01__seg_00000002.wab.sealed  ← corrupt SEALED segment (the drain, or a rejected .confirmed)
 ```
 
+The admin socket is not inside the WAB root: by default it is `<parent(wab_dir)>/<basename(wab_dir)>.admin.sock`, a sibling of the root (`/var/lib/weir/wab.admin.sock` for a `wab_dir` of `/var/lib/weir/wab`), and an `admin_socket_path` inside `wab_dir` is refused at config load (`under_wab_dir`). No WAB walker ever sees it. See [admin socket](operations/configuration.md#admin_socket_path).
+
 Shard directories, the `dead_letter/` directory, and the `quarantine/` directory are created with mode `0o700`. Segment files (including `.confirmed` sidecars, their transient `.confirmed.tmp`, and dead-letter segments) and the `.weir.lock` file are created with mode `0o600`. Permissions are set atomically at creation time via `OpenOptionsExt::mode` and `DirBuilderExt::mode` — there is no post-creation `chmod`.
 
 **The `.wab.sealed` and `.wab.confirmed` files do *not* normally coexist.** On a healthy daemon the drain, after committing a sealed segment to the sink, writes the `.wab.confirmed` sidecar and then **deletes** the `.wab.sealed` segment (see [Post-drain steady state](#post-drain-steady-state)). So a `.confirmed` sidecar usually has **no surviving segment file** beside it. The tree above shows the *transient* states a single segment passes through (`seg_00000001` confirmed, `seg_00000002` sealed-but-not-yet-drained, `seg_00000003` active) — not three files for one segment.
@@ -65,7 +67,7 @@ pid=1234
 host=weir-0
 started_unix=1791100800
 boot_id=0f3c…           # Linux only (/proc/sys/kernel/random/boot_id); omitted elsewhere
-version=4.0.1
+version=4.1.0
 socket_path=/run/weir/weir.sock
 metrics=127.0.0.1:9185
 ```
@@ -243,7 +245,7 @@ A `.confirmed` that is present but fails to parse (wrong length, bad magic or CR
 
 ## Crash recovery algorithm
 
-On startup, before accepting connections, the daemon runs recovery in the calling thread. It runs only after the daemon has taken the [`wab_dir` lock](#the-wab_dir-lock-file) and passed its other refuse-to-start checks, so a second daemon never gets this far on a directory another one owns (unless `wab_dir_lock = "best-effort"` let it start without a lock on a filesystem that cannot take one).
+On startup, before accepting connections, the daemon runs recovery in the calling (main) thread; the metrics and health listener and the admin socket are already up and keep answering through it. It runs only after the daemon has taken the [`wab_dir` lock](#the-wab_dir-lock-file) and passed its other refuse-to-start checks, so a second daemon never gets this far on a directory another one owns (unless `wab_dir_lock = "best-effort"` let it start without a lock on a filesystem that cannot take one).
 
 0. **Enumerate shards by directory scan, not by config.** Recovery `read_dir`s the WAB root, skips the reserved `dead_letter/` and `quarantine/` subdirectories, and treats every remaining directory as a shard (`recover_open_segments` in `crates/weir-server/src/wab/recovery.rs`; the sealed-segment replay scan in `crates/weir-server/src/wab/mod.rs` skips the same two subdirectories) — it does **not** reconstruct the shard set from the `shard_count` config, so segments from a previous run with a different `shard_count` are still recovered.
 1. **Scan** each shard directory for `.wab` (active) files.
@@ -255,7 +257,7 @@ On startup, before accepting connections, the daemon runs recovery in the callin
    e. Write sentinel + footer (record count, data bytes, running file CRC, timestamp).
    f. `sync_all()` (full fsync including metadata).
    g. Atomically rename `.wab` → `.wab.sealed`.
-3. **Replay sealed segments**: for each `.wab.sealed` without a valid `.wab.confirmed`, send the path to the drain channel. The same scan deletes stale `*.wab.confirmed.tmp` files and, when the lock is held, orphaned sealed segments (see [Post-drain steady state](#post-drain-steady-state)). It is fail-fast: a shard directory it cannot list stops startup, because a silently skipped segment would be acked data silently dropped. (The drain's later rescans skip such a shard with a WARN and retry it on the next poll.)
+3. **Replay sealed segments** (`scan_replay` in `crates/weir-server/src/wab/mod.rs`, startup phase `handoff`): list every `.wab.sealed` without a valid `.wab.confirmed`, shard by shard in counter order. The list is handed to the drain in memory as its initial backlog, with no channel sends, so a backlog larger than the drain channel cannot block startup and the producer socket does not wait on the sink; the drain alternates the backlog with live segments. The same scan deletes stale `*.wab.confirmed.tmp` files and, when the lock is held, orphaned sealed segments (see [Post-drain steady state](#post-drain-steady-state)). It is fail-fast: a shard directory it cannot list stops startup, because a silently skipped segment would be acked data silently dropped. (The drain's later rescans skip such a shard with a WARN and retry it on the next poll.)
 
 Key invariant: only records up to the first corrupt entry are replayed. A torn write at crash time never silently corrupts the replay stream — the trailing corrupt record is truncated, not forwarded.
 

@@ -67,11 +67,12 @@ so running it locally first avoids a red CI round-trip:
 # Formatting
 cargo fmt --check
 
-# Lints across the whole feature matrix (CI denies warnings on all three).
-# A lint that only trips under clickhouse/tls must still be fixed.
+# Lints across the whole feature matrix (CI denies warnings on all four).
+# A lint that only trips under clickhouse/tls/s3-sink must still be fixed.
 cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --all-features -- -D warnings
 cargo clippy --all-targets --no-default-features -- -D warnings
+cargo clippy --all-targets --features s3-sink -- -D warnings
 
 # The demo bundle's version banner is GENERATED from [workspace.package]
 # version. CI's lint job regenerates it and fails on any diff, so a version
@@ -79,19 +80,25 @@ cargo clippy --all-targets --no-default-features -- -D warnings
 # depends on lint (test, dst, load, build, monitoring, bench) then SKIPS.
 ./scripts/sync-demo-version.sh && git diff --exit-code demo/version.js
 
+# The alert rules parse, and their promtool unit tests pass (needs Docker).
+docker run --rm --entrypoint promtool -v "$PWD/deploy/prometheus:/r:ro" -w /r \
+    prom/prometheus:v3.14.0 check rules weir-alerts.yml
+docker run --rm --entrypoint promtool -v "$PWD/deploy/prometheus:/r:ro" -w /r \
+    prom/prometheus:v3.14.0 test rules weir-alerts_test.yml
+
 # Tests. weir-server's bin unit tests MUST run serially: socket::bind_hardened
 # mutates the process-global umask around bind(2), and a directory created by
 # another thread in that window loses its execute bit. See
 # docs/security/socket-bind.md. Running them in parallel produces ~66 spurious
 # PermissionDenied failures and leaves proptest-regressions/ unwritable.
 cargo test --workspace --exclude weir-server
-cargo test -p weir-server --lib --test system --test docs_drift --test demo_drift --test load --test load_tls --test tls_client --test tls_listener
+cargo test -p weir-server --lib --test system --test docs_drift --test demo_drift --test deploy --test load --test load_tls --test tls_client --test tls_listener
 cargo test -p weir-server --bins -- --test-threads=1
 
 # The same three, across the full feature matrix (compiles + runs the
 # clickhouse-sink and tls test code the default set never builds).
 cargo test --workspace --exclude weir-server --all-features
-cargo test -p weir-server --lib --test system --test docs_drift --test demo_drift --test load --test load_tls --test tls_client --test tls_listener --all-features
+cargo test -p weir-server --lib --test system --test docs_drift --test demo_drift --test deploy --test load --test load_tls --test tls_client --test tls_listener --all-features
 cargo test -p weir-server --bins --all-features -- --test-threads=1
 
 # Wire-protocol conformance: the vectors' own reference codec, plus the five
@@ -197,7 +204,7 @@ deploy/monitoring/smoke-test.sh --teardown
 # actually fuzzing needs a time budget you choose, so that stays manual:
 cargo +nightly fuzz run envelope_parse
 
-# The chaos orchestrator's own unit suite — 301 tests, stdlib only, ~3 s, no
+# The chaos orchestrator's own unit suite — 466 tests, stdlib only, ~4 s, no
 # root and no device-mapper. This is the ORACLE: I1/I2/I3, quiescence, the
 # canary and the report's verdicts are all Python, so a change to any of them
 # should run this before it runs a real episode. It IS in the `harnesses` CI

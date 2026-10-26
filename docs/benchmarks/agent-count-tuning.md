@@ -18,7 +18,7 @@ explicitly and ignore the log line.
 
 Source: `tests/load.rs::sweep_agent_count_vs_throughput`. Workload:
 64 producer threads, 100 Sync records each. Reproduce with
-`cargo test --release --test load -- --ignored sweep_agent_count_vs_throughput`.
+`cargo test --release -p weir-server --test load -- --ignored sweep_agent_count_vs_throughput`.
 
 | agent_count | median RPS  | min     | max     | agents/cores |
 |-------------|------------:|--------:|--------:|--------------|
@@ -65,8 +65,8 @@ Two compounding effects:
 
 ```rust
 fn recommended_agent_count(cores: usize) -> usize {
-    // Reserve ~2 cores for tokio + accept + OS; give each remaining
-    // core a 2-thread budget for one agent (worker + flusher).
+    // Reserve ~2 cores for tokio runtime + accept + OS; budget each
+    // remaining core for one agent's two threads (worker + flusher).
     cores.saturating_sub(2).max(2) / 2
 }
 ```

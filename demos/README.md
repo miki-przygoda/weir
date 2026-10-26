@@ -19,8 +19,8 @@ against `docs/conformance/wire_v1_batch_vectors.json` — where the reply is a
 bitmap, a set bit is a durability promise and a clear bit means retry. A client
 that does *not* implement the tracked
 extension would still be fully conformant — that is what "additive within wire
-v1" means, and `docs/conformance.md` says so explicitly — so the column above
-records support rather than compliance.
+v1" means, and `docs/conformance.md` says so explicitly — so the tracked and
+batch columns in the table below record support rather than compliance.
 
 Implementing the extension five times was worth it for what it caught. Three of
 the five languages mishandle the top of the u64 range by default, and the
@@ -55,7 +55,10 @@ weir daemon from anything that can open a socket and compute a CRC32.
 Each demo validates against the **canonical** `docs/conformance/wire_v1_vectors.json`
 — resolved relative to the repo, never a vendored copy, so they can't drift from
 the source of truth. Override the path with the `WEIR_CONFORMANCE_VECTORS` env var
-(or, for the C client's `make`, `make check VECTORS=/path/to/vectors.json`).
+(or, for the C client's `make`, `make check VECTORS=/path/to/vectors.json`). The
+tracked and batch suites read `wire_v1_tracked_vectors.json` and
+`wire_v1_batch_vectors.json` from the same directory; that env var does not
+apply to them (the C, Java and TypeScript runners take a path argument instead).
 
 ## The five demos (5 / 5)
 
@@ -68,4 +71,6 @@ the source of truth. Override the path with the `WEIR_CONFORMANCE_VECTORS` env v
 | [`ts-wire-client/`](ts-wire-client/) | TypeScript/Node | Zero runtime deps; runs `.ts` on stock Node; end-to-end HTTP→wire→WAB example. | `node src/conformance.ts` | ✅ `node src/conformance_tracked.ts` | ✅ `node src/conformance_batch.ts` |
 
 Run instructions are in each project's own README. The offline conformance suites
-need no daemon; the live harnesses start a daemon with an isolated socket/wab/port.
+need no daemon; the live harnesses need one on an isolated socket/wab/port (the
+Python demo's `scripts/run_daemon.sh` starts it; the others give the
+`weir-server` command line).

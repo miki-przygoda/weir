@@ -46,6 +46,17 @@ so running the most recent `4.x` is the supported configuration.
   WAB directory, or dead-letter directory.
 - Any case where the daemon writes data outside the configured
   `wab_dir` / dead-letter directory.
+- On the admin socket (`<parent(wab_dir)>/<basename(wab_dir)>.admin.sock`):
+  any way for a peer whose euid is neither the daemon's nor root to have a
+  verb served, or for a verb to return a secret (bearer tokens, S3 secrets,
+  URL passwords).
+- On the metrics listener: any way to make `/status` or the probe routes
+  (`/livez`, `/readyz`, `/startupz`) carry free text that only the admin view
+  may hold (error messages, paths, uids, the sink URL), or to change daemon
+  state through it.
+- Any way for two daemons to write one `wab_dir` at once while the
+  `<wab_dir>/.weir.lock` guard is in force (`wab_dir_lock = "required"`, the
+  default, on a filesystem that supports `flock`).
 - On the TCP + mutual-TLS path: any way to complete a handshake without a
   certificate the configured CA issued, or to bypass client-certificate
   verification.

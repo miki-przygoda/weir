@@ -56,12 +56,17 @@ Segment-size sweep — segments constant, bytes not:
 | 256 KiB | 67.65 MB | 258.1 |
 
 **~259 segments, and the constant is in the tree.** `main.rs` wires the WAB to
-the drain with `crossbeam_channel::bounded::<PathBuf>(256)` — one global channel
-of sealed-segment paths, not one per shard. When the drain falls behind it fills,
+the drain with `crossbeam_channel::bounded::<PathBuf>(wab::DRAIN_CHANNEL_CAPACITY)`,
+and that constant is 256 (`crates/weir-server/src/wab/mod.rs`) — one global
+channel of sealed-segment paths, not one per shard. When the drain falls behind it fills,
 the writer's blocking send stalls, and that stall is the backpressure. Shard
 count does not enter it: these scenarios push from one connection, which lands on
 one shard, so the number of open segments never varies with how many are
-configured.
+configured. Since 4.1.0 the channel's fill is exported as
+`weir_drain_channel_depth` against `weir_drain_channel_capacity`, and the
+stall as `weir_wab_handoff_blocked_seconds` (see
+[the metric reference](../monitoring.md#metric-reference)), so the ceiling can be
+watched approaching rather than inferred from WAB size.
 
 ## This does **not** make the default safe
 

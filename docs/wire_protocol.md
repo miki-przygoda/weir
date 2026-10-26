@@ -532,7 +532,7 @@ allocation maximum to size a buffer for.
 | Push → Ack | open |
 | PushTracked → AckTracked | open |
 | PushBatch → AckBatch | open — including when some records' bits are clear; a per-record failure is a runtime condition, not a protocol error |
-| Push → Nack(InternalError) | open — covers transient daemon-side conditions: queue saturation, ack timeout, a non-durable write (write/fsync error), or the daemon's `wab_max_bytes` cap rejecting because its write-ahead buffer is full. The record's durable outcome is **unknown** for the first three (the producer should retry); a cap rejection is definitively *not* durable, but it is not distinguishable on the wire — the daemon's `weir_wab_cap_rejections_total` metric is what separates it, so a producer treats all four the same way and retries. |
+| Push → Nack(InternalError) | open — covers transient daemon-side conditions: queue saturation, ack timeout, a non-durable write (write/fsync error), or the daemon's `wab_max_bytes` cap rejecting because its write-ahead buffer is full. The record's durable outcome is **unknown** for the first three (the producer should retry); a cap rejection is definitively *not* durable, but it is not distinguishable on the wire — the daemon's `weir_wab_cap_rejections_total` metric is what separates it, so a producer treats all four the same way and retries. A daemon that has lost its `wab_dir` to another instance also NACKs every push `InternalError` (not durable) and then exits with status 3. On the daemon side, `weir_records_nack_internal_total{cause}` names the cause of each; the wire bytes are the same. |
 | HealthCheck → HealthCheckResponse | open |
 
 ### When the server closes the connection

@@ -21,7 +21,8 @@ docker compose up --build
 ```
 
 Brings up four containers — **weir** (noop sink, 4 shards, small segments),
-a **loadgen** (pushes a steady trickle across all three durability tiers),
+a **loadgen** (pushes a steady trickle across both durability tiers, `Durable`
+and `Buffered`),
 **Prometheus** (scraping weir, alerts loaded), and **Grafana** (datasource +
 dashboard pre-provisioned).
 
@@ -130,6 +131,7 @@ job); the `--levels`/`--chaos` scenarios are for local verification.
 | `../grafana/gen-dashboards.py` | Generates the per-instance dashboards (DRY, one panel definition). |
 | `../grafana/dashboards/` | The generated per-instance dashboards (`weir-min/med/high/max/chaos`). |
 | `../prometheus/weir-alerts.yml` | The alert rules (`promtool check rules` validated). |
+| `../prometheus/weir-alerts_test.yml` | `promtool test rules` suite pinning every rule in both directions (CI `lint` job). |
 
 ## Using these with your *existing* Prometheus + Grafana
 

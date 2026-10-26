@@ -60,13 +60,18 @@ chmod 0700 /tmp/weir-quickstart/run
 > first-class knob for any low-throughput deployment; details in
 > [configuration.md](../operations/configuration.md#wab_segment_max_age_secs).
 
-You should see a few `INFO` startup lines ending with the socket and the metrics
-endpoint coming up — the two stable signals that it's ready:
+You should see a few `INFO` startup lines. The metrics and health endpoint comes
+up first (before WAB recovery), then the producer socket, then `weir serving`,
+the signal that it's ready:
 
 ```
+INFO weir_server: metrics and health endpoint listening (/livez /readyz /startupz /status; any other path: metrics)  bind=127.0.0.1 port=9185
 INFO weir_server::socket: socket listening  path=/tmp/weir-quickstart/run/weir.sock
-INFO weir_server::metrics::server: metrics endpoint bound  addr=127.0.0.1:9185
+INFO weir_server: weir serving  elapsed_ms=…
 ```
+
+From another terminal, `curl http://localhost:9185/readyz` prints `ok` once
+the daemon can take ingest.
 
 (Exact wording varies by version. You may also see benign `WARN` lines at
 startup — e.g. a CPU-affinity note, or on macOS a durability note that
@@ -127,7 +132,7 @@ separately only if you need the lower-level wire types directly.
 
 ```toml
 [dependencies]
-weir-client = "4.0"
+weir-client = "4.1"
 # Add `features = ["tls"]` for the TCP + mutual-TLS transport, which also
 # builds on Windows.
 # weir-core is only needed for the lower-level wire types, not a basic producer.
@@ -232,14 +237,16 @@ For the full pipeline detail, see
 > **Ack ≠ delivered.** A successful `push` means the record is durably
 > *buffered* (fsynced for `Durable`), **not** that it has reached the
 > sink. The drain forwards records only after a WAB segment *seals* — at its
-> size threshold (`segment_max_bytes`, default 256 MiB) or on shutdown. So with
+> size threshold (`wab_segment_max_bytes`, default 256 MiB) or on shutdown. So with
 > a handful of small records the sink isn't touched until you stop the daemon,
 > and with the default `noop` sink nothing is forwarded at all (it's a soak-test
 > sink). Confirm acceptance with `weir_records_ack_total`, not the sink-commit
 > metric. To make a low-volume deployment drain promptly, set
 > `wab_segment_max_age_secs` (e.g. `2`) so an idle segment seals on a timer
 > instead of waiting to fill 256 MiB; for a one-off demo you can also just send
-> `SIGTERM` (graceful shutdown seals the open segment).
+> `SIGTERM` (graceful shutdown seals the open segment, then gives the drain up to
+> `drain_shutdown_budget_secs`, default 10 s, to deliver it; anything left is
+> delivered by the next start).
 
 ## Cleaning up
 
@@ -255,6 +262,16 @@ rm -rf /tmp/weir-quickstart
 ```
 
 ## Common issues
+
+**Is it up, and if not, why?**
+`curl http://localhost:9185/readyz` answers `ok`, or `503` with
+`not ready: <codes>`; add `?verbose` for one line per check. For the
+reasons in full (conditions, drain, sink, backlog, shards), run
+`weir-ctl status --wab-dir /tmp/weir-quickstart/wab`: it exits 0 when ready,
+1 when not ready, 2 when it cannot reach the daemon, and 3 when ready with a
+critical condition. Each condition code has a runbook in
+[monitoring.md → Conditions](../monitoring.md#conditions). With no sink
+configured, expect the `noop_sink` warning: records are acked and discarded.
 
 **`socket_path '…' is in use by a running process; refusing to remove it`**
 Another `weir-server` is listening on that socket. Check with

@@ -102,7 +102,8 @@ Unix path:
   connection permit.
 - **Revocation by CA rotation.** CRL and OCSP are out of scope (v2). To
   revoke a client cert, rotate the CA: issue a new CA, re-issue all certs
-  from it, update `tls_client_ca_path`, send SIGHUP. The old CA is
+  from it, update `tls_client_ca_path`, send SIGHUP (or run `weir-ctl reload`,
+  the same reload path). The old CA is
   immediately distrusted.
 
 See [TCP + mutual TLS](../operations/tcp-mtls.md) for the operator guide.
@@ -153,7 +154,8 @@ unlink the first one's live socket. The daemon now enforces single ownership its
 
 **`wab_dir` is exclusively locked before anything reads it.** Startup order
 is: SIGHUP ignored → config → `weir starting` → **lock** → **preflight** →
-recovery → replay → runtime. The lock is `flock(LOCK_EX | LOCK_NB)` on
+runtime (signal and reload handlers, the metrics/health listener, the admin
+socket) → recovery → replay hand-off → pipeline → producer listeners. The lock is `flock(LOCK_EX | LOCK_NB)` on
 `<wab_dir>/.weir.lock` (`crates/weir-server/src/wab/lock.rs`):
 
 - The file is opened `O_NOFOLLOW`, created at mode 0600, and must be a regular
@@ -215,7 +217,7 @@ path with the held fd and re-issues `flock` on the held fd. The verdicts:
 |---|---|
 | Intact | Nothing. |
 | File deleted (re-created with `O_EXCL`, so a file planted meanwhile is never adopted), or replaced by one nobody holds whose record does not name another daemon | Re-creates or re-locks it. ERROR log ending `Never delete the lock file of a running daemon`, and `weir_wab_dir_lock_integrity_failures_total` +1. Keeps running. |
-| Another open file description holds the lock (on the held fd, or on the re-created file), or the replacement nobody holds carries another daemon's record (that daemon held the directory and exited; its record is left in place). Both are checked before the hard-link and owner checks, which only gate writing this daemon's record, so a second daemon running as another uid is still caught | **Proof that a second writer owns the directory.** The daemon raises an in-memory flag, so every new push on the Unix and TCP listeners is Nacked `InternalError` before it reaches the queue (`weir_records_nack_total{reason="internal_error"}`). It then sets `weir_wab_dir_lock_held` to 0, logs `CRITICAL: wab_dir ownership lost: …` naming the other holder, and exits with status **3** at once. It does not seal, because the segments are the other daemon's now, and there is no grace period, because a grace only lengthens the window of knowing false acks. |
+| Another open file description holds the lock (on the held fd, or on the re-created file), or the replacement nobody holds carries another daemon's record (that daemon held the directory and exited; its record is left in place). Both are checked before the hard-link and owner checks, which only gate writing this daemon's record, so a second daemon running as another uid is still caught | **Proof that a second writer owns the directory.** The daemon raises an in-memory flag, so every new push on the Unix and TCP listeners is Nacked `InternalError` before it reaches the queue (`weir_records_nack_total{reason="internal_error"}`, and `weir_records_nack_internal_total{cause="ownership_lost"}`). It then sets `weir_wab_dir_lock_held` to 0, logs `CRITICAL: wab_dir ownership lost: …` naming the other holder, and exits with status **3** at once. It does not seal, because the segments are the other daemon's now, and there is no grace period, because a grace only lengthens the window of knowing false acks. |
 | Any other error | ERROR log and `weir_wab_dir_lock_integrity_failures_total` +1. Retried on the next tick. |
 
 Exit status 3 is distinct from 1 (refused to start). Under the shipped
@@ -306,7 +308,7 @@ deliberate architectural choices; others are future work.
 | Remote producers (unauthenticated) | TCP listener requires mutual TLS (CA-signed client cert). Anonymous TCP connections are rejected at the handshake. Plaintext TCP is never exposed. See [TCP + mutual TLS](../operations/tcp-mtls.md). |
 | Per-client authentication | Possession of socket open access = full producer authority. Filesystem permissions are the access control. |
 | Privilege drop | Daemon runs as whatever user invoked it. There is no built-in `setuid`/`setgid` to a dedicated `weir` user. Operators are expected to launch under the desired user (e.g. via systemd `User=weir`). |
-| Linux capabilities / seccomp | Not applied. Operators should sandbox the binary externally if needed (systemd `CapabilityBoundingSet=`, `RestrictAddressFamilies=AF_UNIX`, `PrivateTmp=yes`, `ProtectSystem=strict`, etc.). |
+| Linux capabilities / seccomp | Not applied by the binary itself. Sandbox it externally: the shipped `deploy/systemd/weir.service` sets `NoNewPrivileges=true`, `ProtectSystem=strict`, `PrivateTmp=true`, `SystemCallFilter=@system-service` and `RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6` (AF_INET/AF_INET6 are needed: the metrics/health listener is TCP, and so are most sinks). Add `CapabilityBoundingSet=` and similar as your deployment allows. |
 | Encrypted at-rest WAB | WAB segments are plaintext on disk. Use filesystem-level encryption (LUKS / dm-crypt) if payloads are sensitive. |
 | Non-repudiation / signed audit log | The hash chain described above ("Tamper evidence — operator-run, not a daemon defense") is not a signature. It proves internal consistency and, via an off-host anchor, consistency with what was already observed — it proves nothing about *who* wrote a record, and signing remains a possible follow-up, not something shipped. It also does not defend against a process running as the daemon UID: that is already out of scope above and unchanged here — such a process can rewrite the segment, the `.attest` sidecar, and the anchor's own log line in one motion. **Detection only, never prevention:** nothing stops the write, and a chain whose head was never observed off-host is not evidence of anything. |
 | Sink-side authorization | Sinks (HTTP / MySQL / Postgres / ClickHouse / S3, plus the built-in `noop`) carry their own credentials to the downstream system; weir does not pass through producer identity. Authorization to the downstream is the sink's / operator's responsibility. The S3 sink additionally carries its own **hand-rolled SigV4 signer** and resolves credentials from static config, `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, IRSA or an EC2 instance role (`crates/weir-sink-s3/src/creds.rs`); the workspace is deliberately ring-only and CI fails if `aws-lc-sys` enters the tree. |

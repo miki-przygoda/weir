@@ -36,9 +36,9 @@ Common to all three:
 | Records | 256 bytes, `Durability::Buffered` |
 | Segments | 64 KiB (`wab_segment_max_bytes`), 1 s idle seal |
 | Daemon | `bench_preset`: 4 shards, 4 workers, ingest batch 64 |
-| Sharding | **Inert in this suite.** Shard is assigned per *connection* (`crates/weir-server/src/socket/mod.rs:210`) and the fill opens one client (`tests/load_drain.rs:374-379`), so every record lands on one shard whatever `shard_count` says. |
-| Sink batch size | `sink_max_batch_size` = 100, the default (`crates/weir-server/src/config/mod.rs:721`), never overridden here. The "batch 64" above is the *ingest* coalescing knob — a different setting. |
-| Timed window | **From the first delivered record to the target count, with the numerator counted over the same interval** — see [the 2026-09-12 correction](#2026-09-12--the-rows-above-were-computed-on-two-different-bases). The target is **the sealed half of the fill**, `bulk(n) = n/2` (`tests/load_drain.rs:350-360`): only whole rotated segments seal, so timing the tail would fold up to a second of idle-seal timer into a throughput number. Each scenario separately asserts the full count arrives, so the tail is checked for correctness without polluting the rate. |
+| Sharding | **Inert in this suite.** Shard is assigned per *connection* (the accept loop's `router.pick` in `crates/weir-server/src/socket/mod.rs`) and the fill opens one client (`fill` in `tests/load_drain.rs`), so every record lands on one shard whatever `shard_count` says. |
+| Sink batch size | `sink_max_batch_size` = 100, the default (`crates/weir-server/src/config/mod.rs`), never overridden here. The "batch 64" above is the *ingest* coalescing knob — a different setting. |
+| Timed window | **From the first delivered record to the target count, with the numerator counted over the same interval** — see [the 2026-09-12 correction](#2026-09-12--the-rows-above-were-computed-on-two-different-bases). The target is **the sealed half of the fill**, `bulk(n) = n/2` (`tests/load_drain.rs`): only whole rotated segments seal, so timing the tail would fold up to a second of idle-seal timer into a throughput number. Each scenario separately asserts the full count arrives, so the tail is checked for correctness without polluting the rate. |
 
 ## 2026-09-12 — the rows above were computed on two different bases
 

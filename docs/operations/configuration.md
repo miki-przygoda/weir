@@ -15,8 +15,9 @@ Weir merges four layers in this precedence order (first match wins):
    Useful for one-off runs and overriding the file for tests.
 2. **Environment variables** — `WEIR_SOCKET_PATH`, `WEIR_WAB_DIR`,
    `WEIR_BATCH_SIZE`, etc. The `WEIR_` prefix + screaming-snake-case
-   field name. Useful in container orchestrators (Kubernetes, ECS,
-   systemd `Environment=`).
+   field name (except the three TLS paths, which drop the `_PATH`:
+   `WEIR_TLS_CERT`, `WEIR_TLS_KEY`, `WEIR_TLS_CLIENT_CA`). Useful in
+   container orchestrators (Kubernetes, ECS, systemd `Environment=`).
 3. **TOML file** — default path `/etc/weir/weir.toml`, overridable via
    `--config <path>`. A missing file is **not** an error; the loader
    falls through to env + defaults, but it logs a WARN naming the path
@@ -92,8 +93,12 @@ batch_size  = 256
 # ... etc
 ```
 
-The reference example at `deploy/docker/weir.toml.example` shows every
-option with its default value and the matching `WEIR_*` env var name.
+The reference example at `deploy/docker/weir.toml.example` shows the
+common options with their default values and the matching `WEIR_*` env var
+names. It leaves out the per-sink keys (`sink_mysql_*`, `sink_postgres_*`,
+`sink_clickhouse_*`, `sink_s3_*`), the TCP/TLS keys, `wab_compression`,
+`wab_compression_level`, `wab_max_bytes` and `max_batch_records`; this page
+covers every key.
 
 ## Option reference
 
@@ -349,7 +354,10 @@ mounted into producer containers.
 
 Number of WAB shards. Each shard has its own segment file and its own
 flusher thread. Each connection is pinned to a shard round-robin at
-accept time (`connection_counter % shard_count`); every record on that
+accept time, over the shards that can take ingest (the `n mod k`-th of the
+`k` live shards; a shard that is down is skipped, and with none live the
+connection is refused and counted in
+`weir_connections_refused_no_live_shard_total`); every record on that
 connection goes to the same shard. Per-record shard-aware routing is
 future work.
 
@@ -361,7 +369,7 @@ throughput. Default `1` is correct for most deployments.
 
 > **`shard_count` is not a throughput dial — and it is non-monotonic under
 > concurrency.** Each connection is pinned to one shard for its lifetime, round-robin
-> at accept time (`counter % shard_count`, `socket/mod.rs`). The Durable-tier throughput
+> over the live shards at accept time (`socket/route.rs`). The Durable-tier throughput
 > lever is **group-fsync batching**: a shard's flusher rides every record currently in
 > its active segment on a single `fsync` (`wab/mod.rs` `flush_batch` — "one group fsync
 > covers every record still in the active segment"), so the more concurrent producers
@@ -912,8 +920,9 @@ between sends (60–300s).
 
 **Operational note**: alert on
 `rate(weir_connection_idle_timeout_total[5m]) > 0` to detect potential
-slowloris activity or buggy clients. The full alert-recipe doc is
-planned for Phase 2.
+slowloris activity or buggy clients. This rule is not among the shipped
+alerts; those, with their runbooks, are in
+[monitoring.md](../monitoring.md#alerts--runbook).
 
 ---
 
@@ -1185,7 +1194,7 @@ as permanent — e.g. an HTTP 4xx, or a SQL constraint violation), the
 record is appended to a dead-letter segment under
 `<wab_dir>/dead_letter/`. The two options below cap that directory's growth.
 
-> **Dead-letter vs. stranded — they are different.** Exhausting `max_retries`
+> **Dead-letter vs. stranded — they are different.** Exhausting `sink_max_retries`
 > on a *transient* failure does **not** dead-letter; the segment is left in the
 > WAB (**stranded**) and re-drained by the drain's rescan once its cool-down
 > has passed, resuming past the records already delivered in this run, or
@@ -1226,7 +1235,7 @@ weir-ctl dl requeue --wab-dir /var/lib/weir/wab --socket /run/weir/weir.sock --y
 - **Flags**: `--wab-dir` (env `WEIR_WAB_DIR`); `--socket` (alias `--socket-path`,
   default `/run/weir/weir.sock`) — the daemon socket to push back through;
   `--durability` (`durable` | `buffered`; `sync` and `batched` are accepted as
-  legacy aliases for `durable`; default `batched`, i.e. `durable`) — the
+  legacy aliases for `durable`; default `durable`) — the
   durability tier for the re-pushed records; `--yes` to actually requeue.
 - **At-least-once, segment-atomic.** A segment is deleted only after **all** of
   its records are re-accepted (each `Push` is acked only once the daemon has made
@@ -1363,8 +1372,8 @@ without it" error rather than an unknown-value one:
 - **Env**: `WEIR_SINK_TYPE`
 - **TOML**: `sink_type`
 
-**When to change**: set to `"http"`, `"mysql"`, `"postgres"`, or
-`"clickhouse"` once a real downstream is available; leave at `"noop"`
+**When to change**: set to `"http"`, `"mysql"`, `"postgres"`,
+`"clickhouse"` or `"s3"` once a real downstream is available; leave at `"noop"`
 until then.
 
 ---
@@ -2511,8 +2520,9 @@ log_level = "info"
 
 > **Requires `--features tls`** — the `tls` feature on `weir-server` (and
 > `weir-client`) is **off by default** for a plain `cargo build`; a binary
-> built without it has no TCP listener and the five keys below are not
-> recognised, and enabling `tcp_bind` without the feature is a startup error.
+> built without it has no TCP listener, and setting `tcp_bind` on it is a
+> startup error (the five keys below are still accepted, so they draw no
+> unknown-key warning).
 > This does **not** mean operators must build from source: as of 2.0.3, the
 > official release binaries (Linux/macOS) and the official Docker image are
 > already built with `--features tls`. **There is no Windows binary** — the
@@ -2545,8 +2555,9 @@ see [TCP + mutual TLS](tcp-mtls.md).
 
 The address and port for the TCP listener. When unset (the default), the
 daemon operates Unix-socket-only and the four TLS keys below are ignored.
-When set, all four TLS keys become required; missing any one is a startup
-error.
+When set, the three path keys (`tls_cert_path`, `tls_key_path`,
+`tls_client_ca_path`) become required; missing any one is a startup error.
+`tls_handshake_timeout_secs` keeps its default.
 
 **Operational notes**:
 
@@ -2623,7 +2634,7 @@ re-keying procedure. Update the path and send SIGHUP.
 
 - **Type**: u64 (seconds)
 - **Default**: `10`
-- **Range**: 1+ (no upper cap)
+- **Range**: 1–300
 - **CLI**: `--tls-handshake-timeout-secs <n>`
 - **Env**: `WEIR_TLS_HANDSHAKE_TIMEOUT_SECS`
 - **TOML**: `tls_handshake_timeout_secs`
@@ -2653,7 +2664,7 @@ Two metric families are added by the `tls` feature:
 | Metric | Type | Labels | What it tracks |
 |--------|------|--------|----------------|
 | `weir_tls_handshake_failures_total` | counter | `reason` ∈ {`no_client_cert`, `bad_cert`, `timeout`, `other`} | TLS handshakes that failed before a connection was established |
-| `weir_tls_config_reloads_total` | counter | `outcome` ∈ {`ok`, `failed`} | SIGHUP-triggered TLS cert/key/CA reload attempts |
+| `weir_tls_config_reloads_total` | counter | `outcome` ∈ {`ok`, `failed`} | TLS cert/key/CA reload attempts, from SIGHUP or `weir-ctl reload` |
 
 Alert on `rate(weir_tls_handshake_failures_total[5m]) > 0` (especially
 `reason="no_client_cert"` or `reason="bad_cert"`) to detect unauthorised
@@ -2666,7 +2677,8 @@ failures.
 ## Limitations
 
 - **No hot reload (except TLS material)**: config is read once at startup.
-  SIGHUP reloads **TLS cert/key/CA only** — all other configuration changes
+  SIGHUP (or `weir-ctl reload`, over the admin socket) reloads **TLS
+  cert/key/CA only** — all other configuration changes
   require a daemon restart. SIGHUP never terminates the daemon: it is ignored
   only before the runtime starts (configuration load, lock and preflight); from
   before WAB recovery onward it is served, and on a daemon with nothing to reload (no
@@ -2685,10 +2697,11 @@ failures.
   running daemon, with a minimal config inline.
 - *Tuning guide* — planned for Phase 2; operator-facing guide on
   picking values for your workload (vs the data dump in batch-tuning).
-- *Observability* — planned for Phase 2; metrics catalogue with alert
-  thresholds and Grafana dashboard JSON.
+- [Monitoring](../monitoring.md) — metric reference, health routes, alert
+  rules with runbooks, and the Conditions catalogue; the Grafana dashboard
+  is `deploy/grafana/weir-dashboard.json`.
 - [Batch tuning data](../benchmarks/batch-tuning.md) — the empirical
   sweep behind the `(256, 1ms)` default.
 - [`deploy/docker/weir.toml.example`](https://github.com/miki-przygoda/weir/blob/main/deploy/docker/weir.toml.example)
-  — every option with its default and matching env var, kept in sync
-  with this reference.
+  — the common options with their defaults and matching env vars (not the
+  per-sink, TCP/TLS or compression keys).

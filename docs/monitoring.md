@@ -320,16 +320,20 @@ inhibit_rules:
 ### Drain / dead-letter
 
 #### WeirDrainNotConfirming
-Segments are entering the WAB and none are leaving it. **This is the only rule
-here that can see a wedged drain**, so treat it as authoritative even when every
-other drain signal looks healthy.
+Segments are entering the WAB and none are leaving it. **Of the drain rules,
+this is the only one that can see a wedged drain**, so treat it as authoritative
+even when every other drain signal looks healthy. The other rule that sees it is
+[WeirConditionCritical](#weirconditioncritical) with `code="drain_wedged"`,
+which the 5 s poll task evaluates from the drain heartbeat, outside the drain
+thread.
 
 `weir_drain_state` and `weir_sink_health` are written *only* by the drain thread
 (`drain/mod.rs`). When that thread wedges they freeze at their last value, so
 `WeirDrainBlocked`, `WeirDrainStopped`, `WeirSinkDown` and `WeirSinkDegraded` are
 all silent in exactly the incident they exist for, and `weir-readiness.sh` prints
-`READY` throughout. This rule rests on `weir_wab_segments_total` instead — a
-counter incremented by the WAB flusher (`sealed`) and by the drain's confirm path
+`READY` throughout (a wedge does not gate readiness; it adds a `drain_wedged`
+WARN line, and exits 3 only with `--fail-on-critical`). This rule rests on
+`weir_wab_segments_total` instead — a counter incremented by the WAB flusher (`sealed`) and by the drain's confirm path
 (`confirmed`) — so neither side depends on the drain publishing its own health.
 
 **Respond:** do not start from the gauges, they are lying by omission. Check
@@ -1110,7 +1114,7 @@ exposition; histograms expose `_bucket` / `_sum` / `_count`.
 |---|---|---|
 | `weir_records_accepted_total{tier}` | counter | Records admitted for processing, by durability tier (`durable`/`buffered`). |
 | `weir_records_ack_total{tier}` | counter | Records durably acked to the producer, by durability tier (`durable`/`buffered`). The gap `accepted − ack` is in-flight or failed (Nacked) work; it is only ~0, and the amortization ratio only meaningful, while `weir_records_nack_total` stays flat. |
-| `weir_records_nack_total{tier,reason}` | counter | Records Nacked (not durably accepted), by durability tier and `reason`. Should be ~0. `reason` is one of `bad_magic`, `version_mismatch`, `bad_header_crc`, `payload_too_large`, `bad_payload_crc`, `internal_error`, `empty_payload`, `unknown_message`, `reserved_flags_set` (the wire `NackReason` variant names, lowercased). `internal_error` is the only *transient* reason (queue saturation / ack timeout / write-fsync error / the [`wab_max_bytes`](operations/configuration.md#wab_max_bytes) cap rejecting — connection stays open, producer retries); the rest are permanent protocol/payload errors that close the connection. The cap is the one cause with its own counter — `weir_wab_cap_rejections_total` — so subtracting it from `internal_error` separates "the WAB is full" from the other three. |
+| `weir_records_nack_total{tier,reason}` | counter | Records Nacked (not durably accepted), by durability tier and `reason`. Should be ~0. `reason` is one of `bad_magic`, `version_mismatch`, `bad_header_crc`, `payload_too_large`, `bad_payload_crc`, `internal_error`, `empty_payload`, `unknown_message`, `reserved_flags_set`, `bad_batch_framing` (the wire `NackReason` variant names, lowercased). `internal_error` is the only *transient* reason (queue saturation / ack timeout / write-fsync error / the [`wab_max_bytes`](operations/configuration.md#wab_max_bytes) cap rejecting — connection stays open, producer retries); the rest are permanent protocol/payload errors that close the connection. `weir_records_nack_internal_total{cause}` (in *Status, lifecycle and conditions* below) splits `internal_error` by cause. |
 | `weir_batch_records` | histogram | Records carried by one `PushBatch` frame. Only observed for the optional batch extension, so it stays empty on a daemon no client batches against. Its shape is the question "are producers actually batching?" — a distribution pinned near 1 means the batch path is being paid for without being used. |
 | `weir_batch_partial_total` | counter | `PushBatch` frames answered with at least one record not durable. Should be ~0. A partial batch is not a protocol error: the frame was valid and the connection stays open, and the clear bits are the same at-least-once signal a single-record `Nack(InternalError)` carries. Rising values track the same underlying causes as `internal_error` — queue saturation, ack timeout, a write or fsync that did not succeed, the `wab_max_bytes` cap — so read it alongside `weir_records_nack_total{reason="internal_error"}` rather than on its own. |
 | `weir_accept_latency_seconds` | histogram | Socket-accept → connection-handler spawn latency (independent of fsync). |
@@ -1140,13 +1144,13 @@ exposition; histograms expose `_bucket` / `_sum` / `_count`.
 | `weir_wab_record_logical_bytes_total` | counter | Cumulative record payload bytes **as accepted from producers**, before any compression. Equal to `weir_wab_record_stored_bytes_total` when `wab_compression = "none"`. Counts payload bytes only — not the 8-byte per-record framing, the segment header, or the footer — so it is not a file-size measure. |
 | `weir_wab_record_stored_bytes_total` | counter | Cumulative record payload bytes **as written to disk**, after compression. Divide the logical counter by this one for the live compression ratio (see *Compression ratio* below). Bumped only after a successful write, so a rejected record moves neither counter. |
 | `weir_wab_unexpected_mode_total` | counter | Segment file found with unexpected permissions (tampering guard). |
-| `weir_wab_cap_rejections_total` | counter | Pushes Nacked because live WAB bytes exceeded [`wab_max_bytes`](operations/configuration.md#wab_max_bytes). These surface to clients as `NackReason::InternalError` — **the same byte queue saturation uses** — so this counter is the **only** way to distinguish a cap rejection from queue-saturation `InternalError` Nacks. Zero when `wab_max_bytes` is unset (the default). |
+| `weir_wab_cap_rejections_total` | counter | Pushes Nacked because live WAB bytes exceeded [`wab_max_bytes`](operations/configuration.md#wab_max_bytes). These surface to clients as `NackReason::InternalError` — **the same byte queue saturation uses** — so this counter (or `weir_records_nack_internal_total{cause="wab_cap"}`) is how to distinguish a cap rejection from queue-saturation `InternalError` Nacks. Zero when `wab_max_bytes` is unset (the default). |
 | `weir_recovery_records_replayed_total` | counter | Records replayed from sealed-but-unconfirmed segments on startup. |
-| `weir_recovery_segments_quarantined_total` | counter | Corrupt segments quarantined during **active**-segment recovery (bad header, or mid-file corruption with a copied tail). Covers every segment quarantine: active-segment recovery (bad header, or mid-file corruption with a copied tail), sealed-segment replay when a `.confirmed` sidecar fails verification, and drain-time quarantine. It moves in lockstep with `weir_wab_segments{state="quarantined"}`. The one thing it deliberately does **not** count is the `.confirmed` **sidecar file** itself when it is quarantined alongside its segment — that would double-count a single incident. `weir_quarantine_bytes_on_disk` is the signal for how much is sitting there. Recover with `weir-ctl quarantine requeue` — see [the runbook](operations/quarantine-recovery.md). |
+| `weir_recovery_segments_quarantined_total` | counter | Segments quarantined for corruption. Despite the name it covers every segment quarantine: active-segment recovery (bad header, or mid-file corruption with a copied tail), sealed-segment replay when a `.confirmed` sidecar fails verification, and drain-time quarantine. It moves in lockstep with `weir_wab_segments{state="quarantined"}`. The one thing it deliberately does **not** count is the `.confirmed` **sidecar file** itself when it is quarantined alongside its segment — that would double-count a single incident. `weir_quarantine_bytes_on_disk` is the signal for how much is sitting there. Recover with `weir-ctl quarantine requeue` — see [the runbook](operations/quarantine-recovery.md). |
 | `weir_recovery_segments_failed_total` | counter | Segments whose active-segment recovery (`recover_segment`) failed **and left the segment at its original path**, so nothing will ever reach it. **Deliberately excludes quarantined segments** — a header-level quarantine (bad magic / unknown version / too-short header) moves the file and is counted by `weir_recovery_segments_quarantined_total` instead, because it is handled, not abandoned. (Such a segment is listed by `weir-ctl quarantine list`, though `inspect` cannot parse it — the header is what's corrupt.) **Does NOT fire for the mid-file-corruption case** this toolchain exists for: recovery returns `Ok` there, having sealed and delivered the valid prefix. Non-zero therefore means a genuine I/O failure left a segment stranded — check the startup logs for the path and cause. |
 | `weir_quarantine_bytes_on_disk` | gauge | Total bytes under `<wab_dir>/quarantine/`. **The one signal that moves on every quarantine event**, including the `.confirmed`-sidecar case neither counter above catches. Survives a restart (unlike the counters), refreshed on the same cadence as `weir_dead_letter_bytes_on_disk`. Recover with `weir-ctl quarantine requeue`. |
 | `weir_recovery_quarantine_copy_failed_total` | counter | Mid-file-corrupt segments whose quarantine copy failed (disk full / read-only / inode exhaustion); recovery left the segment un-truncated to preserve acked-durable tail records and will retry. **Non-zero means recovery is stuck on that segment — clear the disk/read-only state and restart.** |
-| `weir_ack_timeout_total` | counter | Acks that never fired within the timeout (wedged flusher). |
+| `weir_ack_timeout_total` | counter | Acks that never fired within the timeout; the producer got an `ACK_TIMEOUT` nack. The usual cause is a full drain channel blocking the flusher's hand-off, not storage; see [WeirAckTimeout](#weiracktimeout). |
 | `weir_wab_dir_lock_held` | gauge | 1 while this daemon holds the exclusive `flock` on `<wab_dir>/.weir.lock`, so no second `weir-server` can recover or drain its live segments. **0 means it runs without that guard**: `wab_dir_lock = "best-effort"` on a filesystem that cannot lock. It also reads 0 for the instant before an exit with status 3, when the daemon has proven another instance owns the `wab_dir`. Starts at 0 and is set before the metrics endpoint binds, so a scrape never shows a guard that is not there. **Alert on 0** — the shipped [`WeirWabDirUnlocked`](#weirwabdirunlocked) rule. |
 | `weir_wab_dir_lock_integrity_failures_total` | counter | Once-a-second integrity checks of `<wab_dir>/.weir.lock` that found the file deleted or replaced (the daemon re-created and re-locked it, and logs an ERROR saying so), or that failed with an errno (retried a second later). **Must be 0.** Any increase means something is deleting or replacing the lock file of a running daemon, and while it was missing a second `weir-server` could have started on this `wab_dir`. Proven loss to another instance is not counted here: the daemon exits with status 3 instead. |
 | `weir_stage_queue_seconds`, `weir_stage_bridge_wait_seconds`, `weir_stage_write_seconds`, `weir_stage_total_seconds` | histogram | Per-stage latency decomposition (`bench-trace` builds only — diagnostic): queue + coalesce wait, bridge hop + flusher receive, record write before fsync, and enqueue → ack end to end. |
@@ -1166,7 +1170,7 @@ exposition; histograms expose `_bucket` / `_sum` / `_count`.
 
 ### Drain / sink
 
-> **Changed after 4.0.1 — `weir_drain_segments_stranded_total` now counts sink
+> **Changed in 4.1.0 — `weir_drain_segments_stranded_total` now counts sink
 > failures only.** A segment stranded because the drain could not *read* it, or
 > could not write its sink-rejected records into `dead_letter/`, used to count
 > there too, and to mark the sink down. It now counts in
@@ -1206,8 +1210,8 @@ exposition; histograms expose `_bucket` / `_sum` / `_count`.
 | `weir_connection_rejected_peer_uid_total` | counter | Connections rejected by the `SO_PEERCRED` UID check. |
 | `weir_accept_resource_exhaustion_total` | counter | `accept(2)` failures from resource exhaustion (EMFILE/ENFILE/ENOBUFS/ENOMEM); the accept loop backs off on each. A rising value means the daemon is near an fd/memory limit. |
 | `weir_connection_idle_timeout_total` | counter | Connections dropped for read-idle (slowloris guard). |
-| `weir_connections_aborted_at_shutdown_total` | counter | Connections force-closed at shutdown after the grace period. |
-| `weir_tls_handshake_failures_total` | counter | (tls) Mutual-TLS handshake failures. |
+| `weir_connections_aborted_at_shutdown_total` | counter | Connections force-closed at shutdown: still open after `shutdown_timeout_secs`, or open when a second SIGTERM/SIGINT forced the exit. |
+| `weir_tls_handshake_failures_total{reason}` | counter | (tls) Mutual-TLS handshake failures, by `reason`: `no_client_cert`, `bad_cert`, `timeout`, `other`. |
 | `weir_tls_config_reloads_total{outcome}` | counter | (tls) SIGHUP TLS cert/key/CA reload attempts, by `outcome` (`ok` / `failed`). **Alert on `outcome="failed"`** — a failed reload means the daemon keeps serving the old certificate. Unchanged by `weir_config_reloads_total` below, which counts the same reloads again among every other SIGHUP. |
 | `weir_config_reloads_total{trigger,outcome}` | counter | Every config reload request, on every build. `trigger` is `sighup`, or `admin` (the admin socket's `reload` verb, which runs the same reload). `outcome` is `ok` (something was reloaded — today only TLS material), `failed` (a reload was attempted and rejected; the previous config stays in force), `noop` (nothing reloadable: the config is read once at startup, so a daemon without TLS answers every SIGHUP this way and keeps running), or `dropped` (the request never ran: the 8-deep reload queue was full, as in a SIGHUP flood, or the reload loop had stopped). A SIGHUP that arrives before the handler is installed, during startup, is ignored and not counted. |
 | `weir_http_requests_dropped_total{reason}` | counter | Connections to the metrics/health listener (`metrics_bind:metrics_port`) closed without a response. `reason` is `head_timeout` (no complete request head within 1 s: a stalled or slowloris peer), `head_pool_full` (all 64 head slots busy: a connection flood), `metrics_pool_full` (more concurrent scrapes than [`metrics_max_connections`](operations/configuration.md#metrics_max_connections); Prometheus retries on its next interval) or `probe_pool_full` (more than 4 concurrent `/livez`, `/readyz`, `/startupz` or `/status` requests). Should be ~0. A rising `head_timeout` or `head_pool_full` on a listener bound beyond loopback means someone is holding connections open: restrict the port to the scraper and the kubelet. |
@@ -1216,7 +1220,7 @@ exposition; histograms expose `_bucket` / `_sum` / `_count`.
 
 ### Status, lifecycle and conditions
 
-Added by Foundations. The conditions behind `weir_condition_active` get their own section on this page, [Conditions](#conditions), one `cond-<code>` heading each (the runbook link every condition carries).
+New in 4.1.0 (Foundations). The conditions behind `weir_condition_active` get their own section on this page, [Conditions](#conditions), one `cond-<code>` heading each (the runbook link every condition carries).
 
 | Metric | Type | Meaning |
 |---|---|---|
