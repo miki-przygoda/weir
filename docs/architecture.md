@@ -107,7 +107,8 @@ T1 ingest closed          queue-depth task stopped; workers joined; flushers joi
                           (each seals, fsyncs, hands off; ≤ 1 s if the drain is stuck)
 T2 drain budget           drain_shutdown_budget_secs, then the in-flight segment is
                           abandoned (no .confirmed); main waits ≤ budget + 2 s
-T3 exit                   one summary line (no I/O), runtime stops, exit 0
+T3 exit                   one summary line (no I/O), runtime stops, admin socket
+                          unlinked (inode-checked), exit 0
 second signal (any time)  forced: connection drains abort, the drain deadline is now;
                           the worker and flusher joins still run
 ```
@@ -128,7 +129,7 @@ Three-layer configuration: `CLI > env > TOML file > defaults`.
 - `Config::load()` reads CLI flags (pico-args), `WEIR_*` env vars, and an optional TOML file (default `/etc/weir/weir.toml`). Merges in precedence order, then validates all values.
 - Each layer produces a `PartialConfig` (all fields `Option<T>`). `Config::from_layers()` merges and applies defaults; testable without touching real CLI args or env vars.
 - `validate_path(field, path)` — full four-check sequence (absolute, no `..`, no null bytes, `canonicalize()` re-validated against same checks). Used for `wab_dir`. Returns `ConfigError::PathInvalid` with field name on failure.
-- `validate_path_format(field, path)` — format-only check (no `canonicalize()`). Used for `socket_path`, which does not exist until bind time.
+- `validate_path_format(field, path)` — format-only check (no `canonicalize()`). Used for `socket_path` and `admin_socket_path`, which do not exist until bind time.
 - `ConfigError` — manual `impl std::error::Error`, no `thiserror`. Variants: `InvalidValue`, `ParseError`, `IoError`, `PathInvalid`.
 - Unknown TOML keys produce a `warn!` log; a missing config file is treated as an empty layer (not an error) but logs a WARN naming the path, escalated when the resolved sink is `noop`. The startup log names the config source.
 - See `deploy/docker/weir.toml.example` for all fields, defaults, valid ranges, and `WEIR_*` env-var equivalents.
@@ -139,13 +140,13 @@ The entire socket module is gated `#[cfg(unix)]`. Unix domain sockets do not exi
 
 - Binds a Unix socket with TOCTOU-hardened bind sequence (S_ISSOCK check, then a non-blocking connect-only liveness probe, before removing a stale socket — a socket someone is listening on, or one the probe cannot classify, refuses startup instead; then a tightened umask of `0o177` so `bind(2)` creates the socket inode at mode `0o600` directly — no post-bind `chmod`, which was the exact TOCTOU window the design removed). `bind_hardened` returns a `BoundSocket` carrying the bound inode's identity, and shutdown unlinks the path only if it still names that socket. See [security/socket-bind.md](security/socket-bind.md).
 - Accepts connections up to `max_connections` (Semaphore-gated; over-cap streams are dropped immediately).
-- Assigns each accepted connection a `shard_id` round-robin (`accept_counter % shard_count`). Every WorkUnit pushed on that connection inherits the same shard_id, so a connection is pinned to one WAB flusher for its lifetime — no per-record routing decision on the hot path.
+- Assigns each accepted connection a `shard_id` round-robin over the shards that can take ingest (`src/socket/route.rs`: the `(accept_counter mod k)`-th of the `k` ingest-capable shards in the shard registry, so a shard whose flusher or worker is down is skipped; with none, the connection is refused). Every WorkUnit pushed on that connection inherits the same shard_id, so a connection is pinned to one WAB flusher for its lifetime — no per-record routing decision on the hot path.
 - `handle_connection` parses one frame at a time in a loop. Validation order is fixed and security-critical — see [wire_protocol.md](wire_protocol.md).
 - **A second transport lives in the same module**: `tcp.rs` + `tls.rs` (behind the `tls` feature) mirror the Unix accept loop — same global connection-limit semaphore, same round-robin shard assignment, and the same `handle_connection` — so everything below the accept loop is transport-agnostic. Operator setup is in [operations/tcp-mtls.md](operations/tcp-mtls.md). The `#[cfg(unix)]` gate above still applies: the module as a whole is Unix-only, TCP included.
 - `QueueSender::push_timeout` is used with a 5-second deadline so a dead worker pool returns `InternalError` to the client instead of holding the semaphore slot open indefinitely.
 - Each accepted connection lives in a `JoinSet`; graceful shutdown drains it within `shutdown_timeout_secs` before aborting.
 - SIGTERM/Ctrl-C handling and `shutdown_timeout_secs` are wired in `src/main.rs`; the socket layer follows a `watch<ShutdownLevel>` from `src/lifecycle.rs`: on the first signal it unlinks its socket and closes the listener at once, then drains the `JoinSet` for at most `shutdown_timeout_secs`, and aborts it on a second signal.
-- SIGHUP is ignored (`SIG_IGN`) from the top of `main` and handled once the runtime exists (right after the lock and preflight, before WAB recovery), through the one reload path in `src/reload.rs`: a TLS reload when TLS is loaded, otherwise a logged no-op. Both count in `weir_config_reloads_total{trigger,outcome}`. SIGHUP never terminates the daemon.
+- SIGHUP is ignored (`SIG_IGN`) from the top of `main` and handled once the runtime exists (right after the lock and preflight, before WAB recovery), through the one reload path in `src/reload.rs` (the admin socket's `reload` verb feeds the same bounded queue): a TLS reload when TLS is loaded, otherwise a logged no-op. Both count in `weir_config_reloads_total{trigger,outcome}`. SIGHUP never terminates the daemon.
 - Each push checks one `AtomicBool`, `wab_ownership_lost`, before the WAB-cap check; once the lock-integrity thread has proven another daemon owns the `wab_dir`, pushes are NACKed `InternalError` and the process exits 3.
 
 ### Work queue (`src/queue.rs`)
@@ -173,7 +174,7 @@ Crash-safe write-ahead buffer. See [wab_format.md](wab_format.md) for the binary
 - Two durability tiers. `Durable` upholds "ack ⇒ durable": it group-fdatasyncs at the batch boundary before acking every record in the batch. `Buffered` trades durability for latency — it acks after the in-memory write, before any fsync, so it does **not** uphold "ack ⇒ durable" (a Buffered ack survives a process crash but not power loss). (Historically there was a third tier: `Sync` fsynced once per record while `Batched` fsynced once per batch, until both moved onto the same batch-boundary group fsync and the distinction between them stopped existing — one fsync at the end of the batch already covered every record written during it, so a single-producer serial workload saw no difference, and under concurrent producers `Sync` amortised into the group fsync just like `Batched`. weir 2.0 removed the now-redundant tier: wire byte `0x02` is retired and permanently reserved, still decodes to `Durable` for old producers, and is never emitted by the encoder. See [wire_protocol.md → Durability tiers](wire_protocol.md#durability-tiers).)
 - Segments rotate when `bytes_written >= SEGMENT_MAX_BYTES` (256 MiB). Sealed segments are forwarded to the drain channel.
 - Ownership: `src/wab/lock.rs` takes an exclusive `flock` on `<wab_dir>/.weir.lock` before anything reads the WAB, keeps the fd in a process-wide static until exit (never released explicitly, never unlinked, never re-opened), and is re-checked once a second by its own thread from right after acquisition (so through recovery too): a deleted lock file is re-created (`O_EXCL`) and re-locked, and a replacement nobody holds is re-locked unless its record names another daemon; one another instance holds, or one carrying another daemon's record, is proof of lost ownership, and the daemon exits 3 without sealing. `wab_dir_lock = "best-effort"` only covers a filesystem that cannot lock; then orphan deletion is off. File format: [wab_format.md](wab_format.md#the-wab_dir-lock-file).
-- Path validation (`validate_path`) is consolidated in `src/config/mod.rs` and used for `wab_dir` and `socket_path` at config-load time. The WAB module previously carried a local copy for belt-and-suspenders checking at flusher-spawn time; that duplicate has been removed in favour of the single source of truth.
+- Path validation is consolidated in `src/config/mod.rs` and runs at config-load time (`validate_path` for `wab_dir`, `validate_path_format` for `socket_path` and `admin_socket_path`). The WAB module previously carried a local copy for belt-and-suspenders checking at flusher-spawn time; that duplicate has been removed in favour of the single source of truth.
 
 ### Sink (`src/sink/`)
 
@@ -256,6 +257,23 @@ BlockedDeadLetterFull
 - Running `total_bytes` updated after every write; `rescan()` called on each blocked-state wake to detect files deleted by the operator outside the daemon. A `dead_letter/` directory deleted outright is re-created (total reset to 0, counter kept), by `rescan()` and by a write that meets `ENOENT`. `wab_dir` is fsynced before any record is written into a (re-)created `dead_letter/`, so a dead-lettered record, whose source segment is then confirmed and deleted, never sits in a directory whose own entry a power loss could undo.
 - `would_exceed_cap(additional_bytes, cap)` is checked before every write; if it would exceed, the drain enters `BlockedDeadLetterFull` instead, and leaves it only once that same write fits.
 
+### Lifecycle and drain control (`src/lifecycle.rs`, `src/drain/control.rs`)
+
+- `Lifecycle` holds the shutdown level in a `watch` channel. The level only rises: `Running` → `Graceful` (first SIGTERM/SIGINT) → `Forced` (second); a third signal only logs. `request_shutdown` does T0 inline on the signal task (readiness off, phase `shutting_down`, drain absorb mode, the flushers' shutdown flag, the lame duck); the listeners and the admin socket only read the level. SIGHUP is not handled here; it stays on the reload path.
+- `DrainControl` is the drain's *intent*: what the lifecycle or an operator wants it to do. Every field is an atomic on one `Arc` (absorb, stop, a deadline that only ever moves earlier, pause, requeue tickets), so a handle is cheap to clone and never blocks the drain. It carries no channel handle; the drain owns the drain channel's only receiver. Production uses `DrainControl::attached()`: the drain's lifetime is this control, not the channel, so a closed channel (every flusher gone) no longer ends delivery; only `request_stop(budget)` or `force_stop` does. What the drain has actually done is published to the status board (`src/drain/publish.rs`), never read back from the control.
+
+### Status board and shard registry (`src/status/`)
+
+- `StatusBoard` (`src/status/board.rs`) is the daemon's live state: static info, the lifecycle phase, listener, drain, sink, WAB, admin and reload cells, condition latches, queue and drain-channel depth. Each cell has one writer; readers only load. Writers store atomics or swap `ArcSwap` cells, and no blocking lock type appears anywhere under `src/status/` (a test, `no_blocking_locks_under_status`, enforces it).
+- `ShardRegistry` (`src/status/shards.rs`) records each shard's state (the flusher supervisor is the single writer of its terminal state) and each worker's running flag (written by the worker's drop guard). Routing reads it at accept: `pick_live` sends a new connection only to an ingest-capable shard, and startup waits up to 10 s for every shard and worker to settle before binding the producer listeners.
+- The poll tasks (`src/status/poll.rs`): every 5 s, the WAB size scan (feeding the `wab_max_bytes` cap), the drain-heartbeat stall check, and the evaluation of the board into the `weir-status` Conditions and the status gauges; every 500 ms, queue depth and the drain channel's high-water stamp. `src/status/render.rs` turns the board into the `weir.status/v1` document that `/status`, admin `status` and `weir-ctl status` show.
+
+### Admin socket (`src/admin/`) — Unix only
+
+- A JSON-lines control socket, by default `<parent(wab_dir)>/<basename(wab_dir)>.admin.sock`, separate from the producer socket and never in the producer-shared directory. Bound before recovery with the same hardened bind as the producer socket; an explicit `admin_socket_path` that cannot be bound stops startup, a derived default that cannot be bound disables admin (`admin_unavailable`) and the daemon runs on. Keys: `admin_socket_enabled`, `admin_socket_path` ([configuration](operations/configuration.md#admin_socket_path)).
+- Peers: the daemon's own euid or root only, always checked (`src/admin/identity.rs`; independent of `peer_uid_check`, which governs producers). Framing (`src/admin/framing.rs`): one JSON object per line each way, 64 KiB line limit enforced while reading, at most 64 requests per connection.
+- Verbs (`src/admin/verbs.rs`): `status` reads the board; `reload` goes through `src/reload.rs`'s single loop; `drain.pause`, `drain.resume` and `drain.retry_stranded` store intent in `DrainControl` and wait (bounded) for the drain's observation on the board. Neither the drain nor the lifecycle ever waits on a client. A pause takes effect before the next commit batch, keeps ingest buffering, and is in memory only: a restart resumes delivery. `weir-ctl status`, `reload` and `drain pause|resume|retry-stranded` are the client side.
+
 ### Metrics (`src/metrics/`)
 
 A family of Prometheus metrics registered with a `prometheus-client` registry (the full catalogue is in [monitoring.md](monitoring.md)). `Metrics::new()` returns `(Metrics, Registry)` — the metrics struct goes to subsystems; the registry goes to the HTTP server.
@@ -284,7 +302,7 @@ A family of Prometheus metrics registered with a `prometheus-client` registry (t
 | `weir_dead_letter_blocked_duration_seconds` | gauge | Time in `BlockedDeadLetterFull`; alert target |
 | `weir_wab_dir_lock_held` | gauge | 1 while the `wab_dir` lock is held; 0 under the `best-effort` fallback or just before an ownership-lost exit |
 | `weir_wab_dir_lock_integrity_failures_total` | counter | Integrity checks that found `.weir.lock` deleted or replaced (then re-locked), or could not verify it |
-| `weir_config_reloads_total{trigger,outcome}` | counter | Reload requests (`sighup`; `admin` reserved) by `ok` / `failed` / `noop` / `dropped` |
+| `weir_config_reloads_total{trigger,outcome}` | counter | Reload requests (`sighup`, or `admin` for the admin socket's `reload` verb) by `ok` / `failed` / `noop` / `dropped` |
 | `weir_drain_local_io_strands_total{cause}` | counter | Strands caused by local I/O (`read`, `write`), kept out of the sink-oriented stranded counter |
 | `weir_drain_segments_parked{reason}` | gauge | Parked segments (`local_read_failed`, `unsupported_version`, `drain_panic`) |
 | `weir_drain_segments_disposition_pending{kind}` | gauge | Delivered or set-aside segments with a `confirm` or `quarantine` step outstanding |
@@ -293,7 +311,11 @@ A family of Prometheus metrics registered with a `prometheus-client` registry (t
 | `weir_drain_dead_letter_write_failures_total` | counter | Dead-letter writes that failed after the sink committed |
 | `weir_drain_busy_seconds{kind}` | gauge | Seconds the drain has spent in its current blocking operation, by kind |
 
-`weir_drain_state` and `weir_sink_health` are pre-initialised so all label values appear on the first scrape. The HTTP exposition server binds to `metrics_bind:metrics_port` (default `127.0.0.1:9185`, localhost only) and serves `GET /metrics` in OpenMetrics text format. Set `metrics_bind = "0.0.0.0"` to allow container-host scraping; restrict exposure via firewall / network namespace, and note that `/metrics` is unauthenticated.
+The table lists the core series only; 4.1.0 added the status, lifecycle and admin families (`weir_ready`, `weir_live`, `weir_condition_active{code,severity}`, `weir_startup_phase{phase}`, `weir_admin_requests_total` and others), listed in [monitoring.md](monitoring.md).
+
+`weir_drain_state` and `weir_sink_health` are pre-initialised so all label values appear on the first scrape. The HTTP listener binds to `metrics_bind:metrics_port` (default `127.0.0.1:9185`, localhost only) before WAB recovery, so it answers through recovery and until the end of shutdown. Set `metrics_bind = "0.0.0.0"` to allow container-host scraping; restrict exposure via firewall / network namespace, and note that every route on it is unauthenticated.
+
+**Router** (`src/metrics/router.rs`, pure: request head → route, probe answer → response; `src/metrics/server.rs` does the socket work). Each connection first takes one of 64 head slots and must send its request head (≤ 4096 bytes) within 1 s, or it is closed. Then exact-path `GET`/`HEAD` of `/livez`, `/readyz`, `/startupz` and `/status` take one of 4 probe slots; any other method on those paths gets 405, and every other path takes one of `metrics_max_connections` and gets the metrics exposition byte for byte as before. `/livez` and `/readyz` answer `200 ok` or `503 not live: <codes>` / `503 not ready: <codes>`; `/startupz` is 200 once the daemon has ever served; `/status` is the `weir.status/v1` JSON document. The probes read the status board through `StatusSource` (`src/status/http.rs`) and evaluate it with the `weir-status` predicates on every request: loads only, no lock, no I/O. Connections closed without a response count in `weir_http_requests_dropped_total{reason}`. Probe use: [monitoring.md → Health and status endpoints](monitoring.md#health-and-status-endpoints).
 
 ### Testing infrastructure
 
@@ -347,12 +369,17 @@ dependency graph, not just convention — verify with `cargo tree`.
 | Crate | Depends on (normal) | Standalone use without the daemon |
 |-------|---------------------|-----------------------------------|
 | `weir-core` | — (just `bytes`, `crc32fast`) | The wire types + `Payload`. Build a producer or a non-Rust client against the frozen v1 wire protocol. |
-| `weir-wab` | `weir-core`, `crc32fast` | Read/inspect/recover on-disk WAB segments. No async runtime, no daemon. `SegmentReader::open(path)` streams CRC-verified records straight off disk — useful for a recovery tool, an offline inspector, or a custom reader. |
-| `weir-status` | — (just `serde`) | The `weir.status/v1` model, Conditions evaluator and probe predicates shared by the daemon and `weir-ctl`; pure Rust, no I/O. Evaluate a daemon from its metrics exposition or from disk facts without linking the daemon. |
+| `weir-wab` | `weir-core`, `crc32fast`, `zstd` | Read/inspect/recover on-disk WAB segments. No async runtime, no daemon. `SegmentReader::open(path)` streams CRC-verified records straight off disk — useful for a recovery tool, an offline inspector, or a custom reader. |
+| `weir-status` | — (just `serde`, `serde_json`) | The `weir.status/v1` model, Conditions evaluator and probe predicates shared by the daemon and `weir-ctl`; pure Rust, no I/O. Evaluate a daemon from its metrics exposition or from disk facts without linking the daemon. |
 | `weir-sink-sdk` | `weir-core` | Implement **and unit-test** a custom `Sink` against the stable trait — no `weir-server`, no tokio required (the crate's own tests drive `commit`/`health` with a tiny `block_on`). `BasicSinkError` / `Infallible` cover quick error types. |
 | `weir-client` | `weir-core` | The synchronous producer client. Push records over the socket from your own app. |
-| `weir-ctl` | `weir-core`, `weir-client`, `weir-wab` | The admin CLI. Notably does **not** depend on `weir-server` — it's a thin tool over the wire client + the segment reader, so it (and the WAB-reading capability it's built on) work independently of the daemon binary. |
+| `weir-attest` | `weir-wab`, `weir-sink-sdk` | A tamper-evident hash chain over sealed WAB segments, verifiable against the downstream's own rows (`weir-ctl attest`). |
+| `weir-sink-s3` | `weir-core`, `weir-sink-sdk` | The S3-API object-storage sink (AWS S3, MinIO, R2, B2, Ceph); compiled into `weir-server` behind its optional `s3-sink` feature. |
+| `weir-ctl` | `weir-core`, `weir-client`, `weir-wab`, `weir-attest`, `weir-status` | The admin CLI. Notably does **not** depend on `weir-server` — it's a thin tool over the wire client, the segment reader, the admin socket and the HTTP routes, so it (and the WAB-reading capability it's built on) work independently of the daemon binary; offline, `weir-ctl status` evaluates the same `weir-status` predicates from metrics and disk. |
 | `weir-server` | the above + tokio/sink stacks | The daemon itself. |
+| `weir-rs` | `weir-core`; optionally `weir-client`, `weir-sink-sdk`, `weir-wab` | A facade re-exporting the libraries above behind features, for one dependency line. |
+
+Ten crates are published; `weir-testkit` (test helpers over `weir-client`) is workspace-only.
 
 **What this enables.** You can build your own system on the pieces — e.g. read
 the WAB with `weir-wab`, run operations with `weir-ctl`, and forward to your own
@@ -364,8 +391,8 @@ A first-class plugin/entry-point is a candidate for a future minor release.)
 
 The cost of the split is real but small — more `Cargo.toml`s and a published
 surface to keep stable — and it buys genuine composability, not speculative
-modularity: the boundaries have present consumers (`weir-ctl` uses `weir-wab`;
-the built-in sinks implement `weir-sink-sdk`).
+modularity: the boundaries have present consumers (`weir-ctl` uses `weir-wab` and
+`weir-status`; the built-in sinks implement `weir-sink-sdk`).
 
 ## Design notes
 

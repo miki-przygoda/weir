@@ -239,10 +239,12 @@ startup and never reloaded. Changing those settings requires a daemon restart.
 2. Write new files to the configured paths (or new paths, updating config
    first).
 3. Verify the files are readable by the daemon user.
-4. `kill -HUP <pid>` (or `systemctl kill --signal=SIGHUP weir`)
+4. `kill -HUP <pid>` (or `systemctl kill --signal=SIGHUP weir`, or
+   `weir-ctl reload`, which prints the outcome)
 5. Check `weir_tls_config_reloads_total{outcome="ok"}` incremented (via the
    `/metrics` endpoint or your Prometheus instance).
-   `weir_config_reloads_total{trigger="sighup",outcome="ok"}` moves with it.
+   `weir_config_reloads_total{trigger="sighup",outcome="ok"}` moves with it
+   (`trigger="admin"` for `weir-ctl reload`).
 6. Confirm `weir_tls_config_reloads_total{outcome="failed"}` did **not**
    increment. If `weir_config_reloads_total{trigger="sighup",outcome="noop"}`
    moved instead, the daemon has no TLS listener to reload.
@@ -330,13 +332,13 @@ cargo run --example push_tls --features tls -- \
   --cert client.crt \
   --key  client.key \
   --ca   ca.crt \
-  --sni  weir.internal.example.com
+  --server-name weir.internal.example.com
 ```
 
 ## Out of scope
 
 The following are explicitly **not implemented** in the current version. They
-are v2 items and are documented here so operators know what to use instead.
+are documented here so operators know what to use instead.
 
 | Not implemented | What to use instead |
 |----------------|---------------------|

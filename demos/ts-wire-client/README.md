@@ -32,6 +32,7 @@ Offset  Size  Field          Value
  0       4    magic          "WEIR"
  4       1    version        WIRE_VERSION = 1
  5       1    message_type    Push=0x01 / Ack=0x02 / Nack=0x03 / HealthCheck=0x04 / HealthCheckResponse=0x05
+                              (additive in v1: PushTracked=0x06 / AckTracked=0x07 / PushBatch=0x08 / AckBatch=0x09)
  6       1    durability      Durable=0x01 / Batched=0x02 (retired, decodes to Durable) / Buffered=0x03
  7       1    flags          reserved; must be 0 on write
  8       4    payload_len    u32 little-endian (writeUInt32LE)
@@ -52,7 +53,12 @@ friction note below.)
 encodes a `Push` frame, writes it, and returns a `Promise<PushResult>` that
 resolves on `Ack` and rejects with `NackError` on a Nack. `healthCheck()` sends a
 zero-length `HealthCheck`. The client is serial: each request is queued FIFO and
-matched to the next response.
+matched to the next response. `pushTracked(payload, durability)` sends a
+`PushTracked` and resolves with the `RecordCoordinate` from the `AckTracked`; a
+daemon without the extension answers `Nack(UnknownMessage)`, which
+`NackError.meansNoTrackedSupport` names. `src/wire.ts` also holds the
+`PushBatch` body and `AckBatch` bitmap codec (`encodeBatchBody`,
+`decodeBatchBody`, `encodeAckBatch`).
 
 ### The codec (`src/wire.ts`)
 
@@ -70,7 +76,9 @@ the conformance vector names.
 `WeirClient.connect()` opens a single `node:net` connection to the Unix socket
 path — no in-band handshake. Incoming bytes accumulate in a buffer and are framed
 one response at a time: validate magic / version / header CRC, **cap the response
-`payload_len` at `MAX_RESPONSE_PAYLOAD` (2 bytes)** as a desync guard, wait for
+`payload_len` by its message type** (`maxResponsePayload`: `MAX_RESPONSE_PAYLOAD`,
+2 bytes, for most responses; the coordinate cap for `AckTracked`; the bitmap cap
+for `AckBatch`) as a desync guard, wait for
 exactly `payload_len + 4` more bytes, verify the payload CRC, then dispatch. A
 Nack rejects with `NackError` (`isTransient` is true only for `InternalError`;
 all other reasons close the connection). A close mid-stream rejects every queued
@@ -86,7 +94,9 @@ payload, plus a **byte-exact re-encode** round-trip back to the vector `hex`. It
 reads the cap and vectors from `docs/conformance/wire_v1_vectors.json` (resolved
 relative to `src/`), overridable with a path arg or the `WEIR_CONFORMANCE_VECTORS`
 environment variable. It is a self-executing script that exits non-zero on any
-mismatch.
+mismatch. `src/conformance_tracked.ts` and `src/conformance_batch.ts` do the same
+for the additive v1 extensions, against `wire_v1_tracked_vectors.json` and
+`wire_v1_batch_vectors.json`.
 
 ## Run it
 
@@ -96,8 +106,11 @@ cd demos/ts-wire-client
 # Offline codec conformance — no daemon needed
 node src/conformance.ts                 # -> conformance: 30/30 passed
 #   (or via npm: npm run conformance)
+node src/conformance_tracked.ts         # -> tracked conformance: 35/35 checks passed
+node src/conformance_batch.ts           # -> 56/56 batch-extension checks passed
 
 # Live: start a daemon with a unique socket/wab/metrics port
+mkdir -p "$PWD/wab"                     # weir-server does not create wab_dir
 weir-server --socket-path "$PWD/weir.sock" --wab-dir "$PWD/wab" \
             --metrics-port 19100 --sink-type noop &
 
@@ -136,11 +149,11 @@ native `.ts` type-stripping sets the 22.6 floor — hence `"engines": {"node":
 
 | File | What it holds |
 |------|---------------|
-| `src/wire.ts`     | The wire codec: `encodeFrame` / `decodeFrame`, constants, the `as const` `MessageType` / `Durability` / `NackReason` maps, name helpers, `crc()` (`node:zlib`), and `DecodeError` / `DecodeErrorTag`. |
-| `src/client.ts`   | Async Unix-socket producer (`WeirClient`) over `node:net`: serial Push/HealthCheck → Ack/Nack with response framing, a 2-byte response cap, timeouts, and `WireError` / `NackError`. |
+| `src/wire.ts`     | The wire codec: `encodeFrame` / `decodeFrame`, the coordinate and batch codecs, constants, the `as const` `MessageType` / `Durability` / `NackReason` maps, name helpers, `crc()` (`node:zlib`), and `DecodeError` / `DecodeErrorTag`. |
+| `src/client.ts`   | Async Unix-socket producer (`WeirClient`) over `node:net`: serial Push/PushTracked/HealthCheck → Ack/AckTracked/Nack with response framing, a response cap by message type, timeouts, and `WireError` / `NackError`. |
 | `src/conformance.ts` | Self-executing harness running the 30 vectors through the codec (decode + fields + byte-exact re-encode for valid frames, tag-match for rejections). |
+| `src/conformance_tracked.ts`, `src/conformance_batch.ts` | The same harness for the tracked- and batch-extension vectors. |
 | `examples/request-logger.ts` | The demo: a `node:http` backend that fire-and-forget Pushes a JSON access-log event per request at Buffered durability. |
 | `examples/live-smoke.ts` | End-to-end test against a running daemon: 3 durability tiers, empty-Push rejection, and a Prometheus metrics cross-check. |
 | `package.json`    | ESM, `private`, zero runtime deps, TypeScript-only devDep, `engines.node >=22.6`; scripts run `.ts` directly via `node`. |
 | `tsconfig.json`   | Type-check-only config (`noEmit`, `erasableSyntaxOnly`, `allowImportingTsExtensions`) for `tsc --noEmit`. |
-</content>

@@ -32,6 +32,7 @@ Offset  Size  Field          Value
  0       4    magic          "WEIR"
  4       1    version        WIRE_VERSION = 1
  5       1    message_type    PUSH=0x01 / ACK=0x02 / NACK=0x03 / HEALTH_CHECK=0x04 / HEALTH_CHECK_RESPONSE=0x05
+                              (additive in v1: PUSH_TRACKED=0x06 / ACK_TRACKED=0x07 / PUSH_BATCH=0x08 / ACK_BATCH=0x09)
  6       1    durability      DURABLE=0x01 / BATCHED=0x02 (retired, decodes to Durable) / BUFFERED=0x03
  7       1    flags          reserved; must be 0 on write (encode() rejects nonzero)
  8       4    payload_len    u32 little-endian
@@ -51,6 +52,10 @@ frame, writes it, reads the response, and interprets it: `ACK` returns the frame
 `NACK` throws `ProtocolException.nack(reason, rawByte)`. An empty payload is
 guarded client-side (the daemon would Nack `EmptyPayload`). `healthCheck()` sends
 a zero-length `HEALTH_CHECK` and verifies a `HEALTH_CHECK_RESPONSE`.
+`pushTracked(payload, durability)` sends a `PushTracked` and returns the
+`RecordCoordinate` from the `AckTracked`; a daemon without the extension answers
+`Nack(UnknownMessage)`, which `ProtocolException.meansNoTrackedSupport()` names.
+`Batch.java` holds the `PushBatch` body and `AckBatch` bitmap codec (LSB-first).
 
 ### The codec (`Wire.java` / `Frame.java`)
 
@@ -70,7 +75,9 @@ conformance vector name string.
 `java.nio.channels.SocketChannel` (`AF_UNIX SOCK_STREAM`, JDK 21+, pure stdlib,
 no JNI) — no in-band handshake. `readResponse()` frames the reply by hand: read
 16 header bytes, validate magic/version before trusting `payload_len`, **cap the
-response `payload_len` at `MAX_RESPONSE_PAYLOAD` (2 bytes)** before allocating,
+response `payload_len` by its message type** (`Wire.maxResponsePayload`:
+`MAX_RESPONSE_PAYLOAD`, 2 bytes, for most responses; the coordinate cap for
+`AckTracked`; the bitmap cap for `AckBatch`) before allocating,
 then read exactly `payload_len + 4` more bytes and re-validate the whole frame
 through `Frame.decode`. A Nack surfaces as `ProtocolException` carrying the
 `NackReason`; `isRetryable()` is true only for `INTERNAL_ERROR`. A premature
@@ -88,6 +95,12 @@ else the `WEIR_CONFORMANCE_VECTORS` environment variable, else the default
 `../../docs/conformance/wire_v1_vectors.json`; the tiny stdlib `MiniJson` reader
 parses the file. It runs via a `main()` and exits non-zero on any mismatch.
 
+`TrackedConformanceRunner` and `BatchConformanceRunner` do the same for the
+additive v1 extensions, against `wire_v1_tracked_vectors.json`
+(`PushTracked`/`AckTracked` frames and the `RecordCoordinate` codec) and
+`wire_v1_batch_vectors.json` (`PushBatch` bodies and `AckBatch` bitmaps). Both
+take the vectors path as `argv[0]` (required).
+
 ## Run it
 
 ```bash
@@ -97,9 +110,14 @@ javac -d out $(find src -name '*.java')
 # Offline codec conformance — no daemon needed
 java -cp out dev.weir.client.ConformanceRunner ../../docs/conformance/wire_v1_vectors.json
 # -> 30/30 vectors passed (4 encode round-trips verified)
+java -cp out dev.weir.client.TrackedConformanceRunner ../../docs/conformance/wire_v1_tracked_vectors.json
+# -> Tracked conformance: 35/35 checks passed
+java -cp out dev.weir.client.BatchConformanceRunner ../../docs/conformance/wire_v1_batch_vectors.json
+# -> Batch conformance: 60/60 checks passed
 
-# Live: start a daemon with a unique socket/wab/port
+# Live: start a daemon with a unique socket/wab/port (weir-server does not create wab_dir)
 SOCK=$PWD/weir.sock
+mkdir -p "$PWD/wab"
 weir-server --socket-path "$SOCK" --wab-dir "$PWD/wab" --metrics-port 19104 &
 
 java -cp out dev.weir.client.LiveSmokeTest "$SOCK"        # 13/13 checks
@@ -123,10 +141,12 @@ JDK standard library only (`UnixDomainSocketAddress`, `java.util.zip.CRC32`,
 |------|---------------|
 | `Wire.java`              | Frozen v1 constants + the `MessageType` / `Durability` / `NackReason` enums (each with a `code` byte and `fromByte`). |
 | `Frame.java`            | Single-frame `encode()` / `decode(byte[])` (CRC32 IEEE, little-endian `ByteBuffer`) plus the `DecodeError` verdict enum with vector-name strings. |
-| `WeirClient.java`       | Synchronous `AutoCloseable` producer over an `AF_UNIX` `SocketChannel`: `connect` / `push` / `healthCheck`; does its own stream framing and caps response payloads at 2 bytes. |
+| `WeirClient.java`       | Synchronous `AutoCloseable` producer over an `AF_UNIX` `SocketChannel`: `connect` / `push` / `pushTracked` / `healthCheck`; does its own stream framing and caps each response payload by its message type. |
+| `RecordCoordinate.java` | The `AckTracked` coordinate codec. |
+| `Batch.java`            | The `PushBatch` body and `AckBatch` bitmap codec. |
 | `AuditEventProducer.java` | The demo: streams JSON audit events at Durable durability. CLI: `<socket> [event-count]`. |
 | `ConformanceRunner.java`| Offline validator running the codec against the 30 vectors (decode + fields for all, byte-exact re-encode for the 4 client-emittable frames). |
+| `TrackedConformanceRunner.java`, `BatchConformanceRunner.java` | Offline validators for the tracked- and batch-extension vectors. CLI: `<vectors.json>`. |
 | `LiveSmokeTest.java`    | Live happy + rejection paths against a running daemon. CLI: `<socket>`. |
 | `ProtocolException.java`| Unchecked wire exception carrying the `DecodeError` / `NackReason` / raw byte, with `isRetryable()`. |
 | `Hex.java`, `MiniJson.java` | Tiny stdlib-only hex codec and JSON reader for the vector runner. |
-</content>

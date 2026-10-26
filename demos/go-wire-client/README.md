@@ -31,6 +31,7 @@ Offset  Size  Field          Value
  0       4    magic          "WEIR"
  4       1    version        WireVersion = 1
  5       1    message_type    MsgPush=0x01 / MsgAck=0x02 / MsgNack=0x03 / MsgHealthCheck=0x04 / MsgHealthCheckResponse=0x05
+                              (additive in v1: MsgPushTracked=0x06 / MsgAckTracked=0x07 / MsgPushBatch=0x08 / MsgAckBatch=0x09)
  6       1    durability      Durable=0x01 / Batched=0x02 (retired, decodes to Durable) / Buffered=0x03
  7       1    flags          reserved; must be 0 on write
  8       4    payload_len    u32 little-endian (encoding/binary)
@@ -51,7 +52,11 @@ back one response, returned as a `Response` with `IsAck` / `IsNack` /
 `NackReason` (and `DaemonWireVersion` when a `VersionMismatch` Nack carries the
 daemon's version byte). Callers encode with `EncodePush(payload, durability)` and
 call `PushRaw`. An `Ack` means the record is accepted; a Nack is surfaced as data
-on the `Response`, not as a Go error.
+on the `Response`, not as a Go error. `Client.PushTracked(payload, durability)`
+sends a `PushTracked` and returns the `RecordCoordinate` from the `AckTracked`; a
+daemon without the extension answers `Nack(UnknownMessage)`, returned wrapped in
+`ErrTrackedUnsupported`. `batch.go` holds the `PushBatch` body and `AckBatch`
+bitmap codec (LSB-first: bit *i* is byte `i/8`, mask `1 << (i%8)`).
 
 ### The codec (`wire.go`)
 
@@ -70,7 +75,9 @@ conformance vector tag. `NackReason.Permanent()` encodes the open/closed rule
 `Dial(socketPath)` opens a single `net.Dial("unix", ...)` connection with a 5s
 timeout — no in-band handshake. Responses are framed by hand in `readFrame()`:
 read the 16-byte header, verify magic / version / header CRC *before* trusting
-`payload_len`, cap the response `payload_len` at the 16 MiB hard cap, then read
+`payload_len`, cap the response `payload_len` by its message type
+(`maxResponsePayload`: 2 bytes for most responses, the coordinate cap for
+`AckTracked`, the bitmap cap for `AckBatch`), then read
 exactly `payload_len + 4` more bytes and run that single buffer through
 `DecodeFrame`. A mid-stream close surfaces as `io.EOF`; the harness treats it as
 the documented "in-flight outcome unknown, retry on a fresh connection" and, for
@@ -86,16 +93,21 @@ checks the decode outcome and — for valid frames — the decoded `message_type
 vector `hex`. Vectors are read from `docs/conformance/wire_v1_vectors.json`
 (resolved relative to the demo dir, two levels up), overridable with the
 `WEIR_CONFORMANCE_VECTORS` environment variable. It runs as a standard `go test`
-— no daemon needed.
+— no daemon needed. `tracked_test.go` and `batch_test.go` do the same against
+`wire_v1_tracked_vectors.json` and `wire_v1_batch_vectors.json` (the additive
+v1 extensions, which leave the 30 frozen vectors untouched).
 
 ## Run it
 
 ```bash
 # Offline codec conformance — no daemon needed (run from the demo dir)
 cd demos/go-wire-client
-go test ./...                              # 30/30 conformance vectors
+go test ./...                              # 30/30 conformance vectors + tracked + batch
+go test -run TestTracked                   # tracked extension only
+go test -run TestBatch                     # batch extension only
 
 # Live: start the daemon yourself with a unique socket/wab/port
+mkdir -p wab                               # weir-server does not create wab_dir
 weir-server --socket-path ./weir.sock --wab-dir ./wab --metrics-port 19009 &
 go build -o weir-go-client .
 ./weir-go-client -socket ./weir.sock       # 15 adversarial cases, all PASS
@@ -122,9 +134,12 @@ Stdlib only (`net`, `encoding/binary`, `hash/crc32`, `encoding/json`) — the
 | File | What it holds |
 |------|---------------|
 | `wire.go`             | The wire codec: constants, `MessageType` / `Durability` / `NackReason` enums, the IEEE CRC-32 helper, `EncodeFrame` / `EncodePush` / `EncodeHealthCheck`, and the strict one-frame `DecodeFrame` with conformance-tagged sentinel errors. |
-| `client.go`           | Synchronous Unix-socket producer (`Client`): `Dial` / `Close`, framed `readFrame` / `readResponse` (header-verify-before-payload), `PushRaw` Push→Ack, and Ack/Nack classification. |
+| `client.go`           | Synchronous Unix-socket producer (`Client`): `Dial` / `Close`, framed `readFrame` / `readResponse` (header-verify-before-payload, response cap by type), `PushRaw` Push→Ack, `PushTracked` PushTracked→AckTracked, and Ack/Nack classification. |
+| `batch.go`            | The `PushBatch` body and `AckBatch` bitmap codec. |
 | `main.go`             | Adversarial live harness (`-socket` flag, default `weir.sock`): sends happy-path and deliberately-malformed frames and checks each Nack reason + connection-close behavior; exits non-zero on any failure. |
 | `conformance_test.go` | Offline `go test` decoding every canonical vector (decode + fields for all, byte-exact re-encode for valid frames). |
+| `tracked_test.go`     | Tracked-extension vectors (frames, `RecordCoordinate` codec, `u64::MAX` index), plus a live tracked push gated on `WEIR_SOCKET`. |
+| `batch_test.go`       | Batch-extension vectors (frames, bodies, `AckBatch` bitmaps, bit order). |
+| `response_cap_test.go`| A fake peer declaring an 8 MiB response; asserts the client refuses it without allocating. |
 | `probe_test.go`       | Live-daemon `go test` probes (gated on `WEIR_SOCKET`) for protocol corners. |
 | `go.mod`              | Module `weir-wire-client`, `go 1.26.3`, zero external dependencies. |
-</content>

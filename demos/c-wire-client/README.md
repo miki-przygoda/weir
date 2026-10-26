@@ -30,6 +30,7 @@ Offset  Size  Field          Value
  0       4    magic          'W' 'E' 'I' 'R'
  4       1    version        WEIR_WIRE_VERSION = 1
  5       1    message_type    WEIR_MSG_PUSH=0x01 / ACK=0x02 / NACK=0x03 / HEALTHCHECK=0x04 / HEALTHCHECK_RESPONSE=0x05
+                              (additive in v1: PUSH_TRACKED=0x06 / ACK_TRACKED=0x07 / PUSH_BATCH=0x08 / ACK_BATCH=0x09)
  6       1    durability      WEIR_DUR_DURABLE=0x01 / BATCHED=0x02 (retired, decodes to Durable) / BUFFERED=0x03
  7       1    flags          hardcoded 0x00 (reserved; must be zero on write)
  8       4    payload_len    u32 little-endian (put_u32_le)
@@ -50,7 +51,10 @@ A producer does `weir_encode_push(dur, payload, len, out, cap, &out_len)` →
 `weir_conn.c`). `weir_encode_push` refuses a zero-length payload
 (`WEIR_ERR_EMPTY_PAYLOAD`) and an over-cap payload (`WEIR_ERR_PAYLOAD_TOO_LARGE`)
 before building anything. The response is examined via `resp.hdr.message_type`,
-`resp.is_nack`, and `resp.nack_reason`.
+`resp.is_nack`, and `resp.nack_reason`. `weir_push_tracked` does the same round
+trip with a `PushTracked` and returns the `RecordCoordinate` from the
+`AckTracked` (`weir_recv_tracked_response`); `weir_encode_batch_body` and
+`weir_encode_ack_batch` are the `PushBatch` body and `AckBatch` bitmap codec.
 
 ### The codec (`weir_wire.c` / `.h`)
 
@@ -58,8 +62,10 @@ before building anything. The response is examined via `resp.hdr.message_type`,
 `weir_decode_resp_header` validates a 16-byte response header in the spec's
 order — magic (`WEIR_ERR_BAD_MAGIC`), version (`WEIR_ERR_BAD_VERSION`), header CRC
 over `[0..12]` (`WEIR_ERR_BAD_HEADER_CRC`), then caps the response `payload_len`
-at `WEIR_MAX_RESPONSE_PAYLOAD` (2 bytes) so a desynced peer can never make the
-client allocate an attacker-chosen buffer. Diagnostic helpers
+by its message type (`weir_max_response_payload`: `WEIR_MAX_RESPONSE_PAYLOAD`,
+2 bytes, for most responses; the coordinate cap for `AckTracked`; the bitmap cap
+for `AckBatch`) and returns `WEIR_ERR_RESP_TOO_LARGE` past it, so a desynced peer
+can never make the client allocate an attacker-chosen buffer. Diagnostic helpers
 (`weir_nack_reason_str`, `weir_msg_type_str`, `weir_result_str`) name every byte.
 
 ### Connection lifecycle & errors
@@ -71,9 +77,8 @@ the 16-byte header, decode it, then `read_exact` exactly `payload_len + 4` more
 bytes into a small fixed buffer and verify the payload CRC. A peer close mid-read
 returns `WEIR_ERR_SHORT_READ`; `telemetry.c` treats it as "outcome unknown, retry
 on a fresh connection." Nacks are split into transient (`WEIR_NACK_INTERNAL_ERROR`,
-connection stays open → continue) vs permanent (connection closed → stop). One
-implementation detail: a *response* payload-CRC mismatch reuses
-`WEIR_ERR_BAD_HEADER_CRC` rather than a dedicated code (see `weir_conn.c`).
+connection stays open → continue) vs permanent (connection closed → stop). A
+*response* payload-CRC mismatch returns `WEIR_ERR_BAD_PAYLOAD_CRC`.
 
 ## Conformance
 
@@ -89,17 +94,27 @@ JSON itself (no env var) and is given the vectors path on `argv[1]`; the
 Makefile's `check` target passes
 `../../docs/conformance/wire_v1_vectors.json` by default.
 
+Two more offline binaries cover the additive v1 extensions, each with its own
+scanner so the frozen set's result cannot be disturbed: `conformance_tracked.c`
+(`PushTracked`/`AckTracked` frames and the `RecordCoordinate` codec, against
+`wire_v1_tracked_vectors.json`) and `conformance_batch.c` (`PushBatch` bodies
+and `AckBatch` bitmaps, against `wire_v1_batch_vectors.json`).
+
 ## Run it
 
 ```bash
 cd demos/c-wire-client
-make                                # builds: conformance, telemetry, negative
+make                                # builds: conformance, conformance_tracked,
+                                    #         conformance_batch, telemetry, negative
 
 # Offline codec conformance — no daemon needed
 make check                          # -> "vectors scanned: 30 ... RESULT: PASS"
 #   (override the path: make check VECTORS=/abs/path/to/wire_v1_vectors.json)
+make check-tracked                  # -> "frame vectors: 3   coordinate vectors: 8 ... RESULT: PASS"
+make check-batch                    # -> "frames: 4   bodies: 11   acks: 11 ... RESULT: PASS"
 
-# Live: start a daemon with a private socket
+# Live: start a daemon with a private socket (weir-server does not create wab_dir)
+mkdir -p /tmp/weir-demo/wab
 weir-server --socket-path /tmp/weir-demo/weir.sock \
             --wab-dir /tmp/weir-demo/wab --metrics-port 19102 &
 
@@ -125,10 +140,11 @@ compiler · tested with clang 21.**
 
 | File | What it holds |
 |------|---------------|
-| `weir_wire.h` / `weir_wire.c` | The wire codec: `#define` constants, the `weir_msg_type` / `weir_durability` / `weir_nack_reason` / `weir_result` enums, the lazily-built CRC-32 table, `weir_encode_push` / `weir_encode_healthcheck` / `weir_decode_resp_header`, and the `*_str` diagnostics. |
-| `weir_conn.h` / `weir_conn.c` | Blocking POSIX `AF_UNIX` / `SOCK_STREAM` transport: `weir_connect` (with `sun_path` guard), `weir_send_all`, and the read-exact framed `weir_recv_response` with payload-CRC verification. |
+| `weir_wire.h` / `weir_wire.c` | The wire codec: `#define` constants, the `weir_msg_type` / `weir_durability` / `weir_nack_reason` / `weir_result` enums, the lazily-built CRC-32 table, `weir_encode_push` / `weir_encode_push_tracked` / `weir_encode_healthcheck` / `weir_decode_resp_header`, the coordinate and batch codecs, and the `*_str` diagnostics. |
+| `weir_conn.h` / `weir_conn.c` | Blocking POSIX `AF_UNIX` / `SOCK_STREAM` transport: `weir_connect` (with `sun_path` guard), `weir_send_all`, the read-exact framed `weir_recv_response` / `weir_recv_tracked_response` with payload-CRC verification, and `weir_push_tracked`. |
 | `telemetry.c`  | The demo producer: HealthCheck probe then a stream of 16-byte little-endian sensor records at a chosen durability tier. CLI: `telemetry <socket> [count] [durable\|batched\|buffered]`. |
 | `conformance.c`| Offline self-test: byte-exact re-encode of every `"ok"` Push/HealthCheck vector, decode of response vectors, and rejection assertions. |
+| `conformance_tracked.c` | Offline self-test against the tracked-extension vectors. |
+| `conformance_batch.c` | Offline self-test against the batch-extension vectors. |
 | `negative.c`   | Live error-path coverage: hand-crafted malformed frames asserting the daemon's Nack reason. |
-| `Makefile`     | Targets `conformance` (codec only), `telemetry`, `negative`, and `check` (runs the offline conformance suite). |
-</content>
+| `Makefile`     | Targets `conformance`, `conformance_tracked`, `conformance_batch` (codec only), `telemetry`, `negative`, and `check` / `check-tracked` / `check-batch` (run the offline suites). |

@@ -10,7 +10,9 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
 SERVER="${WEIR_SERVER_BIN:-$REPO/target/debug/weir-server}"
 
-rm -f "$HERE/weir.sock"
+# No `rm -f weir.sock`: the daemon removes a stale socket itself after a
+# connect probe, and deleting a LIVE one would cut off its producers.
+mkdir -p "$HERE/wab"
 "$SERVER" \
   --socket-path "$HERE/weir.sock" \
   --wab-dir "$HERE/wab" \
@@ -21,8 +23,11 @@ echo $! > "$HERE/daemon.pid"
 echo "weir-server pid=$(cat "$HERE/daemon.pid"), socket=$HERE/weir.sock"
 
 for _ in $(seq 1 50); do
-  [ -S "$HERE/weir.sock" ] && { echo "socket ready"; exit 0; }
+  # Wait for this daemon to say it is listening (a stale socket file from an
+  # earlier run would otherwise look ready).
+  grep -q "socket listening" "$HERE/daemon.log" 2>/dev/null && { echo "socket ready"; exit 0; }
+  kill -0 "$(cat "$HERE/daemon.pid")" 2>/dev/null || break
   perl -e 'select(undef,undef,undef,0.1)'
 done
-echo "socket did not appear; see $HERE/daemon.log" >&2
+echo "daemon did not start listening; see $HERE/daemon.log" >&2
 exit 1

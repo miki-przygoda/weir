@@ -43,7 +43,7 @@ actually checked. A hand-maintained local mirror reproduces it in a new file.
 
 That argument also condemns the halfway house. A runner that parses the workflow
 but supplies its own toolchain still has an image to keep in step, and *that*
-drifts instead — see [The runner this replaced](#the-runner-this-replaced)
+drifts instead — see [The approach this replaced](#the-approach-this-replaced-and-why-it-is-worth-recording)
 below, which is this repository's own worked example. act has neither problem:
 `actions/setup-go@v5` installs Go, `dtolnay/rust-toolchain` installs rustup, and
 a version bump in the workflow takes effect locally with no edit anywhere.

@@ -42,7 +42,7 @@ the daemon starts. It will then **refuse every connection**.
 `#[cfg(not(any(...)))]` arm and returns `Unsupported`
 (`crates/weir-server/src/socket/peer.rs:44-49`). The accept loop treats a failed
 credential lookup as untrusted and drops the connection
-(`crates/weir-server/src/socket/mod.rs:184-195`) — correctly, since it cannot
+(`crates/weir-server/src/socket/mod.rs:319-347`) — correctly, since it cannot
 prove who the peer is — and `peer_uid_check` defaults to `true`
 (`crates/weir-server/src/config/mod.rs`). Every connection is refused, and
 `weir_connection_rejected_peer_uid_total` climbs.
@@ -149,7 +149,7 @@ difference in the system, and it is a difference in *kind*, not in speed.
 
 On macOS `File::sync_all` is `F_FULLFSYNC`, which does flush; the WAB record
 path deliberately uses `F_BARRIERFSYNC`
-(`crates/weir-server/src/wab/segment.rs:672-685`), which orders writes without
+(`crates/weir-server/src/wab/segment.rs:870-889`), which orders writes without
 forcing the drive to commit them. Data can therefore still be in the drive's
 volatile cache when a `Durable` ack returns. **macOS is not power-loss safe at
 any durability tier.** The daemon warns about this at startup.
@@ -169,8 +169,9 @@ Attached to each version tag on the
 - `weir-server-x86_64-apple-darwin`
 - `weir-server-aarch64-apple-darwin`
 
-Plus the Docker image, which is Linux. There is no `weir-ctl` release artifact —
-build it from source, or use the Docker image.
+Plus the Docker image, which is Linux. There is no `weir-ctl` release artifact,
+and the image carries only `weir-server` — build `weir-ctl` from source or
+`cargo install weir-ctl`.
 
 ## Untested and unsupported
 

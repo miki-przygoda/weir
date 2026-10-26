@@ -281,8 +281,14 @@ starts.
 
 ## Own-inode-only removal at shutdown
 
-At shutdown the daemon's own listener is still open, so the probe would call
-its own socket live. Shutdown therefore uses identity, not liveness.
+The producer socket is removed at the first SIGTERM/SIGINT (the lame duck),
+before the connection drain, so new connects fail fast instead of queueing for
+`shutdown_timeout_secs`; the listener closes right after the unlink. The
+admin socket is removed at the end of shutdown, so admin `status` answers
+throughout; an exit that abandons a drain stuck past its budget leaves it
+behind as a stale socket, which the next start probes and replaces. At that moment the daemon's own listener is still open, so the
+probe would call its own socket live. Removal therefore uses identity, not
+liveness.
 `bind_hardened` returns a `BoundSocket` carrying the `(dev, ino)` of the
 inode it bound and verified. `remove_own_socket` opens the parent dirfd and
 `fstatat`s the path (no symlink follow). It `unlinkat`s the path only if the
@@ -367,6 +373,9 @@ The unit tests in `crates/weir-server/src/socket/mod.rs::tests` cover:
   `remove_own_socket_keeps_a_replaced_socket`,
   `remove_own_socket_refuses_non_socket`, `remove_own_socket_missing_is_noop`
   — shutdown removes only the inode it bound.
+- `lame_duck_unlinks_before_the_connection_drain_and_forced_cuts_it_short` —
+  the first signal unlinks the socket before the connection drain, and a
+  second one cuts the drain short.
 - `full_run_start_then_shutdown_removes_its_own_socket` — the regression
   for the self-probe trap: a clean start and shutdown (`socket::bind`
   then `socket::serve`) leaves no socket behind.
@@ -426,8 +435,12 @@ window lands at `0o700 & !0o177 = 0o600`, losing its execute bit; a 0o600 file
 WAB directories go through `wab::create_dir_private`, which chmods after mkdir.
 
 **In the daemon this is not exploitable and not reachable.** The bind happens
-before any producer can connect, so no records exist and no segment is being
-created. The WAB flushers and workers are running by then, but idle. (The
+before any producer can connect, so no new segment is being created. The WAB
+flushers and workers are running by then, but idle. Since 4.1.0 the drain may
+already be delivering the replay backlog while the producer socket binds, but
+everything it creates is a 0o600 file (a `.confirmed.tmp` sidecar, a
+dead-letter segment) or a directory made through `create_dir_private`
+(`dead_letter/`, `quarantine/`), so the window cannot change its mode. (The
 earlier justification — that startup is single-threaded — was wrong: `main.rs`
 calls `wab::spawn_flushers` and then `worker::spawn_workers_with`, both well
 before `socket::bind` binds. The correct reason is that the process is *idle*, not that

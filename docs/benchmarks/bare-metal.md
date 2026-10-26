@@ -280,11 +280,11 @@ A bare-metal run without this header is not a bare-metal result.
 **Two captures are comparable only if the storage rows match.** `Durable`-tier
 throughput is bounded by one `fdatasync` per record on a single connection — the
 daemon acks frame N before reading frame N+1
-(`crates/weir-server/src/socket/connection.rs:485-491`) — so the number reports
+(`handle_connection` in `crates/weir-server/src/socket/connection.rs`, which awaits `handle_push` before the next header read) — so the number reports
 the platform's fsync primitive as much as it reports weir. Measured on one M3
 Max, the three primitives this codebase can reach cost 36 µs (plain `fsync(2)`,
 which is what `File::sync_all` is on Linux), 238 µs (`F_BARRIERFSYNC`, what the
-WAB record path uses on macOS — `crates/weir-server/src/wab/segment.rs:672-685`)
+WAB record path uses on macOS — `platform_fsync` in `crates/weir-server/src/wab/segment.rs`)
 and 3,965 µs (`F_FULLFSYNC`, what `File::sync_all` becomes on macOS, and what a
 segment seal's parent-directory fsync and the drain's confirm path both pay).
 `run_bare_metal_bench.sh` runs on macOS as well as Linux, so this is a real

@@ -15,6 +15,10 @@ protocol** below.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [4.1.0] - 2026-10-26
+
 The safety floor: the defects through which an operator mistake, a local disk
 fault or a sink quirk could cost acked records, re-deliver without bound, or
 kill the daemon. The mechanisms are under **Fixed**, the new key, exit code,
@@ -358,7 +362,7 @@ older releases warn about and ignore the new config keys, and never read
   - `weir_wab_dir_lock_integrity_failures_total`: lock-file checks that found
     it deleted, replaced or unreadable.
   - `weir_config_reloads_total{trigger,outcome}`: `trigger` is `sighup`
-    (`admin` is reserved); `outcome` is `ok`, `failed`, `noop` or `dropped`.
+    or `admin` (`weir-ctl reload`); `outcome` is `ok`, `failed`, `noop` or `dropped`.
   - `weir_drain_local_io_strands_total{cause}`: strands caused by local I/O,
     `cause="read"` (reading the sealed segment) or `cause="write"` (the
     dead-letter write).
@@ -4272,6 +4276,7 @@ The five commits making up this pass:
 
 ---
 
+[4.1.0]: https://github.com/miki-przygoda/weir/compare/v4.0.1...v4.1.0
 [4.0.1]: https://github.com/miki-przygoda/weir/compare/v4.0.0...v4.0.1
 [4.0.0]: https://github.com/miki-przygoda/weir/compare/v3.0.0...v4.0.0
 [3.0.0]: https://github.com/miki-przygoda/weir/compare/v2.1.0...v3.0.0

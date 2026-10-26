@@ -19,6 +19,7 @@ natively inside the host personal site.
 | `examples.html` | **Example projects by crate-ratio.** A crate-usage matrix + curated recipes spanning one crate → the full pipeline → a zero-Rust-dep wire client. |
 | `clients/<lang>.html` | **Polyglot wire-client subpages** — one per language (`py`, `go`, `c`, `java`, `ts`). Each is a from-scratch, stdlib-only producer built from the wire spec + conformance vectors. Linked from `examples.html`. |
 | `weir.css` | Shared theme (palette, components) loaded by every page above. |
+| `version.js` | Sets the version shown in the page banners. Generated from `Cargo.toml` by `scripts/sync-demo-version.sh`; CI fails if it drifts, so do not edit it by hand. |
 
 The subpages are a **pitch / onboarding layer** — they link out to the canonical,
 versioned [docs site](https://miki-przygoda.github.io/weir) rather than
@@ -57,7 +58,7 @@ figure — adjust it mentally for your own database.
 ## Hosting / integration
 
 The bundle is self-contained — relative links between the pages (including the
-`clients/<lang>.html` subpages), one shared stylesheet, all JS inline. Drop the
+`clients/<lang>.html` subpages), one shared stylesheet, and all JS inline except the small `version.js`. Drop the
 whole `demo/` folder onto any static host.
 
 For the **Next.js personal site**, follow the existing static-demo precedent
@@ -69,5 +70,5 @@ from the weir project page (or embed the simulation via an `<iframe>`):
 ```
 
 There are no absolute asset paths to fix up; only the cross-page links
-(`crates.html`, `examples.html`, the `clients/<lang>.html` subpages) and
-`weir.css`, all relative.
+(`crates.html`, `examples.html`, the `clients/<lang>.html` subpages),
+`weir.css` and `version.js`, all relative.

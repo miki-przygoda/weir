@@ -151,11 +151,11 @@ python3 deploy/avg_benchmarks.py load_results.jsonl docs/benchmarks/latest.md
   statement about weir. Even single-thread scenarios fail to transfer: on one
   connection `Durable` is bounded by one `fdatasync` per record (the daemon acks
   frame N before reading frame N+1 —
-  `crates/weir-server/src/socket/connection.rs:485-491`), so the rate is the
+  `handle_connection` in `crates/weir-server/src/socket/connection.rs`, which awaits `handle_push` before the next header read), so the rate is the
   platform's fsync primitive as much as it is weir's, and those primitives differ
   by two orders of magnitude. Measured on one M3 Max: 36 µs for plain `fsync(2)`
   (what `File::sync_all` is on Linux), 238 µs for `F_BARRIERFSYNC` (what the WAB
-  record path uses on macOS — `crates/weir-server/src/wab/segment.rs:672-685`),
+  record path uses on macOS — `platform_fsync` in `crates/weir-server/src/wab/segment.rs`),
   and 3,965 µs for `F_FULLFSYNC` (what `File::sync_all` becomes on macOS, and
   what the drain's confirm path pays). Compare **ratios within one machine**
   instead — tier vs tier, config vs config, before vs after. Multi-thread

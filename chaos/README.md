@@ -101,9 +101,14 @@ does not build this project.
 > 747 episodes, 2026-09-27) tested that reading by raising throughput 1.45x: the
 > record ceiling did **not** move (123,664 against 126,782) and the duration fell
 > to **1.18 s**. So the ceiling is a quantity of data and the seconds are
-> throughput-specific. Whether the invariant is records or bytes is still open —
-> both runs used 256-byte records, and 123,664 x 256 B is ~31.7 MB, which a
-> record-size sweep would settle.
+> throughput-specific. Those two runs cannot say whether the invariant is
+> records or bytes — both used 256-byte records, and 123,664 x 256 B is
+> ~31.7 MB. The record-size sweep that separates the two is
+> [`powerloss-recsize-64.toml`](schedules/powerloss-recsize-64.toml),
+> [`-1024`](schedules/powerloss-recsize-1024.toml) and
+> [`-4096`](schedules/powerloss-recsize-4096.toml), which vary only
+> `record_size` against the batched Buffered run; no result from it is
+> written up in this repo yet.
 >
 > **What that run alone did NOT establish** — both since closed, and left here
 > because the sequence is the point: a Buffered run measures Buffered, and
@@ -222,7 +227,7 @@ In these runs' records, `fault = power_loss` is the fault the oracle judges
 (so the tier exemption, the power-loss verdict and the quarantine exemption
 all apply unchanged), and `trigger = <kind>` names the lifecycle path.
 
-run.py now unwinds on SIGTERM as well as SIGINT. A run that ends on an
+run.py now unwinds on SIGTERM and SIGHUP as well as SIGINT. A run that ends on an
 exception or a signal before its final pass keeps `wab.img` for forensics and
 writes `crash-postmortem.json` beside `episodes.jsonl`, which `report.md`
 renders as "Crash post-mortem".

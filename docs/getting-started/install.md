@@ -129,10 +129,14 @@ sudo install -m 0755 target/release/weir-server /usr/local/bin/
 ```
 
 Restart the daemon to pick up a new binary or any config change. The only
-hot-reload is `SIGHUP`, which reloads **TLS cert/key/CA only** (and only on
-builds with the `tls` feature) — see `docs/operations/configuration.md`. Every
-other setting requires a restart, so plan for a graceful restart window (default
-30 s, see `shutdown_timeout_secs`).
+hot-reload is `SIGHUP` (or `weir-ctl reload`), which reloads **TLS cert/key/CA
+only**, and only when `tcp_bind` is set on a build with the `tls` feature;
+otherwise it is a logged no-op and the daemon keeps running — see
+`docs/operations/configuration.md`. Every other setting requires a restart.
+Shutdown is bounded: at most `shutdown_timeout_secs` (30 s) for open
+connections, then `drain_shutdown_budget_secs` (10 s) of delivery, so give the
+stop at least 45 s. What the drain did not deliver stays sealed on disk and is
+delivered by the next start.
 
 ### Building other crates
 
@@ -181,7 +185,10 @@ docker compose -f deploy/docker/docker-compose.yml up
 ```
 
 This stores the WAB in a named Docker volume (`wab_data`, mounted at
-`/var/lib/weir/wab`) and exposes the metrics port on `127.0.0.1:9185`.
+`/var/lib/weir/wab`) and exposes the metrics port on `127.0.0.1:9185`. The
+healthcheck sends `GET /livez`, and `stop_grace_period: 45s` covers the
+bounded shutdown. One WAB volume serves one daemon: a second container on
+`wab_data` refuses to start (`locked by`), so do not `--scale` the service.
 Configuration goes in
 `deploy/docker/weir.toml.example` — copy to your own path and
 bind-mount.
@@ -202,12 +209,21 @@ docker run \
     -v weir-wab:/var/lib/weir/wab \
     -v weir-run:/run/weir \
     -v $(pwd)/weir.toml:/etc/weir/weir.toml:ro \
+    --tmpfs /run/weir-admin:rw,noexec,nosuid,size=1m,uid=10001,gid=10001,mode=0700 \
+    -e WEIR_ADMIN_SOCKET_PATH=/run/weir-admin/wab.admin.sock \
+    -e WEIR_METRICS_BIND=0.0.0.0 \
     -p 127.0.0.1:9185:9185 \
+    --stop-timeout 45 \
     --name weir \
     weir:latest
 ```
 
-See [container hardening](../security/container.md) for the rationale
+`--read-only` makes `/var/lib/weir` unwritable, so the admin socket (default
+`/var/lib/weir/wab.admin.sock`) moves to a private tmpfs; without that the
+daemon runs on with the `admin_unavailable` condition and no
+`weir-ctl status`/`reload`/`drain`. `WEIR_METRICS_BIND=0.0.0.0` is what makes
+the mapped port reachable from the host (the `127.0.0.1:` side keeps it
+local). See [container hardening](../security/container.md) for the rationale
 behind each flag.
 
 ### Image variants
@@ -243,16 +259,18 @@ See `deploy/systemd/README.md` for install, enable, and shutdown-tuning steps.
 
 ## `cargo install`
 
-> **Status:** published. All nine crates are on crates.io (4.0.0 as of
-> 2026-09-17). This works today:
+> **Status:** published. All ten crates are on crates.io (4.1.0 as of
+> 2026-10-26). This works today:
 
 ```bash
 cargo install weir-server
 ```
 
 It will fetch the latest published version, build it with the host's Rust
-toolchain, and install to `~/.cargo/bin/weir-server`. The wire protocol and
-public API are frozen at 1.0 under Semantic Versioning.
+toolchain, and install to `~/.cargo/bin/weir-server`. `cargo install weir-ctl`
+installs the operator CLI the same way. The wire protocol has not changed since
+1.0 (`WIRE_VERSION` is still `1`); the crates' Rust APIs follow Semantic
+Versioning.
 
 ## Pre-built release binaries
 
@@ -284,6 +302,9 @@ DAEMON_PID=$!
 # Wait a moment for startup.
 sleep 1
 
+# Readiness: prints "ok" once the daemon can take ingest.
+curl -fsS http://localhost:9185/readyz
+
 # Metrics endpoint should respond. weir_drain_state is pre-initialised on
 # startup, so it has data on the very first scrape (no producer needed).
 curl -fsS http://localhost:9185/metrics | grep '^weir_drain_state'
@@ -294,8 +315,8 @@ wait $DAEMON_PID
 rm -rf /tmp/weir-verify
 ```
 
-Expected output (exactly one state is `1.0`; gauge values render as floats and
-the lines may appear in any order):
+Expected output: `ok` from `/readyz`, then the drain states (exactly one is
+`1.0`; gauge values render as floats and the lines may appear in any order):
 
 ```
 weir_drain_state{state="draining"} 1.0

@@ -16,6 +16,7 @@ convention — see [Architecture → Workspace & crate boundaries](../architectu
 | Forward records to a custom destination | `weir-sink-sdk` (implement `Sink`) | no (to author + test) |
 | Read / inspect / recover WAB segments off disk | `weir-wab` | no |
 | Operate a running daemon from the shell | `weir-ctl` | no |
+| Read a daemon's health in your own tooling (parse `/status`, evaluate Conditions, apply the probe rules) | `weir-status` | no |
 | Build a producer/client in another language | the [wire protocol](../wire_protocol.md) (no Rust dep at all) | no |
 
 The crates this guide covers are sibling directories under `crates/` — `weir-client`,
@@ -23,7 +24,9 @@ The crates this guide covers are sibling directories under `crates/` — `weir-c
 `path` dependency points at `crates/<name>` (e.g.
 `weir-client = { path = "../weir/crates/weir-client" }`).
 
-`crates/` also holds `weir-attest` (tamper-evidence over sealed segments),
+`crates/` also holds `weir-status` (the `weir.status/v1` model, Conditions
+evaluator and probe predicates that the daemon and `weir-ctl` share; pure
+Rust, no I/O), `weir-attest` (tamper-evidence over sealed segments),
 `weir-sink-s3` (the S3-API sink), `weir-rs` (a single-crate facade that
 re-exports core/client/sink-sdk/wab behind features) and `weir-testkit`
 (`publish = false`, test harness only).
@@ -208,7 +211,8 @@ fn producer_thread(sock: &str, jobs: std::sync::mpsc::Receiver<Job>) {
 ## Write a custom sink
 
 Implement the [`Sink`](https://docs.rs/weir-sink-sdk) trait from `weir-sink-sdk`
-(depends only on `weir-core` — no daemon, no tokio needed to build or test it):
+(depends only on `weir-core` and `sha2` — no daemon, no tokio needed to build or
+test it):
 
 ```rust
 use weir_sink_sdk::{BasicSinkError, CommitResult, Payload, Sink, SinkBatch, SinkHealth};
@@ -442,7 +446,8 @@ callers.
 ## Read or recover WAB segments directly
 
 `weir-wab` is a standalone, runtime-free reader of the on-disk segment format
-(depends only on `weir-core` + `crc32fast`). Point `SegmentReader` at any segment
+(depends only on `weir-core`, `crc32fast` and `zstd` for format-v2
+compressed payloads). Point `SegmentReader` at any segment
 file and it streams each record, verifying its CRC32:
 
 ```rust
@@ -498,17 +503,24 @@ damage and resume after an `Err` item).
 
 ## Operate a running daemon
 
-`weir-ctl` is a thin admin tool over the socket + the WAB reader; it does **not**
-depend on `weir-server`, so installing it doesn't drag in the daemon's
-dependencies. It covers `health`, `push`, `metrics`, `segments` (per-shard WAB
-inspect), and `dl` (dead-letter `list` / `drop` / `requeue`). See
+`weir-ctl` is a thin admin tool over the producer socket, the admin socket, the
+metrics listener and the WAB reader; it does **not** depend on `weir-server`, so
+installing it doesn't drag in the daemon's dependencies. It covers `health`,
+`push`, `metrics`, `segments` (per-shard WAB inspect), `dl` (dead-letter
+`list` / `drop` / `requeue`), `quarantine` (`list` / `inspect` / `requeue`),
+`attest` (`seal` / `head` / `verify`), and, over the daemon's admin socket,
+`status` (is it ready, and if not, why: exit 0 ready, 1 not ready, 2
+unreachable, 3 ready with a critical condition), `reload` (TLS material, the
+same path as `SIGHUP`) and `drain pause` / `resume` / `retry-stranded`. See
 [Monitoring](../monitoring.md) and the `dl requeue` notes there.
 
 Pass the global `--json` flag for machine-readable output: the read/inspect
-commands (`health`, `metrics`, `segments`, `dl list`) emit a structured JSON
-object instead of the human table, and the mutating commands (`push`, `dl drop`,
-`dl requeue`) emit a small JSON result object — handy for scripting or piping
-into `jq`. The human output stays the default.
+commands (`health`, `metrics`, `segments`, `dl list`, `quarantine list`,
+`quarantine inspect`, `status`) emit a structured JSON object instead of the
+human table, and the mutating commands (`push`, `dl drop`, `dl requeue`,
+`reload`, `drain`) emit a small JSON result object — handy for scripting or
+piping into `jq`; the `attest` subcommands honour it too. The human output
+stays the default.
 
 ---
 

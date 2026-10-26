@@ -5,7 +5,9 @@ defaults and surface the latency / throughput trade-off for operators tuning
 their own deployments.
 
 Addresses the "Batching efficiency: tune `batch_size` / `batch_deadline_ms`
-sweet spot" item from the perf TODO in `crates/weir-server/tests/load.rs:26-33`.
+sweet spot" item from the perf TODO that used to sit in
+`crates/weir-server/tests/load.rs` (since retired; its module doc now points
+at the CHANGELOG).
 
 ## Caveat
 
@@ -81,7 +83,7 @@ fsync → ack), `batched` (request → flush-or-deadline → ack), `buffered`
   cannot apply to these tables, which are single-producer (see
   [Caveat](#caveat)): one connection gets **1.00 records per `fdatasync`**,
   because the daemon acks frame N before reading frame N+1
-  (`crates/weir-server/src/socket/connection.rs:485-491`), so there is never a
+  (`handle_connection` in `crates/weir-server/src/socket/connection.rs`, which awaits `handle_push` before the next header read), so there is never a
   second record from that connection to amortise against. Treat the gap as
   unexplained and possibly run-to-run noise in a 3-trial median on a shared
   sandbox.
@@ -193,7 +195,7 @@ a sweep observed sync throughput drop from ~90k to ~26k RPS when the segment cap
 was lowered to 1 MiB (observed on one box; treat the absolute numbers as
 machine-specific). The *size* of the cliff is also platform-specific: the
 parent-directory fsync that publishes each seal is `File::sync_all`
-(`crates/weir-server/src/wab/segment.rs:712-714`), which is a plain `fsync` on
+(`sync_path`, via `fsync_parent_dir`, in `crates/weir-server/src/wab/segment.rs`), which is a plain `fsync` on
 Linux but `F_FULLFSYNC` on macOS — measured at 36 µs and 3,965 µs respectively on
 one M3 Max. Do not carry a macOS-measured cliff to a Linux deployment or the
 reverse. **Durability is unaffected** — every accepted record is
