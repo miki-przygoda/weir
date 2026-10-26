@@ -35,7 +35,7 @@ base64 = "0.22"
 # postgres-sink feature and on digest 0.11; 0.12 pairs with sha2 0.10 above.
 hmac = "0.12"
 # Object body compression. zstd is already in weir-server for WAB format v2.
-zstd = "0.13"
+zstd = "0.14"
 # gzip, for query engines that do not read zstd. Already in the tree via
 # mysql_async (the mysql-sink feature, which is in `default`) — but declared
 # explicitly because it is absent under --no-default-features.
