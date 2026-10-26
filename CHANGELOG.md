@@ -15,6 +15,10 @@ protocol** below.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [4.1.0] - 2026-10-26
+
 The safety floor: the defects through which an operator mistake, a local disk
 fault or a sink quirk could cost acked records, re-deliver without bound, or
 kill the daemon. The mechanisms are under **Fixed**, the new key, exit code,
@@ -4272,6 +4276,7 @@ The five commits making up this pass:
 
 ---
 
+[4.1.0]: https://github.com/miki-przygoda/weir/compare/v4.0.1...v4.1.0
 [4.0.1]: https://github.com/miki-przygoda/weir/compare/v4.0.0...v4.0.1
 [4.0.0]: https://github.com/miki-przygoda/weir/compare/v3.0.0...v4.0.0
 [3.0.0]: https://github.com/miki-przygoda/weir/compare/v2.1.0...v3.0.0

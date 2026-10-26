@@ -57,7 +57,7 @@ daemon mid-flight, and watch unconfirmed segments replay, side by side with a
 naive insert-per-record baseline. No build step — open `demo/index.html` in any
 browser, or use the hosted copy linked above.
 
-> **Status — 4.0 (stable), published at 4.0.1.** The wire protocol and public Rust API (`weir-core`,
+> **Status — 4.1 (stable), published at 4.1.0.** The wire protocol and public Rust API (`weir-core`,
 > `weir-client`, `weir-sink-sdk`, `weir-wab`) are under
 > [Semantic Versioning](https://semver.org/), with a
 > [language-neutral conformance suite](docs/conformance.md) pinning the wire
