@@ -41,7 +41,12 @@ services:
       interval: 2s
       timeout: 5s
       retries: 30
-      start_period: 5s
+      # MySQL's first start initialises its data dir and then restarts. On a
+      # slow or worn SSD that alone takes over a minute, longer than 30
+      # retries at 2s, and the container was marked unhealthy while it was
+      # still initialising. Failures inside start_period don't count, and the
+      # first passing check still ends it at once, so fast hosts lose nothing.
+      start_period: 120s
 
   postgres:
     image: postgres:16

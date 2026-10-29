@@ -148,7 +148,10 @@ echo "[invariants] durability + health (healthy fleet; chaos excluded)..."
 # closes — a textbook works-on-my-machine readiness bug.
 echo "[ui] waiting for Grafana's API..."
 grafana_ready=0
-for _ in $(seq 1 60); do
+# 300s, not 60: Grafana's first start runs its database migrations, and on a
+# worn SATA SSD (beast, 29 Oct 2026) "Starting Grafana" to "HTTP Server Listen"
+# took 163s. A ready Grafana still ends the wait on the first poll.
+for _ in $(seq 1 300); do
   if [ "$(curl -fsS -u "$GAUTH" "$GRAF/api/health" 2>/dev/null \
           | python3 -c 'import sys,json;print(json.load(sys.stdin).get("database"))' 2>/dev/null)" = "ok" ]; then
     grafana_ready=1
@@ -157,7 +160,7 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 if [ "$grafana_ready" -ne 1 ]; then
-  echo "  Grafana API did not become ready within 60s — the checks below would"
+  echo "  Grafana API did not become ready within 300s — the checks below would"
   echo "  report a stack failure that is really a startup timeout."
 fi
 
