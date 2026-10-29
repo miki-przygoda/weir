@@ -161,6 +161,14 @@ does each record get its own row, do the invariants hold across a kill) and
 [`schedules/powerloss-batch.toml`](schedules/powerloss-batch.toml) (the
 durability run).
 
+**Result so far (2026-09-26, pre-4.0.1 code): 1,189 completed batched `Durable`
+power cuts, 239,069,696 acked records, 0 violations, canary `bit` on every cut,
+duplicate ratio 1.062.** A 1,190th episode filled the 2 GiB test device, and the
+oracle counted the records weir had refused to truncate as lost. The episode is
+excluded, the run has no final pass, and a rerun on current code is still owed.
+Write-up:
+[`2026-09-26-batched-durable-power-loss.md`](../docs/benchmarks/chaos-phase2/2026-09-26-batched-durable-power-loss.md).
+
 **Check the daemon is really batching before trusting a batched run.** The
 schedule key is easy to typo into silence, and a run that quietly used the
 single-push path looks identical to a passing batched one. Scrape `/metrics`
