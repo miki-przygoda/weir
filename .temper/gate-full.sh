@@ -77,6 +77,8 @@ else
     fi
     step "act-${1%.yml}-$2" "cd '$clone' && $ACT --pull=false --rm -W .github/workflows/$1 -j $2 --env CARGO_BUILD_JOBS=$JOBS $extra"
     if [ -n "$extra" ]; then
+      # The smoke job's fixed-name container outlives the job, pass or fail.
+      docker rm -f weir-smoke >/dev/null 2>&1
       docker run --rm -v "$shared:/s" alpine sh -c 'rm -rf /s/* /s/.[!.]*' >/dev/null 2>&1; rmdir "$shared" 2>/dev/null
     fi
   }
