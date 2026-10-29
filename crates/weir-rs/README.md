@@ -14,10 +14,10 @@ contains no logic of its own — each module *is* the corresponding crate.
 
 | You want to…                       | Use                                                                          |
 |------------------------------------|------------------------------------------------------------------------------|
-| Just the wire-protocol types       | `weir-rs = "4.0"` → `weir_rs::core` (always on)                              |
-| Send records from your app         | `weir-rs = { version = "4.0", features = ["client"] }` → `weir_rs::client`   |
-| Build a custom sink                | `weir-rs = { version = "4.0", features = ["sink-sdk"] }` → `weir_rs::sink_sdk` |
-| Read on-disk WAB segments          | `weir-rs = { version = "4.0", features = ["wab"] }` → `weir_rs::wab`         |
+| Just the wire-protocol types       | `weir-rs = "4.1"` → `weir_rs::core` (always on)                              |
+| Send records from your app         | `weir-rs = { version = "4.1", features = ["client"] }` → `weir_rs::client`   |
+| Build a custom sink                | `weir-rs = { version = "4.1", features = ["sink-sdk"] }` → `weir_rs::sink_sdk` |
+| Read on-disk WAB segments          | `weir-rs = { version = "4.1", features = ["wab"] }` → `weir_rs::wab`         |
 | Run the daemon                     | `cargo install weir-server`                                                  |
 | Operate / inspect a running daemon | `cargo install weir-ctl`                                                     |
 

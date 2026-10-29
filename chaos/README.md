@@ -91,24 +91,27 @@ does not build this project.
 > **Buffered's exposure is now a number, not prose.** Loss is uniformly
 > distributed between zero and the ceiling — mean and stdev both land within 2%
 > of a uniform distribution's `max/2` and `max/√12` — with a ceiling of
-> **126,782 records** and a median of 63,790. The ceiling, not the mean, is what
+> **126,782 records** (~32.5 MB at this run's 256-byte records) and a median of 63,790. The ceiling, not the mean, is what
 > characterises the tier.
 >
-> **Read the ceiling in RECORDS, not in seconds.** This run rendered it as
+> **Read the ceiling in BYTES: not seconds, and not records.** This run rendered it as
 > "~1.76 s of acknowledged writes" by dividing by its own ~72,000 rec/s, and
 > called it "one writeback interval". The batched Buffered run
 > ([`powerloss-batch-buffered.toml`](schedules/powerloss-batch-buffered.toml),
 > 747 episodes, 2026-09-27) tested that reading by raising throughput 1.45x: the
 > record ceiling did **not** move (123,664 against 126,782) and the duration fell
 > to **1.18 s**. So the ceiling is a quantity of data and the seconds are
-> throughput-specific. Those two runs cannot say whether the invariant is
-> records or bytes — both used 256-byte records, and 123,664 x 256 B is
-> ~31.7 MB. The record-size sweep that separates the two is
-> [`powerloss-recsize-64.toml`](schedules/powerloss-recsize-64.toml),
-> [`-1024`](schedules/powerloss-recsize-1024.toml) and
-> [`-4096`](schedules/powerloss-recsize-4096.toml), which vary only
-> `record_size` against the batched Buffered run; no result from it is
-> written up in this repo yet.
+> throughput-specific. The record-size sweep
+> ([`powerloss-recsize-64.toml`](schedules/powerloss-recsize-64.toml) and
+> [`-1024`](schedules/powerloss-recsize-1024.toml), varying only `record_size`
+> against the batched Buffered run) then showed the quantity is **bytes**:
+> 461,956 records at 64 B (29.6 MB), 123,664 at 256 B (31.7 MB) and 27,084 at
+> 1024 B (27.7 MB), a 17x spread in records and ±7% around ~30 MB in bytes, with
+> 0 violations and the canary `bit` on every cut. All legs used 4 shards and
+> 8 MiB segments, so `shard_count x wab_segment_max_bytes` (33.6 MB) is a
+> hypothesis, not a result. The [`-4096`](schedules/powerloss-recsize-4096.toml)
+> leg never ran. Write-up:
+> [`2026-09-27-buffered-ceiling-is-bytes.md`](../docs/benchmarks/chaos-phase2/2026-09-27-buffered-ceiling-is-bytes.md).
 >
 > **What that run alone did NOT establish** — both since closed, and left here
 > because the sequence is the point: a Buffered run measures Buffered, and

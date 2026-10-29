@@ -15,7 +15,7 @@ This directory ships a `cargo-fuzz` setup with three targets:
 | `envelope_parse` | `weir_core::Envelope::decode` | Decodes the wire-format envelope from every push the daemon accepts. Every connected client gets to feed this function arbitrary bytes. |
 | `wab_segment_header` | `weir_server::wab::format::parse_segment_header` (re-exported from `weir_wab::format`) | Parses the header of every `.wab`/`.wab.sealed` file — read at daemon startup (crash recovery's directory scan) and on every drain, so attacker-controlled bytes after a host compromise reach it directly. Exists because format v2 added version-routing and a flags-byte validation v1 never had. |
 
-The existing proptest harness in `crates/weir-core/tests/reference_frames.rs`
+The existing proptest harness in `crates/weir-core/tests/proptest_envelope.rs`
 covers *round-tripping* — encode → decode of valid envelopes always
 yields the original. The fuzz targets cover the *inverse*: arbitrary
 input never panics, regardless of whether it round-trips.

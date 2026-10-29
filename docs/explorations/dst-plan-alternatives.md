@@ -1,5 +1,11 @@
 # DST Tooling Landscape: Build vs Adopt vs Hybrid
 
+> **Historical.** Written in June 2026 for weir v0.8–v1.0 and kept as a record of
+> the reasoning. Much of it has since changed: the `Sync` tier is now `Durable`, and
+> deterministic simulation testing, the S3 sink, `SinkBatch`, WAB compression and the
+> health and `/status` routes have shipped. For how weir works today, read
+> [architecture](../architecture.md), [monitoring](../monitoring.md) and [configuration](../operations/configuration.md).
+
 **Status:** Research / recommendation — no implementation.
 **Builds on:** `phase4-dst-harness.md` (recommended hand-rolled injectable traits +
 single-threaded sim executor), `phase4-dst-scenarios.md` (invariants + fault catalog).

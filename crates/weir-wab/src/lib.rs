@@ -12,9 +12,10 @@
 //! Keeping the format + reader here means there is exactly one parser for the
 //! on-disk format; the daemon and the CLI can never drift out of sync.
 //!
-//! The crate is deliberately tiny: it depends only on [`weir_core`] (for
-//! [`Payload`] and the payload size cap) and `crc32fast`. It does no async I/O,
-//! pulls in no runtime, and is safe for a slim CLI to depend on.
+//! The crate is deliberately small: it depends only on [`weir_core`] (for
+//! [`Payload`] and the payload size cap), `crc32fast` and `zstd` (for format v2's
+//! compressed segments; it builds a vendored libzstd, so a C toolchain is needed).
+//! It does no async I/O, pulls in no runtime, and is safe for a slim CLI to depend on.
 //!
 //! # Trust model
 //!

@@ -19,11 +19,11 @@ connection can mix them.)
 
 **Durability, measured:** 5,311 simulated power cuts, 42,814,591 acknowledged
 records at the durable tier, **none lost** — and, in the same runs, `Buffered`
-loss measured as uniform between zero and a ceiling of **~124,000 records**
-(1.76 s at that run's ~72,000 rec/s; the ceiling is a quantity of data, so the
-seconds shrink as the producer speeds up — a 1.45x faster run measured the same
-record ceiling in 1.18 s)
-([method and results](docs/benchmarks/chaos-phase2/2026-08-28-first-power-loss-measurement.md);
+loss measured as uniform between zero and a ceiling of **~30 MB of acked
+records** (~124,000 at 256 bytes each; the ceiling is bytes, so it is not a
+number of records or of seconds, and what sets it is not yet established)
+([method and results](docs/benchmarks/chaos-phase2/2026-08-28-first-power-loss-measurement.md),
+[the ceiling in bytes](docs/benchmarks/chaos-phase2/2026-09-27-buffered-ceiling-is-bytes.md);
 real kernel power cuts on Linux, which is the platform the guarantee is claimed
 for — see [platform support](docs/platform-support.md#durability-by-platform)) ·
 6 built-in sinks (4 in a default build; `clickhouse` and `s3` opt-in) ·
@@ -249,8 +249,8 @@ listener is available behind the `tls` feature for cross-host producers.
   under injected crash/fault schedules with **replayable seeds**, on every CI run
   (a 300-seed sweep) — see [`docs/architecture.md`](docs/architecture.md#testing-infrastructure).
 - **Language-neutral conformance vectors:** canonical hex frames plus the result
-  a conformant decoder must produce for every message type, all nine Nack
-  reasons, and each rejection case — run your own codec against them
+  a conformant decoder must produce for every message type, nine of the ten
+  Nack reasons (`BadBatchFraming`, `0x0B`, has no vector yet), and each rejection case — run your own codec against them
   ([docs/conformance.md](docs/conformance.md)).
 - **Cross-platform CI:** `fmt` + `clippy` across the feature matrix + `cargo-deny`
   + the full test suites + a monitoring-stack end-to-end smoke test, on every

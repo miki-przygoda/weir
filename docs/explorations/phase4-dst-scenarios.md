@@ -1,5 +1,11 @@
 # Phase 4 — Deterministic Simulation / Chaos Fault Catalog
 
+> **Historical.** Written in June 2026 for weir v0.8–v1.0 and kept as a record of
+> the reasoning. Much of it has since changed: the `Sync` tier is now `Durable`, and
+> deterministic simulation testing, the S3 sink, `SinkBatch`, WAB compression and the
+> health and `/status` routes have shipped. For how weir works today, read
+> [architecture](../architecture.md), [monitoring](../monitoring.md) and [configuration](../operations/configuration.md).
+
 > **Scope**: Research artifact for the DST harness sibling agent. This document
 > enumerates (1) the invariants weir must never violate, (2) every concrete
 > fault the simulation must inject, (3) which faults existing tests already

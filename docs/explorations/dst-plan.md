@@ -1,5 +1,11 @@
 # DST (Deterministic Simulation Testing) for the WAB — Synthesized Plan
 
+> **Historical.** Written in June 2026 for weir v0.8–v1.0 and kept as a record of
+> the reasoning. Much of it has since changed: the `Sync` tier is now `Durable`, and
+> deterministic simulation testing, the S3 sink, `SinkBatch`, WAB compression and the
+> health and `/status` routes have shipped. For how weir works today, read
+> [architecture](../architecture.md), [monitoring](../monitoring.md) and [configuration](../operations/configuration.md).
+
 **Date:** 2026-06-12 · **For:** Phase 4 thread #3 · **Status:** ready to execute
 
 Synthesis of four parallel planning routes (read for full detail):

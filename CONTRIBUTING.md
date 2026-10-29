@@ -60,8 +60,11 @@ traps that bite in practice.
 
 ## The pre-PR gate
 
-Run this before opening a PR. It is exactly what CI enforces (`.github/workflows/ci.yml`),
-so running it locally first avoids a red CI round-trip:
+Run this before opening a PR. It covers CI's Rust jobs (`.github/workflows/ci.yml`),
+so running it locally first avoids most red CI round-trips. It does not cover the
+`conformance` job's tracked and batch runners, the lint job's crypto-provider and
+systemd `flock` checks, or the container jobs; run those with `act` (see
+[`deploy/ci-local/README.md`](deploy/ci-local/README.md)):
 
 ```bash
 # Formatting

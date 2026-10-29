@@ -1240,8 +1240,9 @@ weir-ctl dl requeue --wab-dir /var/lib/weir/wab --socket /run/weir/weir.sock --y
 - **At-least-once, segment-atomic.** A segment is deleted only after **all** of
   its records are re-accepted (each `Push` is acked only once the daemon has made
   it durable), so an interrupted run bounds duplication to the single in-flight
-  segment, which is re-sent on the next run. Duplicate payloads are absorbed by
-  the sink's idempotency key. A corrupt/unreadable segment is skipped wholesale
+  segment, which is re-sent on the next run. A dedup-capable sink will **not**
+  filter those duplicates: a requeued record lands in a new segment, so its
+  `RecordId` is new. Plan for duplicates. A corrupt/unreadable segment is skipped wholesale
   (never partially requeued) and left in place. Records that are requeued but
   whose segment can't be deleted are surfaced loudly (they will requeue again
   next run — remove them manually).
@@ -1514,7 +1515,7 @@ deployments.
 >
 > **Exempt — these key on the record, not the batch:**
 >
-> - **HTTP in the default `per_record` batch mode**: one POST per record, keyed
+> - **HTTP in the default `sink_http_batch = "none"` mode**: one POST per record, keyed
 >   by that record's `RecordId`.
 > - **Postgres / MySQL with [`sink_postgres_id_column`](#sink_postgres_id_column)
 >   or [`sink_mysql_id_column`](#sink_mysql_id_column) set**: the `UNIQUE`

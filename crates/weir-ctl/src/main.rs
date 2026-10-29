@@ -42,8 +42,9 @@ struct Cli {
     /// Emit machine-readable JSON instead of the human table, for the
     /// read/inspect subcommands (health, metrics, segments, dl list,
     /// quarantine list, quarantine inspect, status). The human output stays
-    /// the default. Mutating commands (push, dl drop/requeue, reload, drain)
-    /// emit a small JSON result object under --json.
+    /// the default. Mutating commands (push, dl drop/requeue, quarantine
+    /// requeue, reload, drain) emit a small JSON result object under --json, and
+    /// so do the attest subcommands (seal, verify, head).
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]

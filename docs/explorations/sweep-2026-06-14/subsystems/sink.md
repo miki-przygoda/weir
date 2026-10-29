@@ -1,5 +1,11 @@
 # Sink subsystem — adversarial verification (sweep 2026-06-14)
 
+> **Historical.** Written in June 2026 for weir v0.8–v1.0 and kept as a record of
+> the reasoning. Much of it has since changed: the `Sync` tier is now `Durable`, and
+> deterministic simulation testing, the S3 sink, `SinkBatch`, WAB compression and the
+> health and `/status` routes have shipped. For how weir works today, read
+> [architecture](../../../architecture.md), [monitoring](../../../monitoring.md) and [configuration](../../../operations/configuration.md).
+
 Audited 11 findings across `mysql.rs`, `postgres.rs`, `clickhouse.rs`, `http.rs`, against the drain caller and config defaults. 9 confirmed real, 1 refuted, 1 partially refuted (severity downgraded). Crown invariant (no false acks) holds throughout — all confirmed findings are correctness-adjacent (data routed to dead-letter / duplicate inserts / test gaps), not false-ack data loss.
 
 ## Confirmed (real)

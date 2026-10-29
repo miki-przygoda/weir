@@ -1,5 +1,11 @@
 # Phase 4 Observability — Design Exploration
 
+> **Historical.** Written in June 2026 for weir v0.8–v1.0 and kept as a record of
+> the reasoning. Much of it has since changed: the `Sync` tier is now `Durable`, and
+> deterministic simulation testing, the S3 sink, `SinkBatch`, WAB compression and the
+> health and `/status` routes have shipped. For how weir works today, read
+> [architecture](../architecture.md), [monitoring](../monitoring.md) and [configuration](../operations/configuration.md).
+
 **Scope:** Production-ready observability story for weir 0.9.0 — Grafana dashboard, Prometheus alert rules, and a monitoring runbook.
 **Status:** Exploration (design only; no code changes). Implementable as committed artifacts in Phase 4.
 **Grounded in:** `crates/weir-server/src/metrics/mod.rs` (all metric names verified against real registrations).

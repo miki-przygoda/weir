@@ -93,9 +93,11 @@ cargo build --release -p weir-server --no-default-features
 ```
 
 Available sink features: `http-sink`, `mysql-sink`, `postgres-sink`,
-`clickhouse-sink` (the `noop` sink is always compiled in). Trimming the *default*
-feature set is a breaking change deferred to a future major version, so the full
-set stays the default for now — use `--no-default-features` to opt out today.
+`clickhouse-sink` and `s3-sink` (the `noop` sink is always compiled in). The
+default build has `http-sink`, `mysql-sink` and `postgres-sink`; `clickhouse-sink`
+and `s3-sink` are opt-in. Trimming the *default*
+feature set is a breaking change deferred to a future major version, so those three
+stay the default for now — use `--no-default-features` to opt out today.
 
 ### Install to PATH
 

@@ -158,7 +158,7 @@ The entire socket module is gated `#[cfg(unix)]`. Unix domain sockets do not exi
 
 ### Worker pool (`src/worker.rs`, `src/models.rs`)
 
-- `WorkUnit { shard_id: u32, payload: Payload, durability: Durability, ack_tx: oneshot::Sender<bool> }` — the ack channel travels intact through the worker and batch to the WAB drain, which resolves it after the durable write. Workers do not ack.
+- `WorkUnit { shard_id: u32, payload: Payload, durability: Durability, wants_coordinate: bool, ack_tx: oneshot::Sender<AckOutcome> }` — `wants_coordinate` is set for a `PushTracked` producer, which is told where its record landed. The ack channel travels intact through the worker and batch to the WAB drain, which resolves it after the durable write. Workers do not ack.
 - `Batch { shard_id: u32, records: Vec<WorkUnit> }` — per-shard buffer flushed on batch-full or `batch_deadline`.
 - Flush uses `std::mem::replace` to swap in a fresh pre-allocated buffer; zero allocation on the hot path.
 - `on_disconnect` is `#[cold] #[inline(never)]` to keep it off the hot path and bias the branch predictor toward the `Ok(unit)` arm.
@@ -193,6 +193,7 @@ Crash-safe write-ahead buffer. See [wab_format.md](wab_format.md) for the binary
 | `mysql` | `sink::mysql::MySqlSink` | one multi-row `INSERT` **per batch** | the IOPS-compression downstream |
 | `postgres` | `sink::postgres::PostgresSink` | one multi-row `INSERT … ON CONFLICT DO NOTHING` **per batch** | the IOPS-compression downstream on Postgres |
 | `clickhouse` | `sink::clickhouse::ClickHouseSink` | one HTTP `INSERT … FORMAT RowBinary` **per batch** (opt-in `clickhouse-sink` feature) | bulk inserts into ClickHouse with replay-safe dedup |
+| `s3` | the `weir-sink-s3` crate | one object **per batch** (opt-in `s3-sink` feature) | archiving to S3-API object storage; see [the S3 sink](sinks/s3.md) |
 
 The `mysql` sink is the one that delivers on the headline claim: N
 records push → 1 INSERT statement → 1 server-side commit. The
@@ -333,10 +334,10 @@ Throughput and latency measurements for single-threaded, thundering-herd, connec
 
 The crown invariant — *an ack is never a false ack; no acked record is ever lost* — is checked directly against the durability path under injected fault schedules. The harness swaps the real segment backend for one that injects faults on a seeded schedule, then drives the flusher through scenarios and asserts the invariant in-process.
 
-- **Fault/scenario model.** Injected faults: `fdatasync` returns `EIO`, a short/torn write at the *n*-th record, `rename` fails, and the shutdown seal fails with `ENOSPC`. These are exercised across five scenarios per seed — a synchronous flush under an fsync-`EIO`, a torn write mid-batch, a crash between `sync_all` and the seal-rename, an `ENOSPC` at the shutdown seal, and a cooperatively-scheduled producer/flusher interleaving. Every run asserts that no acked record is lost and that acks never precede stable storage.
+- **Fault/scenario model.** Injected faults: `fdatasync` returns `EIO`, a short/torn write at the *n*-th record, `rename` fails, the shutdown seal fails with `ENOSPC`, and (in a dedicated test) the flusher panics at the `fdatasync` barrier. The sweep exercises six scenarios per seed: a synchronous flush under an fsync-`EIO`, a torn write mid-batch, a crash between `sync_all` and the seal-rename, an `ENOSPC` at the shutdown seal, a cooperatively-scheduled producer/flusher interleaving, and the bounded hand-off to a slow or absent drain across a shutdown. Every run asserts that no acked record is lost and that acks never precede stable storage.
 - **Replayable seeds.** All randomness comes from a seeded `SplitMix64`, so every run is fully reproducible from its seed. A violated invariant panics with the invariant name and a one-line `WEIR_DST_SEED=0x… cargo test … --features dst` reproducer.
-- **Pinned regression seeds.** Any discovered failure serialises into `crates/weir-server/tests/dst_seeds/*.json`; the `replay_pinned_seeds` test re-runs every pinned spec on each CI run, so a fixed bug stays fixed.
-- **Random-seed sweep.** `sweep_random_seeds` runs `WEIR_DST_SWEEP` seeds (default 16 for fast PR runs; CI sets `WEIR_DST_SWEEP=300`), five scenarios each, on every push. Any seed that breaks an invariant fails the build with a pin-able repro.
+- **Pinned regression seeds.** Any discovered failure serialises into `crates/weir-server/tests/dst_seeds/*.json`; the `replay_pinned_regression_seeds` test re-runs every pinned spec on each CI run, so a fixed bug stays fixed.
+- **Random-seed sweep.** `sweep_random_seeds` runs `WEIR_DST_SWEEP` seeds (default 16 for fast PR runs; CI sets `WEIR_DST_SWEEP=300`), six scenarios each, on every push. Any seed that breaks an invariant fails the build with a pin-able repro.
 - **Property-based fault-list exploration.** A proptest layer varies the *fault list* itself (durability-barrier faults at arbitrary record positions) and shrinks any failure to a minimal `(seed, fault-list, records)` counterexample — a standing auto-minimising guard for the day a regression reintroduces a false ack.
 
 ---
@@ -355,7 +356,7 @@ The crown invariant — *an ack is never a false ack; no acked record is ever lo
 | Corrupt `.confirmed` sidecar               | Bad magic / unknown version / CRC mismatch quarantines both the sealed segment and sidecar                                                                                                                                       |
 | Torn write in crash recovery               | Per-record CRC32 checked; replay truncates at the first corrupt entry                                                                                                                                                            |
 | Blocked socket semaphore (dead workers)    | `push_timeout` (5 s) returns `InternalError` Nack rather than blocking indefinitely                                                                                                                                              |
-| WAB integrity on shared/network storage    | **Out of scope.** CRC32 detects accidental corruption; it does not detect malicious modification. The WAB directory must be local storage accessible only to the daemon (`0o700`). Network filesystems break the security model. |
+| WAB integrity on shared/network storage    | **Out of scope.** CRC32 detects accidental corruption; it does not detect malicious modification. The WAB directory must be local storage accessible only to the daemon (`0o700`). Network filesystems break the security model. Sealed segments can carry tamper evidence after the fact with `weir-ctl attest` (the `weir-attest` hash chain). |
 
 ---
 

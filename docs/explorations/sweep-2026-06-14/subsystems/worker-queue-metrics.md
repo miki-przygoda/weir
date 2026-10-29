@@ -1,5 +1,11 @@
 # Sweep 2026-06-14 — worker-queue-metrics subsystem
 
+> **Historical.** Written in June 2026 for weir v0.8–v1.0 and kept as a record of
+> the reasoning. Much of it has since changed: the `Sync` tier is now `Durable`, and
+> deterministic simulation testing, the S3 sink, `SinkBatch`, WAB compression and the
+> health and `/status` routes have shipped. For how weir works today, read
+> [architecture](../../../architecture.md), [monitoring](../../../monitoring.md) and [configuration](../../../operations/configuration.md).
+
 All five findings hold against the code: 4 are real defects (1 medium availability, 1 medium correctness/latency, 2 low observability/doc) and 1 is a real info-level API-design wart — none refuted.
 
 ## Confirmed (real)

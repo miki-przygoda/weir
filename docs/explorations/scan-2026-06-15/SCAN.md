@@ -1,5 +1,11 @@
 # Final pre-1.0 codebase scan — findings (2026-06-15)
 
+> **Historical.** Written in June 2026 for weir v0.8–v1.0 and kept as a record of
+> the reasoning. Much of it has since changed: the `Sync` tier is now `Durable`, and
+> deterministic simulation testing, the S3 sink, `SinkBatch`, WAB compression and the
+> health and `/status` routes have shipped. For how weir works today, read
+> [architecture](../../architecture.md), [monitoring](../../monitoring.md) and [configuration](../../operations/configuration.md).
+
 > Max-tier multi-agent scan run AFTER the 2026-06-14 sweep + all queued-safe + Group-3 fixes landed. 9 orthogonal lenses + 8 subsystem deep-reads (17 find agents, waved), dedup-per-subsystem, adversarial refute-by-default verification. The 54 already-fixed findings and the 6 deferred 1.0-freeze escalations (F25/F41/F42/F48/F50/F52) were given to every agent as an explicit ignore-list. Agents were pointed hardest at the newly-written, not-yet-swept commits `65a39fb..HEAD`. Raw data: `findings.json`.
 
 ## TL;DR
