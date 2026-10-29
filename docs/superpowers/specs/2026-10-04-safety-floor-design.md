@@ -835,7 +835,7 @@ Audit for tests that start a daemon on a `wab_dir` whose previous owner may stil
   - A's oracle shows 0 violations.
 
   Also confirm the orchestrator never starts episode N+1's daemon before episode N's process has exited.
-- **SP-B: no-regression gate** on the standard A6 batched profile, ≥2 runs at a comparable cut count (baseline 2026-09-27: 1,936 cuts, 0 violations, duplicate-delivery ratio 1.062). Gates:
+- **SP-B: no-regression gate** on the standard A6 batched profile, ≥2 runs at a comparable cut count (baseline run 1813189325188119, 2026-09-26: 1,189 completed Durable cuts, 0 violations, duplicate-delivery ratio 1.062; an earlier revision said "1,936 cuts", which added the 747 episodes of the batched Buffered run; see `docs/benchmarks/chaos-phase2/2026-09-26-batched-durable-power-loss.md`). Gates:
   - 0 violations;
   - the canary fires every episode;
   - the duplicate ratio is within noise of 1.062.
