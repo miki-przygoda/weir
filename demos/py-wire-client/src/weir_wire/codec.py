@@ -117,13 +117,16 @@ class NackReason(enum.IntEnum):
     EMPTY_PAYLOAD = 0x07
     UNKNOWN_MESSAGE = 0x08
     RESERVED_FLAGS_SET = 0x09
+    # 0x0A is unassigned. A malformed PushBatch body (bad batch version, zero
+    # records, a record length that disagrees with the body, trailing bytes).
+    BAD_BATCH_FRAMING = 0x0B
 
     @classmethod
     def describe(cls, byte: int) -> str:
         try:
             return cls(byte).name
         except ValueError:
-            # Spec: 0x0A-0xFF reserved; surface the raw byte rather than guess.
+            # Spec: 0x0A and 0x0C-0xFF reserved; surface the raw byte rather than guess.
             return f"reserved/unknown reason 0x{byte:02x}"
 
 
