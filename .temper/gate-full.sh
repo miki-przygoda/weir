@@ -7,16 +7,20 @@
 # 1. CI's lint, test, msrv, advisories and dst jobs, natively in the gate slot
 #    (cargo, with the slot's target dir and the shared compiler cache).
 # 2. CI's container jobs under act, in a clean clone of HEAD (act needs a real
-#    .git, and the jobs write into the tree): conformance, harnesses,
-#    sink-integration and monitoring from ci.yml, docker.yml's smoke and
-#    docs.yml's build.
+#    .git, and the jobs write into the tree), with the runner images already
+#    on the machine (--pull=false, so a registry outage doesn't fail the gate),
+#    removing a failed job's containers (--rm; act keeps them otherwise),
+#    and without their needs on lint and test (step 1 ran those): conformance,
+#    harnesses, sink-integration and monitoring from ci.yml, docker.yml's smoke
+#    and docs.yml's build.
 # 3. The jobs act can't run, in docker: the windows job (cargo-xwin) and the
 #    release build matrix (cargo-zigbuild for both apple-darwin targets and
 #    aarch64-linux, native x86_64-linux plus its TLS smoke).
 # Left out: the load, bench and drain jobs (measurements, not checks; load
 # commits baselines on main), and the darwin smoke and native macOS tests,
 # which need a Mac: the head runs those before a push.
-# Runs every step and reports all failures.
+# Runs every step, and every test binary within a step (--no-fail-fast), and
+# reports all failures.
 set -uo pipefail
 [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
 top=$(git rev-parse --show-toplevel)
@@ -33,13 +37,13 @@ step clippy-all        'cargo clippy --all-targets --all-features -- -D warnings
 step clippy-nodefault  'cargo clippy --all-targets --no-default-features -- -D warnings'
 step clippy-s3         'cargo clippy --all-targets --features weir-server/s3-sink -- -D warnings'
 step demo-version      './scripts/sync-demo-version.sh && git diff --exit-code demo/version.js'
-step test-ws           'cargo test --workspace --exclude weir-server'
-step test-s3           'cargo test -p weir-sink-s3'
-step test-srv          "cargo test -p weir-server $SRV"
-step test-srv-bins     'cargo test -p weir-server --bins -- --test-threads=1'
-step test-ws-all       'cargo test --workspace --exclude weir-server --all-features'
-step test-srv-all      "cargo test -p weir-server $SRV --all-features"
-step test-srv-bins-all 'cargo test -p weir-server --bins --all-features -- --test-threads=1'
+step test-ws           'cargo test --no-fail-fast --workspace --exclude weir-server'
+step test-s3           'cargo test --no-fail-fast -p weir-sink-s3'
+step test-srv          "cargo test --no-fail-fast -p weir-server $SRV"
+step test-srv-bins     'cargo test --no-fail-fast -p weir-server --bins -- --test-threads=1'
+step test-ws-all       'cargo test --no-fail-fast --workspace --exclude weir-server --all-features'
+step test-srv-all      "cargo test --no-fail-fast -p weir-server $SRV --all-features"
+step test-srv-bins-all 'cargo test --no-fail-fast -p weir-server --bins --all-features -- --test-threads=1'
 step load-norun        'cargo test -p weir-server --test load --no-run && cargo test -p weir-server --test load_drain --no-run'
 step msrv              'rustup run 1.88 cargo check --workspace --all-features --locked'
 step deny              'cargo deny fetch && cargo deny check advisories bans licenses sources'
@@ -48,7 +52,9 @@ step dst-300           'WEIR_DST_SWEEP=300 cargo test -p weir-server --bin weir-
 # --- 2. act, in a clean clone of HEAD ---------------------------------------
 clone="$tmp_root/act-src"
 rm -rf "$clone"
-git init -q "$clone" && git -C "$clone" fetch -q "$top" HEAD && git -C "$clone" checkout -q --detach FETCH_HEAD
+# A named branch: on a detached HEAD act finds no ref, and the job container's
+# git then fails CI's `git diff --exit-code` step.
+git init -q "$clone" && git -C "$clone" fetch -q "$top" HEAD && git -C "$clone" checkout -q -B temper-gate FETCH_HEAD
 if [ "$(git -C "$clone" rev-parse HEAD 2>/dev/null)" != "$SHA" ]; then
   echo "gate-full: could not make a clean clone of $SHA" | tee -a "$OUT/summary.txt"; FAILED=$((FAILED + 1))
 else
@@ -57,6 +63,11 @@ else
   # empty dir instead, so that job gets a TMPDIR that is the same path on the
   # host and in the container, emptied afterwards through docker (the files
   # belong to container uids).
+  # act runs a job's `needs` first and has no flag to skip them, so each of
+  # sink-integration and monitoring would rerun lint and the whole test job,
+  # cold, in a container (~35 min apiece). Step 1 already ran those commands,
+  # so the throwaway clone's copy of ci.yml drops its needs on lint and test.
+  sed -i -E '/^    needs: (lint|test)$/d' "$clone/.github/workflows/ci.yml"
   shared="$tmp_root/act-tmp"
   act_job() {  # act_job <workflow> <job>
     local extra=''
@@ -64,7 +75,7 @@ else
       docker rm -f weir-smoke >/dev/null 2>&1; mkdir -p "$shared"
       extra="--env TMPDIR=$shared --container-options '-v $shared:$shared'"
     fi
-    step "act-${1%.yml}-$2" "cd '$clone' && $ACT -W .github/workflows/$1 -j $2 --env CARGO_BUILD_JOBS=$JOBS $extra"
+    step "act-${1%.yml}-$2" "cd '$clone' && $ACT --pull=false --rm -W .github/workflows/$1 -j $2 --env CARGO_BUILD_JOBS=$JOBS $extra"
     if [ -n "$extra" ]; then
       docker run --rm -v "$shared:/s" alpine sh -c 'rm -rf /s/* /s/.[!.]*' >/dev/null 2>&1; rmdir "$shared" 2>/dev/null
     fi
