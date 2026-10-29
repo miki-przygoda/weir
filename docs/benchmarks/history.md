@@ -23,6 +23,16 @@ marker, but **do not read them as trend**. `deploy/avg_benchmarks.py` now
 applies the marker at write time, so this is not a judgement anyone has to
 remember to make again.
 
+**The 25–26 Oct 2026 rows (two at 4.0.1, one at 4.1.0) measured tmpfs, not a
+disk.** GitHub's `ubuntu-latest` had become `ubuntu-26.04`, which mounts `/tmp` as
+tmpfs, and the suite put its WAB there, so `fdatasync` was a no-op: Sync RPS
+jumped from ~3,400 to ~19,000–20,600 and Sync p99 fell from ~600 µs to ~65 µs,
+with no change to the daemon (on one Linux machine with the WAB on ext4, both
+4.0.1 and 4.1.0 issue one `fdatasync` per `Durable` record and take milliseconds
+per ack; on tmpfs both drop to the `Buffered` figure). The
+`load` job now points `TMPDIR` at the runner's disk and refuses to run on tmpfs.
+Compare those rows only with each other.
+
 | Version | Date | Runs | Sync RPS | Sync p99 | Buf p50 | Ramp peak RPS |
 |---------|------|------|----------|----------|---------|---------------|
 | 0.2.0 | 2026-05-24 | 2 | 623 | 3.2 ms | — | 17,229 |

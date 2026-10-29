@@ -298,6 +298,21 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # ubuntu-latest became ubuntu-26.04 by 25 Oct 2026, and 26.04 mounts /tmp
+      # as tmpfs, where fdatasync is a no-op: history.md's 25-26 Oct rows
+      # measured RAM, not a disk (single-thread Durable p50 51 us, the same as
+      # Buffered). The harness puts its WAB under TMPDIR (std::env::temp_dir),
+      # so point TMPDIR at the runner's work disk, and refuse to measure if that
+      # is tmpfs too.
+      - name: Put the WAB on disk
+        run: |
+          echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+          fs=$(findmnt -no FSTYPE -T "$RUNNER_TEMP")
+          echo "RUNNER_TEMP=$RUNNER_TEMP is on $fs"
+          if [ "$fs" = tmpfs ]; then
+            echo "::error::RUNNER_TEMP is on tmpfs, so a Durable ack would include no real fsync"
+            exit 1
+          fi
       - name: Build test binary
         run: cargo test -p weir-server --test load --no-run
       # `|| true` per run is deliberate: a benchmark should not gate the build on
@@ -365,6 +380,21 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # ubuntu-latest became ubuntu-26.04 by 25 Oct 2026, and 26.04 mounts /tmp
+      # as tmpfs, where fdatasync is a no-op: history.md's 25-26 Oct rows
+      # measured RAM, not a disk (single-thread Durable p50 51 us, the same as
+      # Buffered). The harness puts its WAB under TMPDIR (std::env::temp_dir),
+      # so point TMPDIR at the runner's work disk, and refuse to measure if that
+      # is tmpfs too.
+      - name: Put the WAB on disk
+        run: |
+          echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+          fs=$(findmnt -no FSTYPE -T "$RUNNER_TEMP")
+          echo "RUNNER_TEMP=$RUNNER_TEMP is on $fs"
+          if [ "$fs" = tmpfs ]; then
+            echo "::error::RUNNER_TEMP is on tmpfs, so a Durable ack would include no real fsync"
+            exit 1
+          fi
       # The delivery-side counterpart to the `load` job. Every scenario in
       # tests/load.rs measures ingest; nothing measured how fast the buffer
       # empties, which for a write buffer is the half that decides whether it
@@ -422,6 +452,21 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # ubuntu-latest became ubuntu-26.04 by 25 Oct 2026, and 26.04 mounts /tmp
+      # as tmpfs, where fdatasync is a no-op: history.md's 25-26 Oct rows
+      # measured RAM, not a disk (single-thread Durable p50 51 us, the same as
+      # Buffered). The harness puts its WAB under TMPDIR (std::env::temp_dir),
+      # so point TMPDIR at the runner's work disk, and refuse to measure if that
+      # is tmpfs too.
+      - name: Put the WAB on disk
+        run: |
+          echo "TMPDIR=$RUNNER_TEMP" >> "$GITHUB_ENV"
+          fs=$(findmnt -no FSTYPE -T "$RUNNER_TEMP")
+          echo "RUNNER_TEMP=$RUNNER_TEMP is on $fs"
+          if [ "$fs" = tmpfs ]; then
+            echo "::error::RUNNER_TEMP is on tmpfs, so a Durable ack would include no real fsync"
+            exit 1
+          fi
 
       - name: Run bench (tests/load)
         # tests/load.rs spawns its own weir-server, runs every benchmark
