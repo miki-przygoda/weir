@@ -9,6 +9,13 @@
 - [Integrating & extending](getting-started/integrating.md)
 - [Platform support](platform-support.md)
 
+# Comparisons
+
+- [Overview](comparisons/README.md)
+    - [ClickHouse async inserts](comparisons/clickhouse-async-inserts.md)
+    - [Vector and Fluent Bit](comparisons/vector-fluent-bit.md)
+    - [Outbox, SQLite, in-process queues](comparisons/outbox-sqlite.md)
+
 # Operations
 
 - [Configuration reference](operations/configuration.md)

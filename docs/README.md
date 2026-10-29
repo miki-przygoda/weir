@@ -37,6 +37,17 @@ Short docs to get you from zero to a running daemon with records flowing.
 
 ---
 
+## Comparisons
+
+How weir differs from tools that solve nearby problems, with each tool's own
+documentation cited, and when each one is the better choice.
+
+- [**comparisons/**](comparisons/README.md) — ClickHouse async inserts, Buffer
+  tables and Kafka; Vector's disk buffer and Fluent Bit's filesystem storage; a
+  transactional outbox, a SQLite queue and in-process disk queues.
+
+---
+
 ## Operations
 
 Documentation for running weir in production.
