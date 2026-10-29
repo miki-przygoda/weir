@@ -1,14 +1,14 @@
 [package]
 name = "weir-client"
-description = "Client library for the weir daemon"
+description = "Client for the weir write buffer daemon: push records over a Unix socket or TCP+mTLS and get a durable ack"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-keywords = ["weir", "client", "durability", "ingestion", "ipc"]
-categories = ["network-programming", "database"]
+keywords = ["durability", "ingestion", "batching", "unix-socket", "write-ahead-log"]
+categories = ["network-programming", "database", "asynchronous"]
 
 [package.metadata.docs.rs]
 all-features = true

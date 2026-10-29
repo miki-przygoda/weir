@@ -1,7 +1,8 @@
 # weir-rs
 
-Durable, high-throughput write buffer for Rust — microsecond fsync'd acks over a
-Unix socket, N→1 batched commits to your database, and crash-safe WAB replay.
+A durable write buffer for Rust: your app gets an ack once a record is safe on
+local disk, and weir commits records to your database in batches (N writes
+become one commit), replaying anything unconfirmed after a crash.
 
 This crate is a **facade**: it re-exports the published `weir-*` library crates
 under short module names so you can depend on one crate and one version line. It

@@ -4,7 +4,12 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>weir — durable write buffer · live demo</title>
-<meta name="description" content="weir: a durable, high-throughput write buffer for Rust. Interactive browser simulation comparing a naive insert-per-record stack with weir — durable acks in microseconds, N→1 commits, crash-safe replay." />
+<meta name="description" content="weir: stop doing one INSERT per event. Interactive browser simulation comparing a naive insert-per-record stack with weir, a durable write buffer for Rust: an ack after one local fsync, N→1 commits, crash-safe replay." />
+<meta property="og:type" content="website" />
+<meta property="og:title" content="weir — durable write buffer · live demo" />
+<meta property="og:description" content="Stop doing one INSERT per event. Push records, crash the daemon, watch weir replay, side by side with an insert-per-record baseline." />
+<meta property="og:image" content="https://raw.githubusercontent.com/miki-przygoda/weir/main/docs/assets/social-preview.png" />
+<meta name="twitter:card" content="summary_large_image" />
 <link rel="stylesheet" href="weir.css" />
 </head>
 <body>
@@ -190,7 +195,7 @@
     </div>
     <div class="card">
       <h3>No broker</h3>
-      <p class="card-sub" style="margin:0">One binary, one local socket. Not Kafka — a durable buffer in front of one sink, with microsecond acks.</p>
+      <p class="card-sub" style="margin:0">One binary, one local socket. Not Kafka — a durable buffer in front of one sink, with an ack after one local fsync.</p>
     </div>
     <div class="card">
       <h3>Use weir when…</h3>

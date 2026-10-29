@@ -1,14 +1,14 @@
 [package]
 name = "weir-ctl"
-description = "Admin and inspection CLI for the weir daemon"
+description = "Admin CLI for the weir write buffer daemon: status, dead-letter and quarantine requeue, WAB inspection, attestation"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-keywords = ["weir", "cli", "operations", "admin", "durability"]
-categories = ["command-line-utilities", "database"]
+keywords = ["write-ahead-log", "dead-letter", "admin", "cli", "operations"]
+categories = ["command-line-utilities", "database", "development-tools::debugging"]
 
 [[bin]]
 name = "weir-ctl"

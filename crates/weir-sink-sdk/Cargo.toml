@@ -1,13 +1,13 @@
 [package]
 name = "weir-sink-sdk"
-description = "Sink trait and error contract for building sinks for the weir daemon"
+description = "Sink trait and error contract for writing weir sinks: deliver batches from a durable write buffer to any downstream"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-keywords = ["weir", "sink", "ingestion", "database", "async"]
+keywords = ["sink", "connector", "etl", "batching", "ingestion"]
 categories = ["database", "asynchronous"]
 
 [package.metadata.docs.rs]

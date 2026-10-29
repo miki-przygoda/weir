@@ -1,14 +1,14 @@
 [package]
 name = "weir-wab"
-description = "On-disk WAB segment format and reader for weir (shared by the daemon and weir-ctl)"
+description = "On-disk write-ahead buffer (WAB) segment format and reader for weir, shared by the daemon and weir-ctl"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-keywords = ["weir", "wal", "durability", "segment", "format"]
-categories = ["encoding", "filesystem"]
+keywords = ["write-ahead-log", "wal", "segment", "crc32", "durability"]
+categories = ["encoding", "filesystem", "database-implementations"]
 
 [dependencies]
 weir-core = { workspace = true }

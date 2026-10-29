@@ -1,13 +1,13 @@
 [package]
 name = "weir-sink-s3"
-description = "S3-API object-storage sink for the weir daemon (AWS S3, MinIO, R2, B2, Ceph)"
+description = "S3-API object-storage sink for the weir write buffer (AWS S3, MinIO, R2, B2, Ceph)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-keywords = ["weir", "sink", "s3", "object-storage", "archive"]
+keywords = ["s3", "object-storage", "minio", "r2", "archive"]
 categories = ["database", "asynchronous"]
 
 [package.metadata.docs.rs]

@@ -6,16 +6,43 @@
 [![crates.io](https://img.shields.io/crates/v/weir-server.svg?label=weir-server)](https://crates.io/crates/weir-server)
 [![docs.rs](https://img.shields.io/docsrs/weir-rs?label=docs.rs%2Fweir-rs)](https://docs.rs/weir-rs)
 
-A durable, high-throughput write buffer for Rust.
+**Stop doing one INSERT per event.** weir is a small daemon that sits between
+your application and your database. Your app pushes each record to a local
+socket and gets an ack once the record is safe on local disk. weir then commits
+records to Postgres, MySQL, ClickHouse, S3 or an HTTP endpoint in batches, so N
+writes become one commit, and after a crash it replays whatever the database
+had not yet confirmed.
 
-**Fire a record at a local socket, get a durable ack in microseconds, and let
-your database catch up in bulk.** weir writes each record to a CRC32-checksummed
-write-ahead buffer, fsyncs it according to the durability tier you ask for, acks
-the producer, then drains records to your sink in batches — turning N per-record
-commits into 1. **At the `Durable` tier an ack is never a false ack:** an acked
-record is on disk and replays after a crash. (`Buffered` acks before the fsync
-and deliberately trades that away — the tier is a per-record choice, so one
-connection can mix them.)
+- **At the `Durable` tier an ack is never a false ack.** The ack waits for one
+  local fsync, and an acked record is delivered even if the machine loses power
+  right after. Tested with 5,311 simulated power cuts: 42,814,591 acked records,
+  none lost.
+- **A cheaper tier when you can afford it.** `Buffered` acks before the fsync
+  (p50 19 µs against `Durable`'s 1.1 ms on an i9-9900K with a SATA SSD, in
+  [this capture](docs/benchmarks/bare-metal.md)). It survives a process crash, but power
+  loss can take up to ~30 MB of its acked records. You choose the tier per record.
+- **Your database can be down.** Records keep buffering on disk and drain when
+  it is back. Batches the sink rejects go to a dead-letter directory that
+  `weir-ctl` can list, drop or requeue.
+- **No broker to run.** One binary per host, a Rust client, wire-level demo
+  clients in Python, Go, C, Java and TypeScript, and
+  [language-neutral conformance vectors](docs/conformance.md) for writing your own.
+
+**▶ [Try the demo](https://www.mikolaj-mikuliszyn.dev/demo/weir)** — a self-contained, browser-only
+simulation of the pipeline: push records, flip the durability tier, crash the
+daemon mid-flight, and watch unconfirmed segments replay, side by side with a
+naive insert-per-record baseline. No build step — open `demo/index.html` in any
+browser, or use the hosted copy linked above.
+
+**Use weir when** an application produces records faster than its database
+wants to commit them: ClickHouse's "too many parts" from small inserts, a
+Postgres or MySQL insert per event, or an edge box whose uplink comes and goes.
+**Don't** use it when the write must be atomic with your own database
+transaction (use an outbox table), when you need pub/sub or several consumers
+(use a broker), or when writing straight to the database is already fast
+enough.
+
+## Durability and speed, measured
 
 **Durability, measured:** 5,311 simulated power cuts, 42,814,591 acknowledged
 records at the durable tier, **none lost** — and, in the same runs, `Buffered`
@@ -24,12 +51,13 @@ records** (~124,000 at 256 bytes each; the ceiling is bytes, so it is not a
 number of records or of seconds, and what sets it is not yet established)
 ([method and results](docs/benchmarks/chaos-phase2/2026-08-28-first-power-loss-measurement.md),
 [the ceiling in bytes](docs/benchmarks/chaos-phase2/2026-09-27-buffered-ceiling-is-bytes.md);
-real kernel power cuts on Linux, which is the platform the guarantee is claimed
-for — see [platform support](docs/platform-support.md#durability-by-platform)) ·
+each cut drops every write the disk had not yet flushed, at the block layer
+under a real kernel and filesystem, on Linux, which is the platform the
+guarantee is claimed for — see [platform support](docs/platform-support.md#durability-by-platform)) ·
 6 built-in sinks (4 in a default build; `clickhouse` and `s3` opt-in) ·
 wire format + Rust API under SemVer
 
-*Latency and throughput figures are deliberately not quoted here. Every published
+*The CI latency and throughput figures are deliberately not quoted here. Every published
 run — 4.1.0 as of 2026-10-26
 ([`docs/benchmarks/latest.md`](docs/benchmarks/latest.md),
 [`history.md`](docs/benchmarks/history.md)) — is on a 2-vCPU shared CI runner (and
@@ -37,8 +65,8 @@ the 25–26 Oct runs had the WAB on tmpfs, so their `Durable` figures include no
 fsync at all: see [`docs/benchmarks.md`](docs/benchmarks.md#headline-numbers-latest-ci-run)), and
 this project's own rule is that external performance claims cite an operator-run
 capture on named hardware, with the storage and its fsync primitive disclosed
-([`environments.md`](docs/benchmarks/environments.md#what-an-external-claim-may-cite)). The "microseconds" above is the fsync:
-a `Durable` ack is one fsync, so it is your disk's number, not weir's. Measured
+([`environments.md`](docs/benchmarks/environments.md#what-an-external-claim-may-cite)). A `Durable` ack waits
+for one fsync, so its latency is your disk's number, not weir's. Measured
 single-thread `Durable` p50 is ~133–152 µs on a Mac NVMe — where the primitive is
 macOS `F_BARRIERFSYNC`, a barrier rather than a full flush — and **~1.4–1.5 ms** on a
 SATA SSD with an honest Linux `fdatasync`
@@ -52,12 +80,6 @@ short-run figure — see
 [`sustained-load.md`](docs/benchmarks/sustained-load.md), which also shows the
 effect is the storage rather than weir. Measure on
 your own hardware: `cargo test -p weir-server --test load --release -- --nocapture`.*
-
-**▶ [Try the demo](https://www.mikolaj-mikuliszyn.dev/demo/weir)** — a self-contained, browser-only
-simulation of the pipeline: push records, flip the durability tier, crash the
-daemon mid-flight, and watch unconfirmed segments replay, side by side with a
-naive insert-per-record baseline. No build step — open `demo/index.html` in any
-browser, or use the hosted copy linked above.
 
 > **Status — 4.1 (stable), published at 4.1.0.** The wire protocol and public Rust API (`weir-core`,
 > `weir-client`, `weir-sink-sdk`, `weir-wab`) are under
@@ -148,7 +170,7 @@ amortises downstream cost via bulk drain.
 **Use weir when** a high-rate producer must not block on a slow or
 flaky downstream, and must not lose records it has already been told are
 safe — even across a crash. The classic fit is "fire a record at a local
-socket, get a durable ack in microseconds, let the database catch up in
+socket, get a durable ack after one local fsync, let the database catch up in
 bulk."
 
 **Don't reach for weir when** you need fan-out or pub/sub (use a message
@@ -160,7 +182,7 @@ acceptable (an in-process channel is simpler). See [Non-goals](#non-goals-v1).
 
 weir fills a specific gap: a **fast, durable, local write-ahead point** in front
 of a slow or flaky downstream — typically a SQL database — that acks your
-producer in **microseconds** and then **compresses N buffered records into 1
+producer after **one local fsync** and then **compresses N buffered records into 1
 downstream commit**, surviving crashes by replaying unconfirmed segments. It does
 this **without running a message broker**. That niche sits between three
 well-trodden categories, and weir is deliberately *none* of them: not a broker
@@ -199,10 +221,10 @@ payload**: the wire envelope is opaque bytes, with no topic/subject/key field �
 weir does not inspect or route on content. Details in
 [architecture](docs/architecture.md) and [integrating](docs/getting-started/integrating.md).
 
-*No popular project combines all three of weir's defining properties — a local
-microsecond fsync'd ack, N→1 transactional SQL-commit compression, and a
-non-broker single binary. Comparisons reflect public positioning as of June 2026,
-not benchmarks.*
+*We know of no popular project that combines all three of weir's defining
+properties: a local fsync'd ack, N→1 transactional SQL-commit compression, and a
+non-broker single binary. The comparisons reflect each project's public
+positioning in June 2026, not benchmarks.*
 
 ## Crates
 

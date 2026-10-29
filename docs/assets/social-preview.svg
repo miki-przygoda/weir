@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640">
+  <!-- GitHub social preview for the repo (Settings → Social preview). Rendered to
+       docs/assets/social-preview.png with:
+       rsvg-convert -w 1280 -h 640 docs/assets/social-preview.svg -o docs/assets/social-preview.png
+       Palette from demo/weir.css. -->
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8a8a8a"/>
+    </marker>
+    <marker id="arrow-green" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="24" markerHeight="24" markerUnits="userSpaceOnUse" orient="auto">
+      <path d="M0,0 L10,5 L0,10 z" fill="#4ade80"/>
+    </marker>
+  </defs>
+  <rect width="1280" height="640" fill="#141414"/>
+  <rect x="0" y="0" width="1280" height="6" fill="#38bdf8"/>
+
+  <text x="96" y="150" font-family="Menlo, monospace" font-size="96" font-weight="700" fill="#f0f0f0">weir</text>
+  <text x="96" y="222" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-size="44" font-weight="600" fill="#f0f0f0">Stop doing one INSERT per event.</text>
+  <text x="96" y="272" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-size="27" fill="#c0c0c0">A durable write buffer: an ack once the record is on local disk,</text>
+  <text x="96" y="308" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-size="27" fill="#c0c0c0">then N writes become one commit to your database.</text>
+
+  <!-- app: many small writes -->
+  <rect x="96" y="380" width="180" height="120" rx="10" fill="#1c1c1c" stroke="#2a2a2a" stroke-width="2"/>
+  <text x="186" y="447" text-anchor="middle" font-family="Menlo, monospace" font-size="26" fill="#c0c0c0">your app</text>
+  <g stroke="#8a8a8a" stroke-width="2.5" marker-end="url(#arrow)">
+    <line x1="284" y1="404" x2="420" y2="404"/>
+    <line x1="284" y1="428" x2="420" y2="428"/>
+    <line x1="284" y1="452" x2="420" y2="452"/>
+    <line x1="284" y1="476" x2="420" y2="476"/>
+  </g>
+
+  <!-- weir: the WAB -->
+  <rect x="430" y="370" width="300" height="140" rx="10" fill="#1c1c1c" stroke="#38bdf8" stroke-width="2.5"/>
+  <text x="580" y="428" text-anchor="middle" font-family="Menlo, monospace" font-size="30" font-weight="700" fill="#38bdf8">weir</text>
+  <text x="580" y="466" text-anchor="middle" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-size="20" fill="#8a8a8a">fsync'd write-ahead buffer</text>
+  <text x="580" y="492" text-anchor="middle" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-size="20" fill="#8a8a8a">crash replay · dead-letter</text>
+
+  <!-- one batched commit -->
+  <line x1="740" y1="440" x2="902" y2="440" stroke="#4ade80" stroke-width="6" marker-end="url(#arrow-green)"/>
+  <text x="815" y="418" text-anchor="middle" font-family="Menlo, monospace" font-size="20" fill="#4ade80">1 commit</text>
+
+  <rect x="910" y="380" width="274" height="120" rx="10" fill="#1c1c1c" stroke="#2a2a2a" stroke-width="2"/>
+  <text x="1047" y="432" text-anchor="middle" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-size="22" fill="#c0c0c0">Postgres · MySQL</text>
+  <text x="1047" y="464" text-anchor="middle" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-size="22" fill="#c0c0c0">ClickHouse · S3 · HTTP</text>
+
+  <text x="96" y="580" font-family="Helvetica Neue, Helvetica, Arial, sans-serif" font-size="24" fill="#8a8a8a">5,311 simulated power cuts · 42,814,591 acked Durable records · <tspan fill="#4ade80" font-weight="600">none lost</tspan></text>
+  <text x="1184" y="580" text-anchor="end" font-family="Menlo, monospace" font-size="22" fill="#4e4e4e">Rust · Apache-2.0</text>
+</svg>

@@ -7,7 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-keywords = ["weir", "audit", "integrity", "hash-chain", "tamper-evident"]
+keywords = ["tamper-evident", "hash-chain", "audit-log", "integrity", "audit"]
 categories = ["cryptography", "filesystem"]
 
 [dependencies]
