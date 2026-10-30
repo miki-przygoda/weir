@@ -137,10 +137,9 @@ framework into weir-core stands — that reinvents Prometheus (a TSDB) and Grafa
 so it plugs into the whole ecosystem for free. Two kernels of the user's idea are
 worth revisiting later:
 
-- **Built-in status page** — a tiny, read-only "am I healthy" HTML/text view off
-  the existing metrics (e.g. a `/status` route or a `weir-ctl status` TUI), for
-  `cargo install` users who don't run Prometheus/Grafana. Small, optional,
-  **not** a framework — Phase 5 polish, not a monitoring platform.
+- ~~**Built-in status page**~~ — **SHIPPED in 4.1.0** as the `/status` route
+  and `weir-ctl status`, alongside `/livez`, `/readyz` and `/startupz` (see
+  [monitoring](../monitoring.md)).
 - **Data tap / firehose** — a live *stream of the records themselves* flowing
   through the buffer (vs health metrics): an SSE/WebSocket endpoint or a fan-out
   `tap` sink to observe buffered data in real time. A genuine product feature,
@@ -148,14 +147,20 @@ worth revisiting later:
 - **TLS-failure chaos scenario** — the monitoring stack's `chaos` profile already
   demonstrates dead-letter, degraded-sink, and peer-UID-rejection panels lighting
   up under real faults (`deploy/monitoring/`, opt-in `--profile chaos`). The one
-  gap is **TLS handshake failures / cert reloads**: those metrics are gated behind
-  the `tls` build feature (absent from the default image), so the panel renders a
-  clean `0` for now. Phase 5: ship a `--features tls` chaos image + a bad-cert
-  probe so that panel earns its place too. The chaos harness (failmock + a
+  gap is **TLS handshake failures / cert reloads**. The image has built with
+  `--features tls` since 2.0.3; what the chaos profile lacks is the runtime
+  config (`tcp_bind` and the three `tls_*` cert paths) and a bad-cert probe, so
+  the panel renders a clean `0` for now. The chaos harness (failmock + a
   mismatched-uid probe + a tight dead-letter cap) is the reusable foundation —
   a TLS probe drops straight into it.
 
-## Publish readiness (Phase 5 — crates.io + public repo)
+## ~~Publish readiness (Phase 5 — crates.io + public repo)~~ — DONE
+
+Every library crate is on crates.io and the repository is public. The current
+publish order and procedure live in [`RELEASING.md`](../../RELEASING.md); the
+notes below are the pre-1.0 reasoning and their crate list predates `weir-wab`,
+`weir-status`, `weir-attest` and `weir-sink-s3`.
+
 
 Confirmed weir publishes fine as a "thick" multi-crate workspace:
 - **Size is a non-issue** — crates.io's ~10 MiB per-crate *source* tarball limit

@@ -1,5 +1,11 @@
 # Exploration: Deterministic Simulation Testing (DST) Harness for weir
 
+> **Historical.** Written in June 2026 for weir v0.8–v1.0 and kept as a record of
+> the reasoning. Much of it has since changed: the `Sync` tier is now `Durable`, and
+> deterministic simulation testing, the S3 sink, `SinkBatch`, WAB compression and the
+> health and `/status` routes have shipped. For how weir works today, read
+> [architecture](../architecture.md), [monitoring](../monitoring.md) and [configuration](../operations/configuration.md).
+
 **Status:** Exploration — research + proposal only. No implementation.
 **Scope:** Harness architecture. Fault/scenario catalog is handled by a sibling document.
 **Pairing:** This document focuses on *how to get to determinism*; the fault catalog covers *what to test once there*.

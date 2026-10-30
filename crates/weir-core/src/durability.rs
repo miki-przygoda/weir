@@ -62,20 +62,20 @@ pub enum Durability {
     /// dm-flakey, 604,485,602 acknowledged records
     /// (`docs/benchmarks/chaos-phase2/2026-08-28-first-power-loss-measurement.md`).
     ///
-    /// Loss is **uniformly distributed between zero and one writeback
-    /// interval** — a power cut lands at a random point in a periodic
-    /// writeback cycle, so what has not yet reached the platter is uniform
-    /// between "just flushed" and "about to flush". The ceiling, not the mean,
-    /// is what characterises the tier.
+    /// Loss is **uniformly distributed between zero and a ceiling**. The
+    /// ceiling, not the mean, is what characterises the tier.
     ///
-    /// On that hardware, at ~72,000 records/s, the ceiling was **1.76 seconds
-    /// of acknowledged writes** (126,782 records) with a median of 0.89 s.
+    /// On that hardware the ceiling was **126,782 records** (~32.5 MB of
+    /// 256-byte records), with a median of 63,790.
     ///
-    /// What generalises is the *shape*: the bound is one writeback interval of
-    /// whatever your throughput is, and it does not grow with uptime, queue
-    /// depth, or how long the process has been running. The specific figures
-    /// are a property of that filesystem, its mount options and that record
-    /// rate — measure your own if the number matters to you.
+    /// The ceiling is a quantity of **bytes**, not of records or of seconds.
+    /// A run at 1.45x the throughput lost the same amount in less time, and a
+    /// record-size sweep found the record ceiling moving 17x between 64-byte
+    /// and 1024-byte records while the byte ceiling stayed within ±7% of
+    /// ~30 MB (`docs/benchmarks/chaos-phase2/2026-09-27-buffered-ceiling-is-bytes.md`).
+    /// It did not grow with uptime or queue depth. What sets it is not yet
+    /// established (every run held 4 shards and 8 MiB segments), so measure
+    /// your own configuration if the number matters to you.
     ///
     /// # WAB compression raises this materially
     ///

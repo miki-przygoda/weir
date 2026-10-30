@@ -1,5 +1,11 @@
 # Drain subsystem — adversarial verification (sweep 2026-06-14)
 
+> **Historical.** Written in June 2026 for weir v0.8–v1.0 and kept as a record of
+> the reasoning. Much of it has since changed: the `Sync` tier is now `Durable`, and
+> deterministic simulation testing, the S3 sink, `SinkBatch`, WAB compression and the
+> health and `/status` routes have shipped. For how weir works today, read
+> [architecture](../../../architecture.md), [monitoring](../../../monitoring.md) and [configuration](../../../operations/configuration.md).
+
 Verified 11 findings against the code on `v1/phase-4-cleanup`: 10 confirmed real (1 high, 4 medium, 5 low) and 1 confirmed real but with a partially-overstated cross-restart claim; none fully refuted. The most serious is an at-least-once accounting gap (#1) and a hard livelock/poison pair (#2, #3).
 
 ## Confirmed (real)

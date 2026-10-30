@@ -1,6 +1,12 @@
 # Codebase sweep — findings & fixes (2026-06-14 → 15)
 
-> Output of the Max-tier multi-agent sweep (orthogonal lens + independent subsystem sweeps, completeness critic, per-finding adversarial verification). Plan: [`PLAN.md`](PLAN.md). Per-subsystem detail: [`subsystems/`](subsystems/). Raw data: `findings.json`. Every fix is its own commit (grep the log for `[Fxx]`), gated (fmt + clippy -D warnings + tests; DST 300-seed where durability-adjacent).
+> **Historical.** Written in June 2026 for weir v0.8–v1.0 and kept as a record of
+> the reasoning. Much of it has since changed: the `Sync` tier is now `Durable`, and
+> deterministic simulation testing, the S3 sink, `SinkBatch`, WAB compression and the
+> health and `/status` routes have shipped. For how weir works today, read
+> [architecture](../../architecture.md), [monitoring](../../monitoring.md) and [configuration](../../operations/configuration.md).
+
+> Output of the Max-tier multi-agent sweep (orthogonal lens + independent subsystem sweeps, completeness critic, per-finding adversarial verification). (Its plan file was never committed.) Per-subsystem detail: [`subsystems/`](subsystems/). Raw data: `findings.json`. Every fix is its own commit (grep the log for `[Fxx]`), gated (fmt + clippy -D warnings + tests; DST 300-seed where durability-adjacent).
 
 ## TL;DR
 

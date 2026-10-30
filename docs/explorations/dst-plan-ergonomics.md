@@ -1,5 +1,11 @@
 # DST Ergonomics Plan — Author-Facing API, Seed Replay, Invariant Checking, Shrinking, and CI
 
+> **Historical.** Written in June 2026 for weir v0.8–v1.0 and kept as a record of
+> the reasoning. Much of it has since changed: the `Sync` tier is now `Durable`, and
+> deterministic simulation testing, the S3 sink, `SinkBatch`, WAB compression and the
+> health and `/status` routes have shipped. For how weir works today, read
+> [architecture](../architecture.md), [monitoring](../monitoring.md) and [configuration](../operations/configuration.md).
+
 > **Status:** Exploration / Design Proposal.  
 > **Scope:** How a test *author* writes, runs, and debugs DST tests for the WAB.
 > Architecture foundation is already defined in `phase4-dst-harness.md`

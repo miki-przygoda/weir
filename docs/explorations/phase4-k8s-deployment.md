@@ -1,5 +1,14 @@
 # Phase 4 Exploration — Kubernetes Deployment & Packaging
 
+> **Historical, and superseded for Kubernetes.** Written in June 2026 for weir 0.8.
+> Several of its premises are now false: the image builds with `--features tls`
+> (since 2.0.3); weir serves `/livez`, `/readyz` and `/startupz`, so probes don't
+> need a TCP connect to the metrics port; TLS reload no longer goes through
+> `spawn_tls_reload_task`; and the `Sync` tier is now `Durable`. A second daemon on
+> one `wab_dir` is now refused by a lock (exit 1, or exit 3 if ownership is lost),
+> which makes one PVC per pod a hard requirement. Read it for the storage and
+> shutdown reasoning, not for the probe or image details.
+
 **Status:** exploration only — no code committed  
 **Branch context:** `v1/phase-3-performance` (→ 0.8.0)  
 **Author context:** weir is a durable write-buffer daemon; the WAB (write-ahead buffer) is on-disk and fsync-bound. Every decision in this doc flows from that fact.

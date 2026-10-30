@@ -1,5 +1,11 @@
 # Socket subsystem audit — sweep 2026-06-14
 
+> **Historical.** Written in June 2026 for weir v0.8–v1.0 and kept as a record of
+> the reasoning. Much of it has since changed: the `Sync` tier is now `Durable`, and
+> deterministic simulation testing, the S3 sink, `SinkBatch`, WAB compression and the
+> health and `/status` routes have shipped. For how weir works today, read
+> [architecture](../../../architecture.md), [monitoring](../../../monitoring.md) and [configuration](../../../operations/configuration.md).
+
 All six reported findings were verified against the code and confirmed **real**; severities largely hold, with two semantic/robustness items that are genuine but narrow.
 
 ## Confirmed (real)

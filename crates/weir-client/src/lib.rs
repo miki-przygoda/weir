@@ -16,6 +16,8 @@
 //!
 //! [`push`](WeirClient::push) is synchronous: it sends one frame and blocks for
 //! the ack before returning, so one connection carries one record at a time.
+//! [`push_batch`](WeirClient::push_batch) sends many records in one frame and
+//! gets one bitmap reply.
 //! What that costs depends on the tier, and the two are bounded by different
 //! things:
 //!
@@ -45,10 +47,9 @@
 //! **A pooled client needs no protocol change at all** — the wire protocol
 //! already permits several frames in flight on one connection, and fanning out
 //! across connections is measurable today: roughly 5× on `Buffered` at 16
-//! connections and 9× on `Durable` at 48. A built-in batched-push *frame* is the
-//! part that needs new wire machinery. An earlier version of this paragraph
-//! attributed the protocol cost to both and so steered readers away from the one
-//! option that already works.
+//! connections and 9× on `Durable` at 48. The other way to go faster is
+//! [`push_batch`](WeirClient::push_batch), which amortises the round trip and
+//! the ack across many records on one connection.
 //!
 //! # Example
 //!

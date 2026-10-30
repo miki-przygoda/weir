@@ -143,15 +143,18 @@ raising throughput 1.45x:
 Throughput rose 45% and the record ceiling did not move, so **the ceiling is a
 quantity of data and the duration is throughput-specific**. A sizing rule of the
 form "budget for 1.76 s of acked writes" is wrong for any producer faster than
-this one; budget records. The uniform shape holds in both runs (mean within 0.9%
+this one. A later sweep found it is not records either but bytes (below). The uniform shape holds in both runs (mean within 0.9%
 of `max/2` in the batched run).
 
-**Still open: records or bytes.** Both runs used 256-byte records, so the two are
-proportional and indistinguishable here. 123,664 × 256 B ≈ 31.7 MB, which has the
-shape of a dirty-page-cache limit, and the zstd comparison below points the same
-way — compression roughly tripled the record exposure, which is what a fixed byte
-budget predicts once each record costs a third as many bytes. A record-size sweep
-would settle it.
+**Records or bytes: bytes.** Both runs used 256-byte records, so the two are
+proportional and indistinguishable here (123,664 × 256 B ≈ 31.7 MB). The
+zstd comparison below pointed at bytes: compression roughly tripled the record
+exposure, which is what a fixed byte budget predicts once each record costs a
+third as many bytes. The [record-size sweep](2026-09-27-buffered-ceiling-is-bytes.md)
+settled it: at 64 B and 1024 B the record ceilings were 461,956 and 27,084, a 17x
+spread, while the byte ceilings stayed within ±7% of ~30 MB. What sets the ~30 MB
+is not yet established; the kernel's dirty-page thresholds on this box are about
+100x too large to be it.
 
 Two episodes lost precisely zero while the canary still read `bit`: the fault
 fired and there simply happened to be nothing dirty. Those two are why a

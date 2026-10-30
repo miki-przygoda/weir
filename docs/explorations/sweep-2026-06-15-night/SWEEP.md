@@ -1,5 +1,11 @@
 # Pre-1.0 night sweep — findings & dispositions (2026-06-15)
 
+> **Historical.** Written in June 2026 for weir v0.8–v1.0 and kept as a record of
+> the reasoning. Much of it has since changed: the `Sync` tier is now `Durable`, and
+> deterministic simulation testing, the S3 sink, `SinkBatch`, WAB compression and the
+> health and `/status` routes have shipped. For how weir works today, read
+> [architecture](../../architecture.md), [monitoring](../../monitoring.md) and [configuration](../../operations/configuration.md).
+
 > Fifth and final review pass before public 1.0, on branch `v1/phase-5-sweep` (stacked off `v1/phase-4-cleanup`; PR #20 untouched). Covered *differently* from the prior four file/subsystem/lens passes: **by invariant × fault** (correctness) and **by public-readiness**, plus adversarial security and a test-coverage/security-by-design track. 16 find agents (waved), adversarial refute-by-default verification, the prior ~80 F\*/G\* findings as an ignore-list.
 
 **46 confirmed real** (47 raw, 1 refuted). Severity: 5 high, 10 medium, 26 low, 5 info. Fix-risk: 39 safe, 7 moderate.

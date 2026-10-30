@@ -1,5 +1,11 @@
 # Test-coverage sweep — findings & dispositions (2026-06-16)
 
+> **Historical.** Written in June 2026 for weir v0.8–v1.0 and kept as a record of
+> the reasoning. Much of it has since changed: the `Sync` tier is now `Durable`, and
+> deterministic simulation testing, the S3 sink, `SinkBatch`, WAB compression and the
+> health and `/status` routes have shipped. For how weir works today, read
+> [architecture](../../architecture.md), [monitoring](../../monitoring.md) and [configuration](../../operations/configuration.md).
+
 > Focused 8-agent test-coverage sweep on `v1/phase-5-sweep` (5 subsystem + 2
 > invariant/property agents + completeness critic), with adversarial verification
 > rejecting anything already-covered, tautological, or flaky. Goal: pin

@@ -4,7 +4,7 @@
 > The daemon listens on a Unix socket and serves Prometheus metrics
 > on `127.0.0.1:9185`. With no sink configured, records are accepted,
 > acked, and drained to the built-in no-op sink (nothing downstream);
-> configure a sink (HTTP / MySQL / Postgres / ClickHouse) to forward them.
+> configure a sink (HTTP / MySQL / Postgres / ClickHouse / S3) to forward them.
 
 This guide gets you to a running weir daemon in under five minutes,
 then walks through pushing your first record and reading the

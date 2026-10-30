@@ -1,5 +1,11 @@
 # Subsystem audit: client / sink-sdk / ctl
 
+> **Historical.** Written in June 2026 for weir v0.8–v1.0 and kept as a record of
+> the reasoning. Much of it has since changed: the `Sync` tier is now `Durable`, and
+> deterministic simulation testing, the S3 sink, `SinkBatch`, WAB compression and the
+> health and `/status` routes have shipped. For how weir works today, read
+> [architecture](../../../architecture.md), [monitoring](../../../monitoring.md) and [configuration](../../../operations/configuration.md).
+
 All 8 findings verified against code: 7 confirmed real (1 with severity adjusted down), 1 doc finding confirmed. None refuted — every cited defect reproduces in the source.
 
 ## Confirmed (real)
