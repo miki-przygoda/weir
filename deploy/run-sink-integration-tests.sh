@@ -77,7 +77,9 @@ trap cleanup EXIT INT TERM
 
 wait_for_healthy() {
     local service="$1"
-    local max_seconds=120
+    # Longer than mysql's healthcheck start_period (120s, see the compose
+    # file), so a slow first start reaches `healthy` instead of this timeout.
+    local max_seconds=240
     local elapsed=0
     info "waiting for $service to become healthy (timeout: ${max_seconds}s)"
     while [ $elapsed -lt $max_seconds ]; do
