@@ -37,7 +37,12 @@ batch_deadline_ms = 2
 wab_segment_max_bytes = 8388608
 
 [storage]
-size_mb = 2048
+# 16 GiB, matching powerloss-batch-buffered.toml. Run 1813189325188119 filled a
+# 2 GiB device after 1,189 episodes: batching raises ingest ~25x while the sink
+# drain does not keep up, so unconfirmed WAB segments accumulate at ~1.7 MiB per
+# episode. 16 GiB clears the 3,000-episode ceiling. Device size does not change
+# what a power cut can lose, only whether the run survives long enough to finish.
+size_mb = 16384
 dm_target = "flakey"
 
 [faults]
