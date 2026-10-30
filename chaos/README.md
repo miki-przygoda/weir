@@ -161,11 +161,15 @@ does each record get its own row, do the invariants hold across a kill) and
 [`schedules/powerloss-batch.toml`](schedules/powerloss-batch.toml) (the
 durability run).
 
-**Result so far (2026-09-26, pre-4.0.1 code): 1,189 completed batched `Durable`
-power cuts, 239,069,696 acked records, 0 violations, canary `bit` on every cut,
-duplicate ratio 1.062.** A 1,190th episode filled the 2 GiB test device, and the
-oracle counted the records weir had refused to truncate as lost. The episode is
-excluded, the run has no final pass, and a rerun on current code is still owed.
+**Result: 1,968 completed batched `Durable` power cuts, 0 violations, canary
+`bit` on every cut.** The rerun on 4.1 `main` (2026-10-30, 16 GiB device, 5 h):
+779 cuts, 64,712,499 acked records, duplicate ratio 1.053, and a final pass at
+zero slack that passed. Its one anomaly (episode 517) was the quiescence check
+requiring `stranded_total == resumed_total` exactly, after a recovery-edge
+rescan over-counted `resumed` as the metric documents; the records were
+accounted for. The first run (2026-09-26, pre-4.0.1 code): 1,189 cuts,
+239,069,696 acked, duplicate ratio 1.062; its 1,190th episode filled a 2 GiB
+device and is excluded.
 Write-up:
 [`2026-09-26-batched-durable-power-loss.md`](../docs/benchmarks/chaos-phase2/2026-09-26-batched-durable-power-loss.md).
 
