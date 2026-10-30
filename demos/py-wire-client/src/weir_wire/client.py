@@ -54,6 +54,7 @@ class NackError(WeirError):
             NackReason.EMPTY_PAYLOAD,
             NackReason.UNKNOWN_MESSAGE,
             NackReason.RESERVED_FLAGS_SET,
+            NackReason.BAD_BATCH_FRAMING,
         }
         self.retryable = reason_byte == NackReason.INTERNAL_ERROR or reason_byte not in {
             r.value for r in permanent

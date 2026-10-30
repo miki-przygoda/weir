@@ -121,6 +121,7 @@ const (
 	NackEmptyPayload    NackReason = 0x07
 	NackUnknownMessage  NackReason = 0x08
 	NackReservedFlags   NackReason = 0x09
+	NackBadBatchFraming NackReason = 0x0B // 0x0A is unassigned
 )
 
 func (r NackReason) String() string {
@@ -143,8 +144,10 @@ func (r NackReason) String() string {
 		return "UnknownMessage"
 	case NackReservedFlags:
 		return "ReservedFlagsSet"
+	case NackBadBatchFraming:
+		return "BadBatchFraming"
 	default:
-		// 0x0A..0xFF reserved: surface the raw byte (spec line 77-79).
+		// 0x0A and 0x0C..0xFF reserved: surface the raw byte (spec line 77-79).
 		return fmt.Sprintf("Reserved(0x%02x)", uint8(r))
 	}
 }

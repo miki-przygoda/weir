@@ -168,7 +168,7 @@ public final class Wire {
 
     /**
      * Nack reason bytes (see spec "Nack payload format" table). Reasons
-     * 0x0A–0xFF are reserved; an unrecognised reason is surfaced as its raw
+     * 0x0A and 0x0C–0xFF are reserved; an unrecognised reason is surfaced as its raw
      * byte rather than mapped here.
      */
     public enum NackReason {
@@ -180,7 +180,8 @@ public final class Wire {
         INTERNAL_ERROR((byte) 0x06),
         EMPTY_PAYLOAD((byte) 0x07),
         UNKNOWN_MESSAGE((byte) 0x08),
-        RESERVED_FLAGS_SET((byte) 0x09);
+        RESERVED_FLAGS_SET((byte) 0x09),
+        BAD_BATCH_FRAMING((byte) 0x0B);
 
         public final byte code;
 

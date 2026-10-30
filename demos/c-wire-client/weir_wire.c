@@ -220,6 +220,7 @@ const char *weir_nack_reason_str(uint8_t reason) {
         case WEIR_NACK_EMPTY_PAYLOAD:     return "EmptyPayload";
         case WEIR_NACK_UNKNOWN_MESSAGE:   return "UnknownMessage";
         case WEIR_NACK_RESERVED_FLAGS:    return "ReservedFlagsSet";
+        case WEIR_NACK_BAD_BATCH_FRAMING: return "BadBatchFraming";
         default:                          return "Reserved/Unknown";
     }
 }

@@ -77,7 +77,7 @@ more (`max_response_payload`: 2 bytes for most responses, the coordinate cap for
 `payload_len + 4` more bytes and hands that single frame to `decode_frame` (it
 never feeds a multi-frame buffer to one decode call). A `Nack` surfaces as `NackError`, which decodes the first payload
 byte via `NackReason` and exposes `.retryable` (true only for `InternalError`
-and unknown reasons; the eight permanent reasons are not retryable). A
+and unknown reasons; the nine permanent reasons are not retryable). A
 mid-stream socket close raises `ConnectionClosed` ("in-flight outcome unknown;
 retry on a fresh connection").
 
@@ -117,7 +117,7 @@ kill "$(cat demos/py-wire-client/daemon.pid)"              # stop YOUR daemon
 ```
 
 `test_live.py` exercises the happy path (health check, Push at all three
-durability tiers, 50 pipelined Pushes) and every server-enforced rejection
+durability tiers, 50 pipelined Pushes) and six server-enforced rejections
 (EmptyPayload, BadPayloadCrc, BadMagic, ReservedFlagsSet, UnknownMessage,
 PayloadTooLarge), plus the connection close after a permanent Nack. Both the
 conformance and live runners self-bootstrap `sys.path` — no install step.

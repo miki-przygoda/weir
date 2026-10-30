@@ -65,7 +65,7 @@ apply to them (the C, Java and TypeScript runners take a path argument instead).
 | Project | Lang | What it is | Offline conformance | Tracked push | Batch push |
 |---------|------|------------|---------------------|---|---|
 | [`py-wire-client/`](py-wire-client/) | Python (stdlib) | From-scratch producer + codec; runnable `examples/produce.py` + `scripts/run_daemon.sh`. | `python3 tests/test_conformance.py` | ✅ `tests/test_tracked.py` | ✅ `tests/test_batch.py` |
-| [`go-wire-client/`](go-wire-client/) | Go (stdlib) | Producer + codec + a 15-case adversarial live harness (every Nack reason + connection-close). | `go test ./...` | ✅ `go test -run TestTracked` | ✅ `go test -run TestBatch` |
+| [`go-wire-client/`](go-wire-client/) | Go (stdlib) | Producer + codec + a 16-case adversarial live harness (every Nack reason but the transient `InternalError`, + connection-close). | `go test ./...` | ✅ `go test -run TestTracked` | ✅ `go test -run TestBatch` |
 | [`c-wire-client/`](c-wire-client/) | C (C11, POSIX) | Zero-dep, warning-clean (`-Wall -Wextra -Wpedantic -Wconversion`); embedded/systems angle. | `make check` | ✅ `make check-tracked` | ✅ `make check-batch` |
 | [`java-wire-client/`](java-wire-client/) | Java (JDK 21+) | Stdlib-only (`UnixDomainSocketAddress` + `CRC32`); enterprise/JVM angle. | `javac -d out $(find src -name '*.java') && java -cp out dev.weir.client.ConformanceRunner` | ✅ `TrackedConformanceRunner` | ✅ `BatchConformanceRunner` |
 | [`ts-wire-client/`](ts-wire-client/) | TypeScript/Node | Zero runtime deps; runs `.ts` on stock Node; end-to-end HTTP→wire→WAB example. | `node src/conformance.ts` | ✅ `node src/conformance_tracked.ts` | ✅ `node src/conformance_batch.ts` |

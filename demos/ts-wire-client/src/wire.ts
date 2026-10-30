@@ -66,6 +66,8 @@ export const NackReason = {
   EmptyPayload: 0x07,
   UnknownMessage: 0x08,
   ReservedFlagsSet: 0x09,
+  // 0x0A is unassigned.
+  BadBatchFraming: 0x0b,
 } as const;
 export type NackReason = (typeof NackReason)[keyof typeof NackReason];
 

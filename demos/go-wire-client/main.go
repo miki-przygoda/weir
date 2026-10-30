@@ -57,6 +57,12 @@ func main() {
 	flagsFrame := EncodeFrame(Frame{Version: WireVersion, MessageType: MsgPush, Durability: Durable, Flags: 0x01, Payload: []byte("x")})
 	add(runOnce("reserved_flags", flagsFrame, "Nack:ReservedFlagsSet", true))
 
+	// --- BadBatchFraming (0x0B): PushBatch body with an unknown batch version, closes conn ---
+	badBody := EncodeBatchBody([][]byte{[]byte("x")})
+	badBody[0] = BatchVersion + 1
+	batchFrame := EncodeFrame(Frame{Version: WireVersion, MessageType: MsgPushBatch, Durability: Durable, Flags: 0, Payload: badBody})
+	add(runOnce("bad_batch_framing", batchFrame, "Nack:BadBatchFraming", true))
+
 	// --- BadMagic (0x01): corrupt first 4 bytes, closes conn ---
 	bad := EncodePush([]byte("data"), Durable)
 	bad[0] = 'X'

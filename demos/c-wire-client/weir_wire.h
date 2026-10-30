@@ -106,8 +106,10 @@ typedef enum {
     WEIR_NACK_INTERNAL_ERROR    = 0x06,
     WEIR_NACK_EMPTY_PAYLOAD     = 0x07,
     WEIR_NACK_UNKNOWN_MESSAGE   = 0x08,
-    WEIR_NACK_RESERVED_FLAGS    = 0x09
-    /* 0x0A..0xFF reserved; surface the raw byte. */
+    WEIR_NACK_RESERVED_FLAGS    = 0x09,
+    /* 0x0A unassigned. */
+    WEIR_NACK_BAD_BATCH_FRAMING = 0x0B
+    /* 0x0C..0xFF reserved; surface the raw byte. */
 } weir_nack_reason;
 
 /* Result codes for the codec / IO helpers. */

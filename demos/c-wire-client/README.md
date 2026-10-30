@@ -66,7 +66,7 @@ by its message type (`weir_max_response_payload`: `WEIR_MAX_RESPONSE_PAYLOAD`,
 2 bytes, for most responses; the coordinate cap for `AckTracked`; the bitmap cap
 for `AckBatch`) and returns `WEIR_ERR_RESP_TOO_LARGE` past it, so a desynced peer
 can never make the client allocate an attacker-chosen buffer. Diagnostic helpers
-(`weir_nack_reason_str`, `weir_msg_type_str`, `weir_result_str`) name every byte.
+(`weir_nack_reason_str`, `weir_msg_type_str`, `weir_result_str`) name every assigned byte.
 
 ### Connection lifecycle & errors
 

@@ -110,13 +110,14 @@ go test -run TestBatch                     # batch extension only
 mkdir -p wab                               # weir-server does not create wab_dir
 weir-server --socket-path ./weir.sock --wab-dir ./wab --metrics-port 19009 &
 go build -o weir-go-client .
-./weir-go-client -socket ./weir.sock       # 15 adversarial cases, all PASS
+./weir-go-client -socket ./weir.sock       # 16 adversarial cases, all PASS
 
 # Live probes of corners the docs are quieter about (gated on WEIR_SOCKET)
 WEIR_SOCKET=./weir.sock go test -run TestProbe -v
 ```
 
-The live harness covers every Nack reason, the happy path at all three
+The live harness covers every Nack reason except the transient `InternalError`
+(which a healthy daemon cannot be made to emit on demand), the happy path at all three
 durability tiers, HealthCheck, and pipelining — including the connection-close
 semantics for permanent errors. `probe_test.go` adds live probes (short-header
 blocking, lenient HealthCheck, stream framing of trailing bytes, Ack durability
