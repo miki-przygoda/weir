@@ -1,13 +1,13 @@
 [package]
 name = "weir-status"
-description = "Status model, Conditions evaluator and probe predicates shared by the weir daemon and weir-ctl"
+description = "Status model, Conditions evaluator and probe predicates for the weir daemon's health and readiness checks"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-keywords = ["weir", "status", "health", "readiness", "monitoring"]
+keywords = ["health-check", "readiness", "status", "monitoring", "probe"]
 categories = ["development-tools::debugging"]
 
 [dependencies]

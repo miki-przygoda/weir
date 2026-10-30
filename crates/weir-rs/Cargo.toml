@@ -1,14 +1,14 @@
 [package]
 name = "weir-rs"
-description = "Durable write buffer for Rust — facade re-exporting the weir-* libraries"
+description = "Durable write buffer: ack each record after a local fsync, commit them to your database in batches. Facade over the weir-* libraries"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-keywords = ["durability", "write-buffer", "wal", "ingestion", "buffer"]
-categories = ["database", "network-programming"]
+keywords = ["write-ahead-log", "wal", "durability", "batching", "ingestion"]
+categories = ["database", "network-programming", "asynchronous"]
 
 [package.metadata.docs.rs]
 all-features = true

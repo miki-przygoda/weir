@@ -1,6 +1,6 @@
 [book]
 title = "weir"
-description = "A durable, high-throughput write buffer for Rust."
+description = "weir: a durable write buffer for Rust. Ack each record after a local fsync, commit them to Postgres, MySQL, ClickHouse or S3 in batches."
 authors = ["weir contributors"]
 src = "docs"
 language = "en"

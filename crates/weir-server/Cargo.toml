@@ -36,15 +36,15 @@ test-hooks = []
 
 [package]
 name = "weir-server"
-description = "The weir daemon"
+description = "Durable write buffer daemon: fsync'd acks over a local socket, batched commits to Postgres, MySQL, ClickHouse, HTTP or S3, crash replay"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-keywords = ["durability", "write-buffer", "wal", "daemon", "ingestion"]
-categories = ["database", "network-programming", "asynchronous"]
+keywords = ["write-ahead-log", "batch-insert", "store-and-forward", "clickhouse", "postgres"]
+categories = ["database", "network-programming", "asynchronous", "command-line-utilities"]
 
 [package.metadata.docs.rs]
 all-features = true

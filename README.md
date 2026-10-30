@@ -1,275 +1,236 @@
+<div align="center">
+
 # weir
 
+**Stop doing one INSERT per event.**
+
+A durable write buffer daemon. Your app gets an ack once a record is on local
+disk; weir commits records to your database in batches and replays them after a
+crash.
+
 [![CI](https://github.com/miki-przygoda/weir/actions/workflows/ci.yml/badge.svg)](https://github.com/miki-przygoda/weir/actions/workflows/ci.yml)
-[![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](Cargo.toml)
 [![crates.io](https://img.shields.io/crates/v/weir-server.svg?label=weir-server)](https://crates.io/crates/weir-server)
-[![docs.rs](https://img.shields.io/docsrs/weir-rs?label=docs.rs%2Fweir-rs)](https://docs.rs/weir-rs)
+[![docs.rs](https://img.shields.io/badge/docs.rs-weir--rs-blue?logo=docsdotrs)](https://docs.rs/weir-rs)
+[![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](Cargo.toml)
+[![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-A durable, high-throughput write buffer for Rust.
+[Documentation](https://miki-przygoda.github.io/weir/) ·
+[Quickstart](docs/getting-started/quickstart.md) ·
+[Live demo](https://www.mikolaj-mikuliszyn.dev/demo/weir) ·
+[Comparisons](docs/comparisons/README.md) ·
+[Changelog](CHANGELOG.md)
 
-**Fire a record at a local socket, get a durable ack in microseconds, and let
-your database catch up in bulk.** weir writes each record to a CRC32-checksummed
-write-ahead buffer, fsyncs it according to the durability tier you ask for, acks
-the producer, then drains records to your sink in batches — turning N per-record
-commits into 1. **At the `Durable` tier an ack is never a false ack:** an acked
-record is on disk and replays after a crash. (`Buffered` acks before the fsync
-and deliberately trades that away — the tier is a per-record choice, so one
-connection can mix them.)
+</div>
 
-**Durability, measured:** 5,311 simulated power cuts, 42,814,591 acknowledged
-records at the durable tier, **none lost** — and, in the same runs, `Buffered`
-loss measured as uniform between zero and a ceiling of **~30 MB of acked
-records** (~124,000 at 256 bytes each; the ceiling is bytes, so it is not a
-number of records or of seconds, and what sets it is not yet established)
-([method and results](docs/benchmarks/chaos-phase2/2026-08-28-first-power-loss-measurement.md),
-[the ceiling in bytes](docs/benchmarks/chaos-phase2/2026-09-27-buffered-ceiling-is-bytes.md);
-real kernel power cuts on Linux, which is the platform the guarantee is claimed
-for — see [platform support](docs/platform-support.md#durability-by-platform)) ·
-6 built-in sinks (4 in a default build; `clickhouse` and `s3` opt-in) ·
-wire format + Rust API under SemVer
+---
 
-*Latency and throughput figures are deliberately not quoted here. Every published
-run — 4.1.0 as of 2026-10-26
-([`docs/benchmarks/latest.md`](docs/benchmarks/latest.md),
-[`history.md`](docs/benchmarks/history.md)) — is on a 2-vCPU shared CI runner (and
-the 25–26 Oct runs had the WAB on tmpfs, so their `Durable` figures include no
-fsync at all: see [`docs/benchmarks.md`](docs/benchmarks.md#headline-numbers-latest-ci-run)), and
-this project's own rule is that external performance claims cite an operator-run
-capture on named hardware, with the storage and its fsync primitive disclosed
-([`environments.md`](docs/benchmarks/environments.md#what-an-external-claim-may-cite)). The "microseconds" above is the fsync:
-a `Durable` ack is one fsync, so it is your disk's number, not weir's. Measured
-single-thread `Durable` p50 is ~133–152 µs on a Mac NVMe — where the primitive is
-macOS `F_BARRIERFSYNC`, a barrier rather than a full flush — and **~1.4–1.5 ms** on a
-SATA SSD with an honest Linux `fdatasync`
-([comparison](docs/benchmarks/snapshot-2026-06-13-comparison.md) measured 1.5 ms;
-[phase 3](docs/benchmarks/phase3-results.md) measured 1.4 ms on the same box —
-the spread is the storage, not the software). **Those are rested-disk figures.**
-Under sustained load on that same SATA SSD the fsync alternates between ~1.2 ms
-and ~5.6 ms on a ~4.5 minute cycle, spending 76% of the time in the slow state,
-which puts one producer's sustained `Durable` throughput at about 40% of its
-short-run figure — see
-[`sustained-load.md`](docs/benchmarks/sustained-load.md), which also shows the
-effect is the storage rather than weir. Measure on
-your own hardware: `cargo test -p weir-server --test load --release -- --nocapture`.*
+Writing every event straight to the database is slow, and holding events in
+memory loses them on a crash. weir sits between the two: a small daemon on the
+same host as your application that makes each write durable locally, acks it,
+and turns many writes into one commit downstream.
 
-**▶ [Try the demo](https://www.mikolaj-mikuliszyn.dev/demo/weir)** — a self-contained, browser-only
-simulation of the pipeline: push records, flip the durability tier, crash the
-daemon mid-flight, and watch unconfirmed segments replay, side by side with a
-naive insert-per-record baseline. No build step — open `demo/index.html` in any
-browser, or use the hosted copy linked above.
+```mermaid
+flowchart LR
+    app["your app"] -- "push" --> weir["weir<br/>write-ahead buffer<br/>on local disk"]
+    weir -. "ack after fsync" .-> app
+    weir -- "one batched commit" --> sink[("Postgres · MySQL<br/>ClickHouse · S3 · HTTP")]
+```
 
-> **Status — 4.1 (stable), published at 4.1.0.** The wire protocol and public Rust API (`weir-core`,
-> `weir-client`, `weir-sink-sdk`, `weir-wab`) are under
-> [Semantic Versioning](https://semver.org/), with a
-> [language-neutral conformance suite](docs/conformance.md) pinning the wire
-> format for non-Rust implementers. The WAB on-disk format is stable and
-> unconfirmed segments replay on restart. Built-in sinks: `noop`, `http`,
-> `mysql`, `postgres` in the default build, plus `clickhouse` and `s3` behind
-> the opt-in `clickhouse-sink` and `s3-sink` Cargo features (see [Crates](#crates) and the
-> [configuration reference](docs/operations/configuration.md)). WAB flusher and
-> drain threads are panic-supervised. Published on crates.io.
->
-> **The wire protocol has not broken since 1.0** — `WIRE_VERSION` is still `1`,
-> and a 1.x producer still works against a 4.x daemon without recompiling. Every
-> major so far has broken the Rust API instead; see
-> [`CHANGELOG.md`](CHANGELOG.md) for each one's break list.
+## Highlights
 
-## How it works
-
-Producers write records to the `weir` daemon over a Unix domain socket (or
-TCP + mutual TLS). The daemon validates each record, writes it to the
-CRC32-checksummed Write-Ahead Buffer, fsyncs per the durability tier, acks the
-producer, and asynchronously drains batches to a `Sink`. WAB segments are not
-reclaimed until the sink confirms the batch; on restart, unconfirmed segments
-are replayed automatically.
+- **An ack is never a false ack.** At the `Durable` tier the ack waits for a
+  local fsync, and an acked record is delivered even if the machine loses power
+  immediately afterwards. Tested with 5,311 simulated power cuts:
+  42,814,591 acked records, none lost.
+- **Choose the cost per record.** `Buffered` acks before the fsync for a p50 of
+  19 µs, against 1.1 ms for `Durable`. It survives a process crash but can lose
+  up to ~30 MB of acked records on power loss.
+- **Your database can be down.** Records keep buffering on disk and drain when
+  it returns. Batches the sink rejects go to a dead-letter directory that
+  `weir-ctl` can list, drop or requeue.
+- **No broker to operate.** One binary per host. Clients for Rust, Python, Go,
+  C, Java and TypeScript, plus language-neutral
+  [conformance vectors](docs/conformance.md) for writing your own.
+- **Observable.** `/livez`, `/readyz` and `/startupz` probes, a `/status`
+  document and Prometheus metrics, with
+  [alerts and a Grafana dashboard](docs/monitoring.md).
 
 ## Quickstart
 
-> **The daemon is Unix-only** (Linux or macOS). A Windows producer talks to it
-> over the [TCP + mutual-TLS listener](docs/operations/tcp-mtls.md) using
-> `weir-client`; there is no Windows `weir-server`. Full matrix, including what
-> is untested, in [Platform support](docs/platform-support.md).
+Install the daemon and the admin CLI, or use the
+[container image](docs/getting-started/install.md):
 
 ```bash
-cargo build --release -p weir-server
+cargo install weir-server weir-ctl
+```
+
+Start it with a sink:
+
+```bash
 mkdir -p /tmp/weir/wab /tmp/weir/run && chmod 0700 /tmp/weir/run
-./target/release/weir-server \
+weir-server \
     --wab-dir /tmp/weir/wab \
     --socket-path /tmp/weir/run/weir.sock \
     --sink-type http --sink-url https://your-endpoint.example/ingest
 ```
 
-> **Ack ≠ delivered — and the default sink discards everything.** A successful
-> push means the record is durably *buffered* on disk, not that it reached a
-> downstream. With **no `--sink-type`, the sink defaults to `noop`, which acks
-> then DISCARDS every record** (it's for soak-testing). Set `--sink-type`
-> (`http`/`mysql`/`postgres`/`clickhouse`) + `--sink-url` to actually deliver.
-> Records also only drain once a WAB segment seals, so a few small records won't
-> reach the sink until shutdown — see the quickstart.
->
-> **Two more producer gotchas:** `push()` is **blocking** — never call it directly
-> from an `async fn` (it starves the runtime; use the
-> [async bridge](docs/getting-started/integrating.md#producing-from-an-async-runtime)).
-> And `Buffered` acks *before* fsync, so it survives a process crash but **not**
-> power loss — use `Durable` for data you can't lose. The
-> [quickstart](docs/getting-started/quickstart.md#push-your-first-record) has the
-> full rundown.
+Push a record from the shell:
 
-Full walk-through, including pushing your first record: [docs/getting-started/quickstart.md](docs/getting-started/quickstart.md).
+```bash
+weir-ctl push --socket /tmp/weir/run/weir.sock 'hello, weir!'
+# ack  12 bytes, Durable
+```
 
-## Documentation
+Or from Rust, with `weir-client = "4.1"`:
 
-Start at [`docs/`](docs/) — the docs landing page is the recommended
-entry point. The structure:
+```rust
+use weir_client::{Durability, WeirClient};
 
-| Section            | What's there                                                              |
-|--------------------|---------------------------------------------------------------------------|
-| **Getting started**| [install](docs/getting-started/install.md), [quickstart](docs/getting-started/quickstart.md) |
-| **Operations**     | [configuration reference](docs/operations/configuration.md) (every option, default, range, tuning notes), [TCP + mutual TLS](docs/operations/tcp-mtls.md), [monitoring](docs/monitoring.md) (health endpoints, the `/status` document and Conditions, Prometheus metrics, alerts, Grafana) |
-| **Sinks**          | [S3 / object storage](docs/sinks/s3.md) (key scheme, IAM policy, provider notes, reading the bucket from Athena or DuckDB) |
-| **Protocol**       | [wire format](docs/wire_protocol.md), [WAB format](docs/wab_format.md), [conformance vectors](docs/conformance.md) (language-neutral test vectors for non-Rust clients) |
-| **Architecture**   | [internals](docs/architecture.md), [benchmarks](docs/benchmarks.md)       |
-| **Security**       | [threat model](docs/security/threat-model.md), [socket-bind hardening](docs/security/socket-bind.md), [container hardening](docs/security/container.md) — reporting policy at [SECURITY.md](SECURITY.md) |
-| **Testing**        | [system-test audit](docs/testing/test-audit.md) (verdicts on every system test), [sink integration suite](docs/testing/sink-integration.md) (docker-compose runner for the SQL sinks), [fuzzing](docs/testing/fuzzing.md) (`cargo-fuzz` targets for the trust-boundary parsers) |
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut client = WeirClient::connect("/tmp/weir/run/weir.sock")?;
+    client.push(b"hello, weir!", Durability::Durable)?; // returns once fsync'd
+    Ok(())
+}
+```
 
-The full version history is in [CHANGELOG.md](CHANGELOG.md).
+> [!IMPORTANT]
+> - **An ack means buffered, not delivered.** Records reach the sink when a WAB
+>   segment seals. Without `--sink-type`, the `noop` sink discards everything.
+> - **`push()` blocks.** From async code, use the
+>   [async bridge](docs/getting-started/integrating.md#producing-from-an-async-runtime).
+> - **The daemon runs on Linux and macOS.** Windows producers connect over
+>   [TCP with mutual TLS](docs/operations/tcp-mtls.md). Power-loss durability is
+>   claimed for Linux only; see [platform support](docs/platform-support.md).
 
-## Why
+The [full quickstart](docs/getting-started/quickstart.md) covers configuration
+files, sinks and the delivery details.
 
-The path between "producer wants to write a record" and "record is
-durably committed to a downstream database" is usually slow
-(synchronous insert per record, fsync per row, network round-trip) or
-unsafe (in-memory queue, lost on crash). `weir` compresses
-producer-facing latency to one local socket round-trip and one local
-fsync, while preserving end-to-end durability via the WAB, and
-amortises downstream cost via bulk drain.
+## Durability tiers
 
-**Use weir when** a high-rate producer must not block on a slow or
-flaky downstream, and must not lose records it has already been told are
-safe — even across a crash. The classic fit is "fire a record at a local
-socket, get a durable ack in microseconds, let the database catch up in
-bulk."
+The producer chooses the tier for each record.
 
-**Don't reach for weir when** you need fan-out or pub/sub (use a message
-broker), when you can already tolerate writing straight to the database
-synchronously, or when losing un-acked in-flight data on crash is
-acceptable (an in-process channel is simpler). See [Non-goals](#non-goals-v1).
+| | `Durable` | `Buffered` |
+|---|---|---|
+| Ack is sent | after the record is fsync'd | after the record is in memory |
+| Survives a process crash | yes | yes |
+| Survives power loss | **yes** | up to ~30 MB of acked records may be lost |
+| Ack latency, p50 | 1.1 ms | 19 µs |
 
-## How weir compares
+Latencies are from a [bare-metal capture](docs/benchmarks/bare-metal.md) on an
+i9-9900K with a SATA SSD. A `Durable` ack waits for one fsync, so its latency is
+your disk's, not weir's.
 
-weir fills a specific gap: a **fast, durable, local write-ahead point** in front
-of a slow or flaky downstream — typically a SQL database — that acks your
-producer in **microseconds** and then **compresses N buffered records into 1
-downstream commit**, surviving crashes by replaying unconfirmed segments. It does
-this **without running a message broker**. That niche sits between three
-well-trodden categories, and weir is deliberately *none* of them: not a broker
-(no pub/sub or fan-out — one producer stream → one sink), not embedded (a daemon,
-not a linked library), and not a database (the buffer isn't queryable).
+## How the guarantee is tested
 
-| Project | Category | Great at | Why you'd pick weir instead |
-|---|---|---|---|
-| **Kafka** / **Redpanda** | Streaming broker | Multi-consumer fan-out, replayable topics, horizontal scale | One stream → one DB without running a broker (or a Connect + JDBC sink) just to batch writes |
-| **NATS JetStream** / **NSQ** | Durable messaging | Subject/topic pub/sub, edge & realtime fan-out | A fsync-before-ack durability contract + N→1 SQL-commit delivery, not a subscribe/pull broker |
-| **Apache Pulsar** | Streaming + tiered storage | Multi-tenant, geo-replicated, millions of topics | One binary on one host, not brokers + BookKeeper |
-| **Chronicle Queue** | Embedded durable queue (JVM) | Ultra-low-latency persisted IPC inside the JVM | A language-agnostic *daemon* that also owns the drain into your database, not an in-process library you read back yourself |
-| **RocksDB** / **sled** / **bbolt** | Embedded KV store + WAL | Queryable embedded persistence inside your app | A standalone buffer that drains to a sink and reclaims itself, not a queryable store you link in |
-| **Vector** | Observability pipeline | Telemetry collection, transforms, routing with disk buffers | An application-facing durable ack + transactional N→1 commits into one SQL DB, not a general telemetry router |
-| **Fluentd** / **Fluent Bit** / **Beats** | Log shippers | Log/metric forwarding with file buffering and retries | Your producer is an application needing a durable write-ahead point in front of its DB, not a logging agent |
+- **Simulated power loss on a real kernel.** Each cut drops every write the disk
+  had not flushed, at the block layer under ext4. 5,311 cuts at the `Durable`
+  tier lost no acked record, and a canary block confirmed the fault fired every
+  time ([method and results](docs/benchmarks/chaos-phase2/2026-08-28-first-power-loss-measurement.md)).
+  The same harness measured `Buffered`'s exposure as uniform up to a ceiling of
+  about 30 MB ([write-up](docs/benchmarks/chaos-phase2/2026-09-27-buffered-ceiling-is-bytes.md)).
+- **Deterministic simulation.** The buffer's durability invariants are checked
+  under injected crash and fault schedules with replayable seeds, 300 seeds on
+  every CI run ([architecture](docs/architecture.md#testing-infrastructure)).
+- **Conformance vectors.** Canonical frames and the results a decoder must
+  produce, so a client in any language can be checked against the wire format
+  ([conformance](docs/conformance.md)).
+- **Integration tests and fuzzing.** The SQL sinks run against real MySQL,
+  Postgres and ClickHouse ([sink integration](docs/testing/sink-integration.md)),
+  and the parsers at the trust boundary are fuzzed ([fuzzing](docs/testing/fuzzing.md)).
 
-**Reach for weir when** an application produces records faster than your database
-wants to commit them, you need a **durable ack now** (not after a network
-round-trip to a broker), and you want **many records to become one transactional
-`INSERT`/commit** against MySQL, Postgres, ClickHouse, or an HTTP endpoint — from
-a single local daemon with crash-safe replay. **Reach for something else when**
-you need multiple consumers / pub/sub / fan-out (Kafka, Redpanda, NATS, Pulsar,
-NSQ), an embedded queryable store (RocksDB, sled, bbolt) or in-JVM low-latency
-queue (Chronicle Queue), or a telemetry pipeline with transforms and many
-destinations (Vector, Fluentd, Fluent Bit, Beats).
+## When to use weir
 
-**Delivery contract (read before migrating from Kafka/NATS):** delivery is
-**at-least-once** — a crash or retry can redeliver a record, so **your sink must
-dedupe** (e.g. on an `Idempotency-Key` / `ON CONFLICT`). **Ordering holds only
-within a single connection's** sequential pushes, and it is the order records
-enter the WAB, not the order the sink receives them: strands, retry cool-downs,
-parked segments, `weir-ctl` requeues and the HTTP sink's concurrent POSTs
-(`sink_http_concurrency`) can all reorder delivery. There is **no ordering across
-connections, and no per-key or global order**. And **routing/keys live in your
-payload**: the wire envelope is opaque bytes, with no topic/subject/key field —
-weir does not inspect or route on content. Details in
-[architecture](docs/architecture.md) and [integrating](docs/getting-started/integrating.md).
+**Use it when** an application produces records faster than its database wants
+to commit them. Typical cases are ClickHouse's "too many parts" from small
+inserts, an INSERT per event into Postgres or MySQL, and an edge host whose
+uplink comes and goes.
 
-*No popular project combines all three of weir's defining properties — a local
-microsecond fsync'd ack, N→1 transactional SQL-commit compression, and a
-non-broker single binary. Comparisons reflect public positioning as of June 2026,
-not benchmarks.*
+**Use something else when**
+
+- the write must be atomic with your own database transaction: use an outbox
+  table;
+- you need pub/sub, several consumers or replayable topics: use a broker such as
+  Kafka, Redpanda or NATS;
+- you need to transform and route telemetry to many destinations: use Vector or
+  Fluent Bit;
+- writing straight to the database is already fast enough.
+
+The [comparison pages](docs/comparisons/README.md) cover ClickHouse async
+inserts, Vector and Fluent Bit, and the outbox pattern in detail, with sources.
+
+## Delivery semantics
+
+- **At-least-once.** A crash or retry can deliver a record twice, so the sink
+  should deduplicate, for example with `ON CONFLICT` or an idempotency key.
+- **Ordering** holds only within one connection's sequential pushes, and only
+  as the order records enter the buffer. Retries, requeues and concurrent HTTP
+  delivery can reorder what the sink sees. There is no cross-connection or
+  per-key order.
+- **Payloads are opaque bytes.** weir does not parse, route or key on content.
+
+See [architecture](docs/architecture.md) and
+[integrating](docs/getting-started/integrating.md) for the details.
+
+## Performance
+
+A `Durable` ack costs one local fsync, so throughput and latency depend mostly
+on the disk. On a SATA SSD under sustained load the fsync alternates between
+~1.2 ms and ~5.6 ms, which [sustained-load.md](docs/benchmarks/sustained-load.md)
+traces to the storage rather than to weir. Measure on your own hardware:
+
+```bash
+cargo test -p weir-server --test load --release -- --nocapture
+```
+
+The published CI benchmarks, 4.1.0 as of 2026-10-26, run on a shared 2-vCPU
+runner and are tracked for regressions, not quoted as performance
+([benchmarks](docs/benchmarks.md)).
+
+## Project status
+
+weir is stable at 4.1. The wire protocol and the public Rust API are under
+[Semantic Versioning](https://semver.org/). The wire protocol has not changed
+since 1.0, so a 1.x producer still works against a 4.x daemon. The on-disk
+buffer format is stable, and unconfirmed segments replay on restart.
+
+Built-in sinks: `noop`, `http`, `mysql` and `postgres` in the default build,
+plus `clickhouse` and `s3` behind the `clickhouse-sink` and `s3-sink` Cargo
+features. See the [configuration reference](docs/operations/configuration.md).
 
 ## Crates
 
-| Crate           | Type       | Description                                                                                          |
-|-----------------|------------|------------------------------------------------------------------------------------------------------|
-| `weir-core`     | lib        | Wire protocol types — `Envelope`, `Header`, `Durability`, `NackReason`, `Payload`. Cross-platform.   |
-| `weir-wab`      | lib        | On-disk WAB segment format + `SegmentReader`. Shared by the daemon and `weir-ctl` (one parser) so `dl requeue` can read dead-letter segments without the daemon's dep tree. Cross-platform. |
-| `weir-status`   | lib        | The `weir.status/v1` model, Conditions evaluator and probe predicates shared by the daemon and `weir-ctl`. Pure Rust, no I/O. Cross-platform. |
-| `weir-server`   | bin + lib  | Daemon: socket layer, WAB, queue, worker pool, drain, metrics, config. **Unix only.**                |
-| `weir-client`   | lib        | Client library. Connects over a Unix socket (or TCP + mutual TLS), sends Push/HealthCheck frames, returns typed errors. Ships three examples (`push_simple`, `health_check`, `push_tls`). Benchmark coverage lives in `weir-server/tests/load.rs`. **The Unix-socket transport is Unix-only; the TCP + mutual-TLS transport is not** — since 2.0.3 `WeirClient<TlsStream>` builds on Windows too, and the `windows` CI job compiles `weir-client --features tls` there on every push. So a Windows producer talks to a Linux/macOS daemon over the [TCP + mutual-TLS listener](docs/operations/tcp-mtls.md) using this crate, rather than having to implement the [wire protocol](docs/wire_protocol.md) itself. `WeirClient::connect` (the Unix-socket constructor) remains `#[cfg(unix)]`. There is no Windows *server* build: it had no ingest path, and 2.0.5 dropped it. |
-| `weir-sink-sdk` | lib        | The `Sink` trait plus its `SinkError` / `CommitResult` contract — published standalone so you can **implement and unit-test** a custom sink against a stable API, independent of the daemon internals. *Running* a custom sink in the shipped daemon currently means building `weir-server` with your sink wired into the sink-selection path (no dynamic plugin yet — see the crate docs). |
-| `weir-sink-s3` | lib | The S3-API object-storage sink (AWS S3, MinIO, Cloudflare R2, Backblaze B2, Ceph), behind `weir-server`'s opt-in `s3-sink` feature. The first weir sink built **outside** the daemon against `weir-sink-sdk` alone — so it is also the proof that the SDK is a contract a third party can build against. See [docs/sinks/s3.md](docs/sinks/s3.md). |
-| `weir-attest`   | lib        | Per-record content-committing hash chain over sealed segments — `RecordId` plus a chain digest, driven by `weir-ctl attest`. **Detection, never prevention**: it makes tampering evident after the fact, it does not stop it, and it is not on the ack path. |
-| `weir-ctl`      | bin        | Admin CLI for a running daemon: `status` (ready / not ready / which Conditions, via the admin socket, `/status`, then metrics and disk), `reload` (TLS certs), `drain pause\|resume\|retry-stranded`, `health`, `push`, `metrics`, `segments` (per-shard WAB inspect), `dl` (dead-letter list/drop/requeue), `quarantine` (list/inspect/requeue) and `attest` (seal/verify/head over a sealed segment's hash chain). **Unix only** — it drives `WeirClient::connect`, the Unix-socket constructor. Not a release artifact and not in the Docker image (which ships only `weir-server`); `cargo install weir-ctl` or build from source. |
-| `weir-rs`       | lib        | Single-crate facade: re-exports `weir-core` always, plus `client` / `sink-sdk` / `wab` behind features (`full` enables all three). Use it to depend on one crate instead of four. **Named `weir-rs`, not `weir`** — that name belongs to someone else on crates.io. |
-| `weir-testkit`  | lib (dev)  | Internal test harness (the `weir_server!` integration-test macro). Not published.                    |
+| Crate | Purpose |
+|---|---|
+| [`weir-server`](https://crates.io/crates/weir-server) | The daemon. Linux and macOS. |
+| [`weir-ctl`](https://crates.io/crates/weir-ctl) | Admin CLI: status, push, drain control, dead letters, quarantine, attestation. |
+| [`weir-client`](https://crates.io/crates/weir-client) | Rust producer client, over a Unix socket or TCP with mutual TLS. The TLS transport also builds on Windows. |
+| [`weir-rs`](https://crates.io/crates/weir-rs) | A single-crate facade over the libraries below. |
+| [`weir-core`](https://crates.io/crates/weir-core) | Wire protocol types. |
+| [`weir-sink-sdk`](https://crates.io/crates/weir-sink-sdk) | The `Sink` trait, for building and testing your own sink. |
+| [`weir-sink-s3`](https://crates.io/crates/weir-sink-s3) | The S3-compatible object storage sink (AWS S3, MinIO, R2, B2, Ceph). |
+| [`weir-wab`](https://crates.io/crates/weir-wab) | The on-disk buffer format and a segment reader. |
+| [`weir-status`](https://crates.io/crates/weir-status) | The `/status` model and its health Conditions. |
+| [`weir-attest`](https://crates.io/crates/weir-attest) | A tamper-evident hash chain over sealed segments. |
 
-These are deliberately separate so you can compose the pieces you need without
-the daemon — produce with `weir-client`, forward with a custom `weir-sink-sdk`
-sink, or read the buffer with `weir-wab`, and only depend on `weir-server` if you
-run it. See [Integrating & extending](docs/getting-started/integrating.md) for
-how, and [Architecture → Workspace & crate boundaries](docs/architecture.md#workspace--crate-boundaries)
-for why.
+The libraries are separate so you can use the parts you need without the
+daemon; see [Integrating & extending](docs/getting-started/integrating.md).
 
-## Non-goals (v1)
+## Documentation
 
-- **Not embedded** — weir is a daemon; producers talk to it over a socket.
-- **Not a message broker** — no pub/sub, no fan-out. One producer stream, one sink.
-- **Not a database** — the WAB is not queryable; replay on crash is the only read path.
-- **Not opinionated about serialisation** — the wire envelope carries opaque bytes.
-
-The default transport is the Unix domain socket; an optional TCP + mutual-TLS
-listener is available behind the `tls` feature for cross-host producers.
-
-## How it earns the "durable" claim
-
-- **The invariant:** an ack is never a false ack — an acked record is on disk and
-  replays after a crash. Every design choice serves this. (On Linux, durability
-  is `fdatasync`. On macOS, weir uses `F_BARRIERFSYNC`, which orders writes and
-  survives process crashes but is **not** guaranteed to survive sudden power loss
-  on consumer SSDs with a volatile write cache — macOS is best treated as a dev
-  platform; run production on Linux.)
-- **Deterministic simulation (DST):** the WAB durability invariants are checked
-  under injected crash/fault schedules with **replayable seeds**, on every CI run
-  (a 300-seed sweep) — see [`docs/architecture.md`](docs/architecture.md#testing-infrastructure).
-- **Language-neutral conformance vectors:** canonical hex frames plus the result
-  a conformant decoder must produce for every message type, nine of the ten
-  Nack reasons (`BadBatchFraming`, `0x0B`, has no vector yet), and each rejection case — run your own codec against them
-  ([docs/conformance.md](docs/conformance.md)).
-- **Cross-platform CI:** `fmt` + `clippy` across the feature matrix + `cargo-deny`
-  + the full test suites + a monitoring-stack end-to-end smoke test, on every
-  push. The build matrix compiles `weir-server` on all four release targets —
-  two Linux, two macOS. The **daemon** runs only on Linux and macOS, and as of
-  2.0.5 that is also all it is built for: releases through v2.0.4 attached an
-  `x86_64-pc-windows-msvc` binary that could not accept a record by any route,
-  and it has been dropped. The **client** is a different story since 2.0.3: a
-  dedicated `windows` CI job builds `weir-client --features tls` there, so a
-  Windows producer against a Linux/macOS daemon over the mTLS listener remains
-  a supported configuration, alongside a portability check of the four
-  published libraries (`weir-core`, `weir-wab`, `weir-sink-sdk`, `weir-status`).
+| | |
+|---|---|
+| **Getting started** | [Install](docs/getting-started/install.md), [quickstart](docs/getting-started/quickstart.md), [integrating & extending](docs/getting-started/integrating.md) |
+| **Operations** | [Configuration reference](docs/operations/configuration.md), [TCP + mutual TLS](docs/operations/tcp-mtls.md), [monitoring](docs/monitoring.md), [S3 sink](docs/sinks/s3.md) |
+| **Protocol** | [Wire format](docs/wire_protocol.md), [WAB format](docs/wab_format.md), [conformance vectors](docs/conformance.md) |
+| **Internals** | [Architecture](docs/architecture.md), [benchmarks](docs/benchmarks.md), [platform support](docs/platform-support.md) |
+| **Security** | [Threat model](docs/security/threat-model.md), [socket hardening](docs/security/socket-bind.md), [container hardening](docs/security/container.md) |
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for how to build, the exact pre-PR
-gate (the same checks CI runs), and the heavier test suites. Security issues
-go through [SECURITY.md](SECURITY.md), not public issues.
+Contributions are welcome. [CONTRIBUTING.md](CONTRIBUTING.md) covers building,
+the pre-PR checks and the heavier test suites. Please report security issues
+through [SECURITY.md](SECURITY.md) rather than in public issues.
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE).
+Licensed under the [Apache License, Version 2.0](LICENSE).

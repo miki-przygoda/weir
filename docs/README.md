@@ -1,5 +1,10 @@
 # weir documentation
 
+weir is a durable write buffer: your application pushes each record to a local
+socket and gets an ack once the record is safe on local disk, and weir commits
+records to Postgres, MySQL, ClickHouse, S3 or an HTTP endpoint in batches, so N
+writes become one commit. New here? Read the [quickstart](getting-started/quickstart.md).
+
 This directory is the source of truth for all weir documentation. It is
 organised by user role:
 

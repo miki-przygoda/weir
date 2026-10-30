@@ -1,13 +1,13 @@
 [package]
 name = "weir-core"
-description = "Shared types, wire protocol, and error types for weir"
+description = "Wire protocol, durability tiers and shared types for the weir write buffer"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-keywords = ["wire-protocol", "durability", "wal", "ingestion", "buffer"]
+keywords = ["wire-protocol", "write-ahead-log", "durability", "ingestion", "framing"]
 categories = ["network-programming", "encoding"]
 
 [dependencies]

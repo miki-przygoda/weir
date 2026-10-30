@@ -23,7 +23,7 @@ edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
 repository = "https://github.com/miki-przygoda/weir"
-homepage = "https://github.com/miki-przygoda/weir"
+homepage = "https://miki-przygoda.github.io/weir/"
 
 # Inter-crate dependency versions centralised here so a workspace version bump is
 # a single edit, not one per dependent crate (the previous hardcoded
