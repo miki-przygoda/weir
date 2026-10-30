@@ -10,7 +10,7 @@ crash.
 
 [![CI](https://github.com/miki-przygoda/weir/actions/workflows/ci.yml/badge.svg)](https://github.com/miki-przygoda/weir/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/weir-server.svg?label=weir-server)](https://crates.io/crates/weir-server)
-[![docs.rs](https://img.shields.io/docsrs/weir-rs?label=docs.rs%2Fweir-rs)](https://docs.rs/weir-rs)
+[![docs.rs](https://img.shields.io/badge/docs.rs-weir--rs-blue?logo=docsdotrs)](https://docs.rs/weir-rs)
 [![MSRV](https://img.shields.io/badge/MSRV-1.88-blue.svg)](Cargo.toml)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
