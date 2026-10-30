@@ -37,7 +37,7 @@ they are two selectable tiers today.
 
 > See [latest.md](benchmarks/latest.md) for the full tables and
 > [history.md](benchmarks/history.md) for the trend over time. The figures
-> below are rounded from one averaged CI run (v4.0.1, 2026-09-28, 5 passes per
+> below are rounded from one averaged CI run (v4.1.0, 2026-10-26, 5 passes per
 > deadline, `shard_count=4`, `batch_size=64`). **This index is hand-maintained
 > and is not regenerated** — `deploy/avg_benchmarks.py` writes `latest.md` and
 > appends to `history.md`, and says so at its own line 9. When the two disagree,
@@ -48,39 +48,59 @@ they are two selectable tiers today.
 > single-thread `Sync` RPS. The `±σ` column is the within-run-set deviation
 > across the 5 passes only; it is not the spread between CI runs.
 
+> **This run's `Durable` figures contain no fsync.** By 25 Oct 2026 GitHub's
+> `ubuntu-latest` had moved from `ubuntu-24.04` to `ubuntu-26.04`, and 26.04
+> mounts `/tmp` as tmpfs, where `fdatasync` returns at once. The load suite put
+> its WAB under `/tmp`, so the 25–26 Oct rows in `history.md` (two at 4.0.1, one
+> at 4.1.0) measured RAM: single-thread `Durable` p50 is 51 µs, the same as
+> `Buffered`, against 259 µs on the last run with the WAB on disk. The daemon
+> did not change: on one Linux machine with the WAB on ext4, 4.0.1 and 4.1.0 both
+> issue one `fdatasync` per `Durable` record (`strace`: 2,000 calls for 2,000
+> records) and both put single-thread `Durable` in milliseconds against
+> `Buffered`'s ~16 µs; with the WAB on tmpfs both drop to the `Buffered` figure.
+> The `load`, `bench`
+> and `drain` jobs now point `TMPDIR` at the runner's disk and refuse to run if
+> it is tmpfs, so the next run is fsync-bound again; until it lands, read the
+> `Durable` rows below as the daemon's cost without the disk, and the analysis
+> under the table, which cites the last on-disk run (v4.0.1, 2026-09-28), for
+> what the disk adds.
+
 ### Throughput at `batch_deadline_ms=1`
 
 | Scenario | Concurrency | RPS | ±σ across the 5 passes |
 |----------|---|-----|-----|
-| Single thread, Buffered | 1 | ~14,950 | ±350 |
-| Single thread, Durable | 1 | ~3,670 | ±226 |
-| Thundering herd, Buffered | 64 | ~46,300 | ±12,868 |
-| Saturation ceiling, Buffered | 48 | ~97,000 | not sampled |
-| Saturation ceiling, Durable | 48 | ~43,000 | not sampled |
+| Single thread, Buffered | 1 | ~18,900 | ±184 |
+| Single thread, Durable (tmpfs: no fsync) | 1 | ~18,700 | ±619 |
+| Thundering herd, Buffered | 64 | ~116,500 | ±4,083 |
+| Saturation ceiling, Buffered | 48 | ~145,000 | not sampled |
+| Saturation ceiling, Durable (tmpfs: no fsync) | 48 | ~126,000 | not sampled |
 
-> **The single-thread rows are latency reciprocals, not ceilings.** Read down
-> the `Durable` rows: the same tier, on the same runner, in the same run set,
-> does ~3,670 rec/s on one connection and ~43,000 across 48 — **12×**. Nothing
-> about the daemon changed between those two rows.
+> **The single-thread rows are latency reciprocals, not ceilings.** On the last
+> run with the WAB on disk (v4.0.1, 2026-09-28) the same `Durable` tier, on the
+> same runner, in the same run set, did ~3,670 rec/s on one connection and
+> ~43,000 across 48 — **12×**. Nothing about the daemon changed between those
+> two rows. (On tmpfs the gap all but closes, ~18,700 against ~126,000, because
+> the fsync that one connection waits on is gone.)
 >
 > `Durable` is a group commit at the batch boundary
 > (`crates/weir-core/src/durability.rs`), and the daemon acks frame N before
 > reading frame N+1 on a connection
 > (`crates/weir-server/src/socket/connection.rs`). One synchronous producer
-> therefore pays one fsync per record and is bound by fsync *latency*: 1 ÷ 3,670
-> = 273 µs, which sits between that run's `Durable` p50 of 259 µs and its mean
-> of 283 µs. Concurrency is what fills a batch, and a filled batch is what
-> amortises the fsync.
+> therefore pays one fsync per record and is bound by fsync *latency*: on that
+> on-disk run, 1 ÷ 3,670 = 273 µs, which sits between its `Durable` p50 of
+> 259 µs and its mean of 283 µs. Concurrency is what fills a batch, and a
+> filled batch is what amortises the fsync.
 >
-> **How much the runner distorts the tail varies between runs, and this run is
-> a mild one.** Its `Durable` p99 of 567 µs against a p50 of 259 µs is a ratio of
-> 2.2× — *tighter* than the bare-metal capture's 1.1 ms / 3.7 ms, which is 3.4×.
-> The distortion has not gone away, it has moved outward: p99.9 is 7.6 ms and the
-> max 9.5 ms, so the same runner is still injecting multi-millisecond stalls, just
-> past the 99th percentile this time. Earlier run sets put that stall at the p99
-> instead (one reported 22.4 ms against a 359 µs p50, a 62× ratio). Which
-> percentile the noise lands on is not a property of weir, and it is the reason
-> this index refuses to let a single CI percentile stand as a claim.
+> **How much the runner distorts the tail varies between runs.** That on-disk
+> run was a mild one: its `Durable` p99 of 567 µs against a p50 of 259 µs is a
+> ratio of 2.2× — *tighter* than the bare-metal capture's 1.1 ms / 3.7 ms, which
+> is 3.4×. The distortion had not gone away, it had moved outward: p99.9 was
+> 7.6 ms and the max 9.5 ms, so the same runner was still injecting
+> multi-millisecond stalls, just past the 99th percentile that time. Earlier run
+> sets put that stall at the p99 instead (one reported 22.4 ms against a 359 µs
+> p50, a 62× ratio). Which percentile the noise lands on is not a property of
+> weir, and it is the reason this index refuses to let a single CI percentile
+> stand as a claim.
 >
 > So a single-thread figure answers "how fast can one caller push-and-wait on
 > this hardware", and only a concurrent figure answers "how much can the daemon
@@ -96,15 +116,16 @@ under two scenario tags — `Sync` and `Batched` — kept only for continuity
 with prior CI history; both push the same `Durability::Durable` and the two
 rows below are the same tier measured twice, not two tiers.
 
-| Tier (scenario tag) | p50 | p99 |
-|------|-----|-----|
-| Buffered | ~56 µs | ~96 µs |
-| Durable (`Sync` tag) | ~359 µs | ~22.4 ms |
-| Durable (`Batched` tag, historical) | ~366 µs | ~44.0 ms |
+| Tier (scenario tag) | p50 | p99 | p50, last on-disk run (v4.0.1, 2026-09-28) |
+|------|-----|-----|-----|
+| Buffered | ~51 µs | ~76 µs | ~65 µs |
+| Durable (`Sync` tag) | ~51 µs | ~73 µs | ~259 µs |
+| Durable (`Batched` tag, historical) | ~53 µs | ~90 µs | — |
 
 *Numbers above are approximate CI figures (sandboxed GitHub runners), not a baseline.
-Exact figures are in [latest.md](benchmarks/latest.md); for claims on named
-hardware see [bare-metal.md](benchmarks/bare-metal.md).*
+The v4.1.0 `Durable` rows were measured on tmpfs and include no fsync (see the
+note above the throughput table). Exact figures are in [latest.md](benchmarks/latest.md);
+for claims on named hardware see [bare-metal.md](benchmarks/bare-metal.md).*
 
 ---
 

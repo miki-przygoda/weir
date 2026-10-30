@@ -30,9 +30,11 @@ for — see [platform support](docs/platform-support.md#durability-by-platform))
 wire format + Rust API under SemVer
 
 *Latency and throughput figures are deliberately not quoted here. Every published
-run — 4.0.1 as of 2026-09-28
+run — 4.1.0 as of 2026-10-26
 ([`docs/benchmarks/latest.md`](docs/benchmarks/latest.md),
-[`history.md`](docs/benchmarks/history.md)) — is on a 2-vCPU shared CI runner, and
+[`history.md`](docs/benchmarks/history.md)) — is on a 2-vCPU shared CI runner (and
+the 25–26 Oct runs had the WAB on tmpfs, so their `Durable` figures include no
+fsync at all: see [`docs/benchmarks.md`](docs/benchmarks.md#headline-numbers-latest-ci-run)), and
 this project's own rule is that external performance claims cite an operator-run
 capture on named hardware, with the storage and its fsync primitive disclosed
 ([`environments.md`](docs/benchmarks/environments.md#what-an-external-claim-may-cite)). The "microseconds" above is the fsync:
