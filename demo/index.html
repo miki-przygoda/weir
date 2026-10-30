@@ -35,14 +35,14 @@
   <div class="hero">
     <h1>weir <span class="accent">// live demo</span></h1>
     <p class="role">durable write buffer · interactive simulation</p>
-    <p class="tag">A durable write buffer — as fast as a direct insert at the producer, but crash-safe and N→1 on the database.</p>
-    <p class="tag" style="opacity:.72">A <code class="inline">Durable</code> ack is one fsync, so it is your disk's number, not weir's: 133&nbsp;µs on a Mac NVMe, where macOS uses <code class="inline">F_BARRIERFSYNC</code> — a write <em>barrier</em>, not a full flush, and not power-loss safe — and ~1.5&nbsp;ms on a SATA SSD with an honest Linux <code class="inline">fdatasync</code>. The simulation below uses the honest number.</p>
+    <p class="tag"><b>Stop doing one INSERT per event.</b> Your app gets an ack once a record is on local disk; weir commits records to your database in batches and replays them after a crash.</p>
     <div class="metrics">
-      <span><span class="mk">Buffered ack p50</span><b>~19 µs</b></span>
-      <span><span class="mk">Durable ack p50</span><b>133 µs – 1.5 ms</b></span>
-      <span><span class="mk">commit compression</span><b>N→1</b></span>
-      <span><span class="mk">false acks at Durable</span><b>0</b></span>
+      <span><span class="mk">Durable ack p50</span><b>1.1 ms</b></span>
+      <span><span class="mk">Buffered ack p50</span><b>19 µs</b></span>
+      <span><span class="mk">database commits</span><b>N→1</b></span>
+      <span><span class="mk">simulated power cuts</span><b>5,311 · 0 acked lost</b></span>
     </div>
+    <p class="tag" style="opacity:.72">Latencies from a <a href="https://github.com/miki-przygoda/weir/blob/main/docs/benchmarks/bare-metal.md" target="_blank" rel="noopener">bare-metal capture</a>: i9-9900K, SATA SSD, Linux <code class="inline">fdatasync</code>. A <code class="inline">Durable</code> ack waits for one fsync, so its latency is your disk's, not weir's.</p>
     <div class="cta">
       <a href="#sim" class="primary">▶ Run the simulation</a>
       <a href="crates.html">The crates →</a>
@@ -51,18 +51,18 @@
   </div>
 
   <div class="panel">
-    <div class="panel-title">The pitch</div>
+    <div class="panel-title">The idea</div>
     <div class="panel-body">
-      <p style="margin-top:0">A "usual" setup inserts each record straight into the database and blocks the
-      producer until it commits. weir instead takes the record over a local socket, writes it to a
-      CRC-checked <b>Write-Ahead Buffer</b>, fsyncs per the durability tier, and <b>acks</b> the
-      producer — then drains <b>batches</b> downstream, collapsing N commits into one. You get two
-      things the direct path can't: <span style="color:var(--n-green)">an ack is never a false ack</span>
-      (an acked record is durable and replays across a crash) and far fewer database commits — at a
-      producer-facing latency as fast or faster than the direct insert. The honest tradeoff: a record
-      lands in the database a beat <em>later</em>, via the batched drain.</p>
-      <p style="margin-bottom:0; color:var(--n-fg-dim)">Push records below and compare the two stacks.
-      <em>Browser simulation; latencies are modeled on weir's benchmarks, with per-record jitter.</em></p>
+      <p style="margin-top:0">The usual setup inserts each record straight into the database and blocks the
+      producer until the commit lands: one round-trip and one commit per record. weir is a small daemon on
+      the same host. It takes each record over a local socket, appends it to a checksummed
+      <b>write-ahead buffer</b> on disk and <b>acks</b>, then drains <b>batches</b> to Postgres, MySQL,
+      ClickHouse, S3 or HTTP, so N records become one commit. If the database is down, records keep
+      buffering on disk; if the machine crashes, everything weir acked as <code class="inline">Durable</code> replays.</p>
+      <p style="margin-bottom:0">The tradeoff: a record reaches the database a little <em>later</em>, once its batch is
+      committed.</p>
+      <p style="margin-bottom:0; color:var(--n-fg-dim)">Push records below, then try both kinds of crash.
+      Browser simulation: latencies are modelled on the capture above, with per-record jitter.</p>
     </div>
   </div>
 
@@ -78,12 +78,13 @@
       <span class="label">Durability</span>
       <span class="seg" id="tierSeg">
         <button data-tier="Durable" class="sel" title="Written and group-fsynced at the batch boundary before the ACK. An acked record is on disk.">Durable</button>
-        <button data-tier="Buffered" title="ACK after the in-memory write only. Fastest — but a crash can lose the not-yet-fsynced window.">Buffered</button>
+        <button data-tier="Buffered" title="ACK before the fsync. Survives a process crash; power loss can take records that were not yet fsynced.">Buffered</button>
       </span>
     </div>
     <div class="group">
-      <span class="label">Daemon</span>
-      <button id="crash" class="danger">Crash daemon</button>
+      <span class="label">Crash</span>
+      <button id="crash" class="danger" title="The daemon process dies. The OS keeps everything it had written.">Kill process</button>
+      <button id="powercut" class="danger" title="The machine loses power. Anything not yet fsynced is gone.">Pull the plug</button>
       <button id="restart">Restart</button>
     </div>
     <div class="group" style="margin-left:auto">
@@ -119,7 +120,7 @@
 
   <!-- weir -->
   <div class="panel">
-    <div class="panel-title">weir <span class="pt-right">local durable ack, then batched drain — N→1 commits, crash-safe</span>
+    <div class="panel-title">weir <span class="pt-right">local ack after fsync, then batched drain — N→1 commits, crash-safe</span>
       <span class="pill" id="statusPill">running</span></div>
     <div class="panel-body">
       <canvas id="cvW" width="1040" height="250"></canvas>
@@ -156,25 +157,23 @@
     <p>The motion is illustrative, but the model follows weir's real semantics, and per-record
        latencies are drawn from a long-tailed distribution (hence the avg / p99 / max):</p>
     <ul>
-      <li><b>The first hop is the same in both lanes</b> — getting the record off the producer. The
-        stacks diverge after it: weir does a <em>local</em> fsync and acks (~1.5 ms Durable on this
-        storage); the
-        naive path blocks on the <em>remote</em> commit round-trip (~8 ms). Same database, so weir's
-        drain commit costs the same as a naive commit — but one trip carries the whole batch.</li>
-      <li><b>Durable</b> — written and <code class="inline">fdatasync</code>ed via the batch-boundary group
-        fsync before the ack; zero acked-record loss on crash. weir&nbsp;1.x split this into
-        <code class="inline">Sync</code> and <code class="inline">Batched</code>; both moved onto the same group
-        fsync, at which point the distinction stopped existing, and 2.0 collapsed them. Wire byte
-        <code class="inline">0x02</code> is retired and permanently reserved — a 1.x producer that still
-        sends it gets a <code class="inline">Durable</code> record, and the encoder never emits it.</li>
-      <li><b>Buffered</b> — ack after the in-memory write only; fastest, but a crash can lose the
-        not-yet-fsynced window (shown as lost — weir is honest about the tradeoff).</li>
-      <li><b>Crash recovery</b> — on restart weir replays every sealed-but-unconfirmed segment, so
-        anything durably acked is redelivered. The naive lane talks straight to the DB and is
-        independent of the weir daemon.</li>
-      <li><b>End-to-end</b> — a record reaches the database <em>later</em> under weir (it waits to be
-        batched). weir trades end-to-end freshness for fast durable acks, far fewer commits, and
-        producer/​downstream decoupling — not for raw insert speed.</li>
+      <li><b>The first hop is the same in both lanes</b>: getting the record off the producer. After
+        it, weir writes and fsyncs <em>locally</em> and acks (~1.1 ms <code class="inline">Durable</code>),
+        while the naive path waits for a <em>remote</em> commit (~8 ms, modelled, not measured). weir's
+        drain commit costs the same as a naive one, but one commit carries the whole batch.</li>
+      <li><b>Durable</b>: the record is written and <code class="inline">fdatasync</code>ed, as part of a
+        group fsync at the batch boundary, before the ack. It survives a process crash and power loss.</li>
+      <li><b>Buffered</b>: the ack comes after the write, before any fsync. A killed process loses
+        nothing, because the operating system still holds the write. A power cut loses whatever had
+        not reached the disk yet; on real hardware that was measured at up to ~30 MB.</li>
+      <li><b>Kill process</b>: the daemon dies, like <code class="inline">kill -9</code>. Records still in
+        flight were never acked, so the producer retries them. Every acked record replays on restart.</li>
+      <li><b>Pull the plug</b>: the machine loses power. Acked <code class="inline">Durable</code> records
+        replay; acked <code class="inline">Buffered</code> records in the open segment are lost.
+        The naive lane is drawn as unaffected, because it only shows what the database had committed.</li>
+      <li><b>End-to-end</b>: under weir a record reaches the database <em>later</em>, because it waits
+        for its batch. weir trades that freshness for fast durable acks, far fewer commits, and a
+        producer that keeps working while the database is down.</li>
     </ul>
   </details>
 
@@ -182,28 +181,45 @@
   <div class="sec-head"><span class="label">Why weir</span><span class="rule"></span></div>
   <div class="grid cols-3">
     <div class="card">
-      <h3>Durable before ack</h3>
-      <p class="card-sub" style="margin:0">An ack at the <code class="inline">Durable</code> tier means the record is on disk and replays after a crash. Never a false ack.</p>
+      <h3>An ack is never a false ack</h3>
+      <p class="card-sub" style="margin:0">A <code class="inline">Durable</code> ack means the record is on disk and will be delivered, even if the machine loses power right after.</p>
     </div>
     <div class="card">
-      <h3>N→1 commits</h3>
-      <p class="card-sub" style="margin:0">The async drain seals a segment and forwards it as one bulk commit — N records collapse into a single downstream write.</p>
+      <h3>N writes, one commit</h3>
+      <p class="card-sub" style="margin:0">Batches go to Postgres, MySQL, ClickHouse, S3 or an HTTP endpoint: fewer, larger inserts instead of one per event.</p>
     </div>
     <div class="card">
-      <h3>Crash-safe replay</h3>
-      <p class="card-sub" style="margin:0">Unconfirmed segments replay automatically on restart. CRC32 per record catches corruption before replay.</p>
+      <h3>The database can be down</h3>
+      <p class="card-sub" style="margin:0">Records keep buffering on disk and drain when it returns. Rejected batches go to a dead-letter directory you can inspect and requeue.</p>
     </div>
     <div class="card">
-      <h3>No broker</h3>
-      <p class="card-sub" style="margin:0">One binary, one local socket. Not Kafka — a durable buffer in front of one sink, with an ack after one local fsync.</p>
+      <h3>No broker to run</h3>
+      <p class="card-sub" style="margin:0">One binary per host. Clients in Rust, Python, Go, C, Java and TypeScript, plus conformance vectors for writing your own.</p>
     </div>
     <div class="card">
       <h3>Use weir when…</h3>
-      <p class="card-sub" style="margin:0">a high-rate producer must not block on a slow/flaky downstream, and must not lose records it was told are safe — even across a crash.</p>
+      <p class="card-sub" style="margin:0">an application produces records faster than its database wants to commit them, or its uplink to the database comes and goes.</p>
     </div>
     <div class="card">
-      <h3>Don't reach for weir when…</h3>
-      <p class="card-sub" style="margin:0">you need fan-out / pub-sub / multiple consumers (use a broker), or can write straight to the DB synchronously.</p>
+      <h3>Use something else when…</h3>
+      <p class="card-sub" style="margin:0">the write must be atomic with your own transaction (an outbox table), or you need pub/sub and several consumers (a broker).</p>
+    </div>
+  </div>
+
+  <!-- TESTED -->
+  <div class="sec-head"><span class="label">How the guarantee is tested</span><span class="rule"></span></div>
+  <div class="grid cols-3">
+    <div class="card">
+      <h3>5,311 power cuts</h3>
+      <p class="card-sub" style="margin:0">Simulated power loss on a real Linux kernel and filesystem: 42,814,591 acked <code class="inline">Durable</code> records, none lost. <a href="https://github.com/miki-przygoda/weir/blob/main/docs/benchmarks/chaos-phase2/2026-08-28-first-power-loss-measurement.md" target="_blank" rel="noopener">Method and results →</a></p>
+    </div>
+    <div class="card">
+      <h3>Deterministic simulation</h3>
+      <p class="card-sub" style="margin:0">The buffer's durability invariants are checked under injected crash and fault schedules, with replayable seeds, on every CI run. <a href="https://miki-przygoda.github.io/weir/architecture.html#testing-infrastructure" target="_blank" rel="noopener">Architecture →</a></p>
+    </div>
+    <div class="card">
+      <h3>Conformance vectors</h3>
+      <p class="card-sub" style="margin:0">Canonical wire frames and the results a decoder must produce, so a client in any language can be checked. <a href="https://miki-przygoda.github.io/weir/conformance.html" target="_blank" rel="noopener">Conformance →</a></p>
     </div>
   </div>
 
@@ -212,9 +228,13 @@
   <p class="tag">Take only what you need — produce, forward, read the buffer, or operate, each without pulling the daemon.</p>
   <div class="chips" style="gap:8px">
     <span class="chip">weir-client</span>
-    <span class="chip">weir-sink-sdk</span>
-    <span class="chip">weir-wab</span>
+    <span class="chip">weir-rs</span>
     <span class="chip">weir-core</span>
+    <span class="chip">weir-sink-sdk</span>
+    <span class="chip">weir-sink-s3</span>
+    <span class="chip">weir-wab</span>
+    <span class="chip">weir-status</span>
+    <span class="chip">weir-attest</span>
     <span class="chip dim">weir-server</span>
     <span class="chip dim">weir-ctl</span>
   </div>
@@ -237,14 +257,11 @@
 "use strict";
 (function(){
   // ---- modeled real latencies (µs) ----
-  // Single-connection p50 for one local fsync, from the figures README.md
-  // publishes with their hardware and fsync primitive named. Durable is a SATA
-  // SSD with an honest Linux fdatasync (~1.4-1.5 ms); on a Mac NVMe, where the
-  // primitive is F_BARRIERFSYNC -- a write barrier, not a full flush -- the same
-  // tier is ~133-152 us. The slower, honest number is used here because it is
-  // the configuration in which this page's "never a false ack" line is true.
-  // NOT a CI figure: environments.md forbids citing latest.md externally.
-  const WEIR_ACK_US = { Durable:1500, Buffered:19 };
+  // Single-connection p50 from docs/benchmarks/bare-metal.md: i9-9900K, SATA
+  // SSD, Linux fdatasync, the configuration in which "never a false ack" holds
+  // under power loss. NOT a CI figure: environments.md forbids citing CI runs
+  // externally.
+  const WEIR_ACK_US = { Durable:1100, Buffered:19 };
   const NAIVE_COMMIT_US = 8000;                                 // remote insert+commit round trip
   const TIER_COLOR = { Durable:"#38bdf8", Buffered:"#4ade80" };  // hr2 tier palette
 
@@ -306,7 +323,7 @@
   const drainQueue = [];        // {ids, durable, phase, p}
   const spawnQueue = [];
   let spawnAcc = 0;
-  const metrics = { latN:[], latW:[], e2eN:[], e2eW:[], comN:0, comW:0, ackN:0, ackW:0, lostW:0, safeW:0, recovered:false, crashed:false };
+  const metrics = { latN:[], latW:[], e2eN:[], e2eW:[], comN:0, comW:0, ackN:0, ackW:0, lostW:0, safeW:0, recovered:false, crashed:false, crashKind:null };
 
   // ---- helpers ----
   const $ = id => document.getElementById(id);
@@ -423,32 +440,43 @@
   function markInflightLost(r){ r._sx=r.stage; r.lost=true; r.stage="lost-anim"; r.lostAt=tNow; r.done=true;
     log(`record #${r.id} in-flight at crash — never acked (producer retries)`, "ev-loss"); }
 
-  function crash(){
+  // kind: "kill" — the process dies; the OS keeps every write it accepted, so
+  // acked Buffered records survive. "power" — the machine loses power; only
+  // fsynced data survives, so acked Buffered records still in the open segment
+  // are lost. Sealed segments were fsynced when they sealed.
+  function crash(kind){
     if(!daemonUp) return;
-    daemonUp=false; metrics.crashed=true;
-    $("statusPill").textContent="crashed"; $("statusPill").classList.add("down");
+    daemonUp=false; metrics.crashed=true; metrics.crashKind=kind;
+    $("statusPill").textContent = kind==="power" ? "power lost" : "killed";
+    $("statusPill").classList.add("down");
     let lostBuffered=0;
-    wab = wab.filter(w=>{ if(!w.durable){ lostBuffered++; metrics.lostW++; return false; } return true; });
+    if(kind==="power"){
+      wab = wab.filter(w=>{ if(!w.durable){ lostBuffered++; metrics.lostW++; return false; } return true; });
+    }
     for(const r of records){
       if(r.lane==="weir" && !r.done && (r.stage==="socket"||r.stage==="wab"||r.stage==="fsync")) markInflightLost(r);
     }
     metrics.safeW = wab.length + drainQueue.reduce((s,b)=> s + (b.done?0:b.ids.length), 0);
     metrics.recovered = false;
-    log(`*** weir daemon DOWN. ${metrics.safeW} durable record(s) safe in the WAB; naive lane unaffected. ***`, "ev-crash");
-    if(lostBuffered>0) log(`lost ${lostBuffered} Buffered record(s): acked but in the not-yet-fsynced window`, "ev-loss");
+    if(kind==="power"){
+      log(`*** power lost. ${metrics.safeW} acked record(s) were on disk and are safe. ***`, "ev-crash");
+      if(lostBuffered>0) log(`lost ${lostBuffered} acked Buffered record(s) that had not been fsynced yet`, "ev-loss");
+    } else {
+      log(`*** weir process killed. ${metrics.safeW} acked record(s) safe in the WAB, Buffered included: the OS still holds every write. ***`, "ev-crash");
+    }
   }
   function restart(){
     if(daemonUp) return;
     daemonUp=true; metrics.recovered=true;
     $("statusPill").textContent="running"; $("statusPill").classList.remove("down");
     log(`daemon restarting — scanning WAB for unconfirmed segments…`, "ev-recover");
-    if(metrics.safeW>0){ log(`recovered ${metrics.safeW} durable record(s) from ${Math.ceil(wab.length/BATCH_SIZE)||1} unconfirmed segment(s); replaying`, "ev-recover"); batchTimer = tNow + 200; }
+    if(metrics.safeW>0){ log(`recovered ${metrics.safeW} acked record(s) from ${Math.ceil(wab.length/BATCH_SIZE)||1} unconfirmed segment(s); replaying`, "ev-recover"); batchTimer = tNow + 200; }
     else log(`no unconfirmed segments — clean restart`, "ev-recover");
   }
   function reset(){
     records.length=0; wab.length=0; drainQueue.length=0; spawnQueue.length=0;
     batchTimer=null; spawnAcc=0; recId=0;
-    Object.assign(metrics,{latN:[],latW:[],e2eN:[],e2eW:[],comN:0,comW:0,ackN:0,ackW:0,lostW:0,safeW:0,recovered:false,crashed:false});
+    Object.assign(metrics,{latN:[],latW:[],e2eN:[],e2eW:[],comN:0,comW:0,ackN:0,ackW:0,lostW:0,safeW:0,recovered:false,crashed:false,crashKind:null});
     daemonUp=true; streaming=false;
     $("stream").classList.remove("on"); $("statusPill").textContent="running"; $("statusPill").classList.remove("down");
     $("log").innerHTML=""; log("reset.");
@@ -516,7 +544,7 @@
       const rx=ING_X-58;
       ctx.save(); ctx.fillStyle="rgba(248,113,113,0.10)"; ctx.fillRect(rx,0,cvW.width-rx,cvW.height);
       ctx.fillStyle=C_LOSS; ctx.font="700 13px 'JetBrains Mono',monospace"; ctx.textAlign="center";
-      ctx.fillText("daemon DOWN — durable segments held; Restart to replay", (rx+cvW.width)/2, 30); ctx.restore();
+      ctx.fillText(metrics.crashKind==="power" ? "POWER LOST — fsynced segments held; Restart to replay" : "PROCESS KILLED — buffer held on disk; Restart to replay", (rx+cvW.width)/2, 30); ctx.restore();
     }
     for(const r of records){
       if(r.lane!=="weir") continue;
@@ -547,8 +575,8 @@
     $("wLostNote").textContent = !metrics.crashed
       ? "— acked records replay from the WAB"
       : (!metrics.recovered
-          ? `— ${metrics.safeW} durable held in WAB; press Restart to replay${metrics.lostW?" · Buffered window lost":""}`
-          : `— ${metrics.safeW} durable replayed${metrics.lostW?` · ${metrics.lostW} Buffered-window record(s) lost for good`:""}`);
+          ? `— ${metrics.safeW} acked held in the WAB; press Restart to replay${metrics.lostW?` · ${metrics.lostW} unsynced Buffered lost`:""}`
+          : `— ${metrics.safeW} acked replayed${metrics.lostW?` · ${metrics.lostW} Buffered record(s) lost to power loss`:""}`);
   }
 
   function frame(ts){
@@ -562,7 +590,7 @@
   $("push1").onclick=()=>pushRecords(1);
   $("push10").onclick=()=>pushRecords(10);
   $("stream").onclick=e=>{ streaming=!streaming; e.target.classList.toggle("on",streaming); };
-  $("crash").onclick=crash; $("restart").onclick=restart; $("reset").onclick=reset;
+  $("crash").onclick=()=>crash("kill"); $("powercut").onclick=()=>crash("power"); $("restart").onclick=restart; $("reset").onclick=reset;
   document.querySelectorAll("#tierSeg button").forEach(b=>{
     b.onclick=()=>{ tier=b.dataset.tier;
       document.querySelectorAll("#tierSeg button").forEach(x=>x.classList.remove("sel"));
@@ -570,7 +598,7 @@
   });
   document.querySelector('#tierSeg button.sel').parentElement.style.setProperty("--tier", TIER_COLOR.Durable);
 
-  log("ready — push some records; compare the two stacks, then try Crash daemon + Restart.");
+  log("ready — push some records, then try Kill process or Pull the plug, and Restart. Compare Durable with Buffered.");
   requestAnimationFrame(frame);
 })();
 </script>

@@ -14,7 +14,7 @@ natively inside the host personal site.
 
 | File | What it is |
 |------|------------|
-| `index.html` | **Landing + live simulation.** The pitch, the interactive Naive-vs-weir pipeline sim, "why weir", and a crate strip. |
+| `index.html` | **Landing + live simulation.** The pitch, the interactive Naive-vs-weir pipeline sim, "why weir", how the guarantee is tested, and a crate strip. |
 | `crates.html` | **The crates.** Which-crate-do-I-need table, a dependency diagram, and a card per crate (when to reach for it, deps, platform). |
 | `examples.html` | **Example projects by crate-ratio.** A crate-usage matrix + curated recipes spanning one crate → the full pipeline → a zero-Rust-dep wire client. |
 | `clients/<lang>.html` | **Polyglot wire-client subpages** — one per language (`py`, `go`, `c`, `java`, `ts`). Each is a from-scratch, stdlib-only producer built from the wire spec + conformance vectors. Linked from `examples.html`. |
@@ -34,22 +34,25 @@ record" baseline:
   Producer → Socket → WAB → fsync → Ack, then drain in **batches** to the sink.
 - **Toggle the durability tier** (Durable / Buffered) and see the effect
   on ack latency and on what survives a crash.
-- **Crash the daemon** mid-flight and **Restart** to watch unconfirmed WAB
-  segments replay — the visual proof of *"an ack is never a false ack."*
+- **Kill the process** or **pull the plug** mid-flight, then **Restart** to
+  watch unconfirmed WAB segments replay. The two crashes differ on purpose: a
+  killed process loses no acked record at either tier, because the OS still
+  holds every write; a power cut loses acked `Buffered` records that were not
+  yet fsynced, and no acked `Durable` record. That difference is the contract.
 - **Live metric cards** compare producer-facing ack latency, downstream DB
   commits (the N→1 compression), and records lost on crash.
 
 It's a *simulation*, not the daemon (no Unix-socket daemon in a browser), but the
 model follows weir's real semantics.
 
-Latency figures come from the operator-run captures README.md publishes with
-their hardware and fsync primitive named — **not** from CI. `docs/benchmarks/environments.md`
-forbids citing `latest.md`/`history.md` for an external claim, and this bundle is
-the most external artifact in the tree. A `Durable` ack is one fsync, so it is
-the disk's number: ~1.5 ms on a SATA SSD with an honest Linux `fdatasync`, and
-~133 µs on a Mac NVMe, where macOS uses `F_BARRIERFSYNC` — a write barrier
-rather than a full flush, and not power-loss safe. The simulation uses the
-honest Linux figure. `Buffered` is ~19 µs on the same box.
+Latency figures come from the operator-run bare-metal capture
+(`docs/benchmarks/bare-metal.md`: i9-9900K, SATA SSD, Linux `fdatasync`), **not**
+from CI. `docs/benchmarks/environments.md` forbids citing CI runs for an
+external claim, and this bundle is the most external artifact in the tree. A
+`Durable` ack is one fsync, so it is the disk's number: p50 1.1 ms there.
+`Buffered` is 19 µs on the same box. The Mac figures are deliberately not used:
+macOS uses `F_BARRIERFSYNC`, a write barrier rather than a full flush, and is not
+power-loss safe.
 
 The naive baseline (~8 ms, one commit per record) is **modelled**, not measured:
 a synchronous remote insert + commit round-trip. It is not a weir benchmark
