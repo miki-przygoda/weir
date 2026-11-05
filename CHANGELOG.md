@@ -15,7 +15,12 @@ protocol** below.
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- A `WEIR_*` environment variable that is not valid UTF-8 no longer has its
+  value printed in the startup error: the message names the variable only, so
+  a secret such as `WEIR_SINK_URL`'s credentials or
+  `WEIR_SINK_S3_SECRET_ACCESS_KEY` no longer reaches stderr or the journal.
 
 ## [4.1.0] - 2026-10-26
 

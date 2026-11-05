@@ -90,9 +90,11 @@ fn env_string(key: &'static str) -> Result<Option<String>, ConfigError> {
     match std::env::var(key) {
         Ok(v) => Ok(Some(v)),
         Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(e) => Err(ConfigError::ParseError {
+        // Not `ParseError` around the `VarError`: `NotUnicode`'s Display
+        // prints the raw value, and the var may hold a secret.
+        Err(std::env::VarError::NotUnicode(_)) => Err(ConfigError::InvalidValue {
             field: key,
-            source: Box::new(e),
+            reason: "the value is not valid UTF-8 (not shown: it may be a secret)".into(),
         }),
     }
 }
@@ -171,5 +173,26 @@ mod tests {
             other => panic!("expected ParseError, got {other:?}"),
         }
         unsafe { std::env::remove_var(k) }
+    }
+
+    /// A non-UTF-8 env var must not echo its value: std's
+    /// `VarError::NotUnicode` Display prints the raw bytes, and the var may
+    /// be a secret (`WEIR_SINK_URL` credentials, the S3 secret key).
+    #[cfg(unix)]
+    #[test]
+    fn env_string_non_utf8_error_does_not_print_the_value() {
+        use std::os::unix::ffi::OsStrExt;
+        let k = "WEIR_TEST_NON_UTF8_SECRET_COVERAGE";
+        let v = std::ffi::OsStr::from_bytes(b"http://u:FAKE-SECRET\xff@h/");
+        // SAFETY: serial test, key is unique and removed at the end.
+        unsafe { std::env::set_var(k, v) }
+        let err = env_string(k).unwrap_err();
+        unsafe { std::env::remove_var(k) }
+        let shown = format!("{err} / {err:?}");
+        assert!(shown.contains(k), "the error must name the field: {shown}");
+        assert!(
+            !shown.contains("FAKE-SECRET"),
+            "the error must not print the value: {shown}"
+        );
     }
 }
