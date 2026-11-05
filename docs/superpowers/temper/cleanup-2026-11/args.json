@@ -1,0 +1,40 @@
+{
+  "epic": "cleanup-2026-11",
+  "repo": "/Users/miki_przygoda/Projects/GitHub-Projects/weir",
+  "branch": "epic/cleanup-2026-11",
+  "base": "main",
+  "default_branch": "main",
+  "log": "docs/superpowers/temper/cleanup-2026-11/log.md",
+  "spec": "docs/superpowers/temper/cleanup-2026-11/spec.md",
+  "host": {
+    "kind": "ssh",
+    "name": "beast",
+    "root": "/home/miki_przygoda/work/weir",
+    "clone": "/srv/bulk/Projects/weir/src"
+  },
+  "gates": {
+    "quick": "ssh beast 'cd <worktree> && JOBQ_SUBMITTER=temper-cleanup ~/.local/bin/jobq submit --profile rust --project weir --cores 4 --mem 4G --timeout 3h --cwd \"$(pwd -P)\" --name <label>-quick -- bash .temper/gate-quick.sh', then `~/.local/bin/jobq wait <id>` until it ends (see the build rule)",
+    "full": "ssh beast 'cd <worktree> && JOBQ_SUBMITTER=temper-cleanup ~/.local/bin/jobq submit --profile rust --project weir --cores 4 --mem 8G --timeout 5h --cwd \"$(pwd -P)\" --name <label>-full -- bash .temper/gate-full.sh', then `~/.local/bin/jobq wait <id>` until it ends (see the build rule)"
+  },
+  "done": [],
+  "lenses": [
+    "security",
+    "failure paths and lifecycle",
+    "test strength and docs",
+    "durability and ack semantics",
+    "wab and recovery",
+    "drain and dead letters",
+    "wire socket and client",
+    "config reload and startup",
+    "sinks",
+    "status metrics and admin",
+    "weir-ctl and attest",
+    "deploy ci and chaos harness"
+  ],
+  "severity_notes": "- An acked `Durable` record that is not on disk, or does not replay after a crash, is severe. So is anything that lets two daemons own one `wab_dir`.\n- A change to the on-disk WAB format, the wire protocol or a published crate's public API without a version decision is severe: it needs the owner (semver, the `docs_drift` guards).\n- A panic reachable from a client frame, a stored segment or a config value is critical.\n- A secret (sink URL credentials, bearer token, crates.io token) reaching a log, a `Debug` string, argv or `/status` is critical.\n- Anything that loosens a security default (peer UID check, socket permissions, mTLS on TCP) is severe, and is never fixed overnight without the owner.\n\nScope of this epic (from its spec, docs/superpowers/temper/cleanup-2026-11/spec.md): the whole repository at the branch tip, NOT only `git diff main...epic/cleanup-2026-11` (the branch starts equal to main, so that diff is just the spec). Review the code itself, in your lens's area (the spec's Scope table). A finding needs an input and a wrong result that a verifier can reproduce; style, refactors and perf ideas are not findings.\nThese are owner items (kind owner), never fixes: a change to the WAB or `.confirmed` format, the wire protocol, `--json` shapes or a published crate's public API; loosening a security default; a new or upgraded dependency; D10 (explicit missing --config only WARNs: a deferred owner decision).",
+  "sweeps": 2,
+  "build_rule": "Every build, test, clippy or gate on beast runs as a jobq job: never run cargo, a gate script or a test binary directly in your ssh session (beast's ~/agents/CLAUDE.md; a session that compiled outside jobq was OOM-killed). Work in a worktree under ~/work/weir/ on beast; jobq's --cwd is that worktree's physical path (`pwd -P`).\n\nSubmit, then wait in the foreground (a single Bash call must stay under 10 minutes, so never use `jobq run` for a gate, and never end your turn while a job of yours is queued or running):\n  ssh beast 'cd <worktree> && JOBQ_SUBMITTER=temper-cleanup ~/.local/bin/jobq submit --profile rust --project weir --cores 4 --mem 4G --timeout 3h --cwd \"$(pwd -P)\" --name <your-label>-quick -- bash .temper/gate-quick.sh'\n  ssh beast '~/.local/bin/jobq wait <id>'   (call it again, with a Bash timeout of 600000 ms, until the job ends; its exit status is the gate's)\nThe full gate is the same with `--mem 8G --timeout 5h --name <your-label>-full -- bash .temper/gate-full.sh`. One cargo command (a reproduction, a single test) is the same with `--mem 4G --timeout 1h --name <your-label>-run -- bash .temper/gate-run.sh <cargo args>`, e.g. `... -- bash .temper/gate-run.sh test -p weir-wab segment`.\nA job's env is cleared: pass variables as `-- env VAR=value bash .temper/gate-run.sh ...`. Read results from `~/.local/bin/jobq logs <id> --tail 400` (it prints only the last 200 lines by default) and from the gate's summary, /srv/bulk/Projects/weir/logs/gate/<worktree dir name>/latest-<quick|full|run>/summary.txt, whose last line is `GATE <name> rc=N`. A job's peak memory includes page cache: if a job is OOM-killed, resubmit once with a 2G larger --mem and say so in your result. Never cancel or touch another submitter's jobs. Keep at most one job of yours queued or running at a time.\nNever set CARGO_TARGET_DIR or make another target dir: the gate slots are the build dirs; a gate that waits for a slot or for jobq's memory is normal. Never run sudo, never run the chaos harness's power-cut campaign, never touch docker images, volumes or containers that aren't weir's, never write the CI-skip token in a commit message. Commits carry only the `Temper-Task` trailer: no Co-Authored-By, Claude-Session or \"Generated with\" lines. Never print a secret or token.\nA fix also adds one line under CHANGELOG.md `## [Unreleased]` (replace its \"Nothing yet.\" line), in `### Fixed`, or `### Changed` for a behaviour an operator can notice, in the file's existing style. The `docs_drift` and `demo_drift` tests guard figures and version strings in the docs: if a fix trips one, fix the doc, never weaken the guard.\nClean up what you start on beast (test processes, tmux servers); leave worktrees in place.",
+  "flaky": [],
+  "gate_slots": 2,
+  "part": "sweep"
+}
