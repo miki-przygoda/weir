@@ -102,6 +102,16 @@ fn sealed_segments_in(shard_dir: &Path) -> Result<Vec<PathBuf>, String> {
         .collect())
 }
 
+/// Whether a listed segment is gone now. The live drain deletes a delivered
+/// segment between `list_segment_files` and the open, so a read that fails on
+/// a segment no longer there is treated as if the segment had never been
+/// listed: exactly what a run started a moment later would see, so nothing
+/// it would have flagged goes unflagged. `weir-wab`'s errors drop the
+/// `io::ErrorKind`, hence a fresh check rather than matching on the error.
+fn segment_vanished(seg: &Path) -> bool {
+    matches!(seg.try_exists(), Ok(false))
+}
+
 /// The sequence number in a segment file name (`seg_00000042.wab.sealed` →
 /// 42), or `None` for a name the daemon would not have written.
 fn segment_seq(path: &Path) -> Option<u64> {
@@ -292,8 +302,14 @@ pub(crate) fn cmd_attest_seal(
                 prev = sidecar.head;
                 continue;
             }
-            let sidecar =
-                chain_segment(&seg, prev).map_err(|e| format!("chain {}: {e}", seg.display()))?;
+            let sidecar = match chain_segment(&seg, prev) {
+                Ok(sidecar) => sidecar,
+                // Delivered and deleted after the listing (`segment_vanished`):
+                // the next segment chains from `prev`, as if this one had
+                // never been listed.
+                Err(_) if segment_vanished(&seg) => continue,
+                Err(e) => return Err(format!("chain {}: {e}", seg.display())),
+            };
             write_sidecar_durably(&sp, &sidecar.encode())?;
             emit_attest_head_line(&sidecar, json);
             prev = sidecar.head;
@@ -668,7 +684,6 @@ pub(crate) fn cmd_attest_verify(
         let mut disposed: Option<BTreeSet<u64>> = None;
         let mut prev_seq: Option<u64> = None;
         for seg in segments {
-            segments_total += 1;
             let name = segment_name_for(&seg);
             let decoded = read_sidecar(&seg);
 
@@ -683,15 +698,36 @@ pub(crate) fn cmd_attest_verify(
             // expected head, so deleting a segment outright is still a broken
             // link.
             let seq = segment_seq(&seg);
+            let mut expected = expected_head;
             if let (Some(prev), Some(cur)) = (prev_seq, seq)
                 && cur > prev.saturating_add(1)
             {
                 let disposed = disposed.get_or_insert_with(|| disposed_seqs(wab_dir, dir));
                 if disposed.range(prev + 1..cur).count() as u64 == cur - prev - 1 {
-                    expected_head = None;
+                    expected = None;
                 }
             }
+
+            // Read the segment before recording anything about it. If a read
+            // fails because the live drain deleted the segment after it was
+            // listed, it was delivered: skip it as if it had never been
+            // listed, so the gap check above covers it on the next segment
+            // exactly as it would have a moment later (`segment_vanished`).
+            // Only a failed or skipped read qualifies: a divergence already
+            // read is evidence, whatever happens to the file afterwards.
+            let recomputed = match (decoded.as_ref(), expected) {
+                (None, Some(prev)) => Some(chain_segment(&seg, prev)),
+                _ => None,
+            };
+            let verdict = verify_segment(&seg);
+            let unread = matches!(recomputed, Some(Err(_)))
+                || matches!(verdict, Err(_) | Ok(Verdict::MissingSidecar));
+            if unread && segment_vanished(&seg) {
+                continue;
+            }
+            segments_total += 1;
             prev_seq = seq;
+            expected_head = expected;
 
             // A chain origin: no predecessor was observed (the first segment
             // of a shard, or the oldest to survive reclamation or a quarantine
@@ -731,9 +767,9 @@ pub(crate) fn cmd_attest_verify(
             // deleting a tampered segment's sidecar turned a detected
             // divergence into `exit 0`. Deleting a sidecar must BREAK the
             // link, not erase it.
-            expected_head = match (decoded.as_ref(), expected_head) {
+            expected_head = match (decoded.as_ref(), recomputed) {
                 (Some(sidecar), _) => Some(sidecar.head),
-                (None, Some(prev)) => match chain_segment(&seg, prev) {
+                (None, Some(recomputed)) => match recomputed {
                     Ok(recomputed) => Some(recomputed.head),
                     // Structurally unreadable, so the next boundary is
                     // genuinely uncheckable. "Could not check" is the exit-2
@@ -748,7 +784,7 @@ pub(crate) fn cmd_attest_verify(
                 (None, None) => None,
             };
 
-            match verify_segment(&seg) {
+            match verdict {
                 Ok(Verdict::Verified) => verified += 1,
                 Ok(Verdict::Diverged {
                     at_record,
@@ -1573,6 +1609,75 @@ mod tests {
             "a gap the daemon accounts for with a quarantined copy must not exit 1: {body}"
         );
         assert!(body.contains("weir_attest_chain_origins 2"), "{body}");
+    }
+
+    /// Replaces `seg` with a dangling symlink under the same name: it is
+    /// listed, then fails to open with `NotFound` — the same thing verify and
+    /// seal see when the live drain deletes a segment between
+    /// `list_segment_files` and the open.
+    #[cfg(unix)]
+    fn vanish_after_listing(seg: &Path) {
+        std::fs::remove_file(seg).unwrap();
+        std::os::unix::fs::symlink(seg.with_extension("gone"), seg).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_segment_the_drain_deletes_mid_verify_is_not_an_error() {
+        // The drain writes the tombstone, then deletes the segment; the
+        // `.attest` sidecar stays. A segment delivered after the listing is
+        // the same as one delivered before it, not "could not check".
+        let (code, body) = verify_after_middle_disposed("deleted_mid_verify", |_, seg1| {
+            let shard = seg1.parent().unwrap();
+            std::fs::write(shard.join("seg_00000001.wab.confirmed"), b"1").unwrap();
+            vanish_after_listing(seg1);
+        });
+        assert_eq!(code, ExitCode::SUCCESS, "{body}");
+        assert!(body.contains("weir_attest_verify_failures 0"), "{body}");
+        assert!(body.contains("weir_attest_segments 2"), "{body}");
+        assert!(body.contains("weir_attest_chain_origins 2"), "{body}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unattested_segment_the_drain_deletes_mid_verify_is_not_an_error() {
+        // No sidecar and a predecessor observed: verify recomputes the head
+        // with `chain_segment`, which is where the open fails.
+        let scratch = Scratch::new("unattested_deleted_mid_verify");
+        let shard = scratch.path().join("shard_00");
+        write_segment(&shard.join("seg_00000000.wab.sealed"), 0, &[b"a"]);
+        cmd_attest_seal(scratch.path(), None, false).unwrap();
+        let seg1 = shard.join("seg_00000001.wab.sealed");
+        write_segment(&seg1, 0, &[b"b"]);
+        std::fs::write(shard.join("seg_00000001.wab.confirmed"), b"1").unwrap();
+        vanish_after_listing(&seg1);
+
+        let metrics_path = scratch.path().join("weir_attest.prom");
+        let code = cmd_attest_verify(scratch.path(), None, Some(&metrics_path), false);
+        let body = std::fs::read_to_string(&metrics_path).unwrap();
+        assert_eq!(code, ExitCode::SUCCESS, "{body}");
+        assert!(body.contains("weir_attest_verify_failures 0"), "{body}");
+        assert!(body.contains("weir_attest_missing_sidecar 0"), "{body}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn seal_skips_a_segment_the_drain_deletes_mid_run() {
+        // The deleted segment must not abort the run and leave every later
+        // segment unchained.
+        let scratch = Scratch::new("deleted_mid_seal");
+        let shard = scratch.path().join("shard_00");
+        let seg0 = shard.join("seg_00000000.wab.sealed");
+        let seg1 = shard.join("seg_00000001.wab.sealed");
+        write_segment(&seg0, 0, &[b"a"]);
+        write_segment(&seg1, 0, &[b"b"]);
+        std::fs::write(shard.join("seg_00000000.wab.confirmed"), b"1").unwrap();
+        vanish_after_listing(&seg0);
+
+        cmd_attest_seal(scratch.path(), None, false).expect("seal must not abort");
+        assert!(!sidecar_path(&seg0).exists());
+        let sidecar = read_sidecar(&seg1).expect("the later segment must be chained");
+        assert_eq!(sidecar.prev_head, ChainHead::ORIGIN);
     }
 
     #[test]

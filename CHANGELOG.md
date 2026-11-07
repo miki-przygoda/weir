@@ -29,6 +29,12 @@ protocol** below.
   directory the weir user cannot read, such as a root-owned `lost+found` when
   `wab_dir` is a mount root, no longer makes every `seal` exit 1 with no shard
   chained, nor every `verify` exit 2 with `weir_attest_verify_failures` above 0.
+- `weir-ctl attest verify` and `attest seal` now skip a sealed segment the
+  live drain delivers and deletes after the run has listed it, as `weir-ctl
+  status` already does offline. Run against a busy daemon's `wab_dir`,
+  `verify` no longer exits 2 with `No such file or directory` and
+  `weir_attest_verify_failures` above 0, and `seal` no longer aborts with
+  every later segment left unchained.
 - The MySQL sink now strands, rather than dead-letters, a batch that fails
   with server error `1040` (`ER_CON_COUNT_ERROR`, too many connections),
   `1203` (`ER_TOO_MANY_USER_CONNECTIONS`) or `1053` (`ER_SERVER_SHUTDOWN`), as
