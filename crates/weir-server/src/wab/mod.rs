@@ -327,6 +327,13 @@ pub(crate) fn recover(
     for shard_id in 0..shard_count {
         create_dir_private(shard_dir_path(wab_dir, shard_id))?;
     }
+    // A shard directory just created is linked into `wab_dir`, and that entry
+    // is crash-durable only after `wab_dir` itself is fsynced (the rule
+    // segments and `dead_letter/` already follow). Without this, the first
+    // Durable ack on a fresh `wab_dir` could sit in a shard dir a power loss
+    // removes. Runs before any flusher exists, so no ack precedes it.
+    #[cfg(unix)]
+    segment::sync_path(wab_dir)?;
     recover_open_segments(wab_dir, metrics)?;
     Ok(RecoverySummary {
         shard_dirs: shard_count,
@@ -2478,6 +2485,33 @@ mod tests {
                 assert_eq!(mode & 0o777, 0o700, "shard_{id:02} must be private");
             }
         }
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// The shard directories `recover` creates are linked into `wab_dir`, and
+    /// that link is crash-durable only once `wab_dir` itself is fsynced. The
+    /// first Durable ack on a fresh `wab_dir` lands in a segment under one of
+    /// them, so `recover` must fsync `wab_dir` before any flusher starts, and
+    /// a failed fsync must fail startup rather than ack into an entry a power
+    /// loss could undo.
+    #[cfg(unix)]
+    #[test]
+    fn recover_fsyncs_wab_dir_so_new_shard_dirs_are_durable() {
+        use crate::wab::segment::sync_hook;
+        let dir = tmp_dir("recover_fsyncs_wab_dir");
+        let metrics = Arc::new(Metrics::new().0);
+
+        sync_hook::fail(&dir, libc::EIO, 0);
+        recover(&dir, 2, &metrics).unwrap();
+        assert!(
+            sync_hook::calls(&dir) >= 1,
+            "recover must fsync wab_dir after creating the shard dirs"
+        );
+
+        sync_hook::fail(&dir, libc::EIO, 1);
+        let err = recover(&dir, 2, &metrics).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EIO));
+        sync_hook::forget(&dir);
         fs::remove_dir_all(dir).ok();
     }
 

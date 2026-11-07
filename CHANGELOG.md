@@ -17,6 +17,10 @@ protocol** below.
 
 ### Fixed
 
+- Startup now fsyncs `wab_dir` after creating the `shard_NN` directories, so
+  the first `Durable` acks on a fresh `wab_dir` no longer land in a shard
+  directory whose own entry a power loss could still remove. A failed fsync
+  fails startup.
 - A `WEIR_*` environment variable that is not valid UTF-8 no longer has its
   value printed in the startup error: the message names the variable only, so
   a secret such as `WEIR_SINK_URL`'s credentials or
