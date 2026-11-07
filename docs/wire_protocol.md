@@ -378,7 +378,7 @@ protocol error ⇒ close" contract. The mapping is:
 | Body-decode failure | Nack reason |
 |---|---|
 | a zero-length record | `EmptyPayload` (`0x07`) |
-| more than `max_batch_records` records, or one over `max_payload_bytes` | `PayloadTooLarge` (`0x04`) |
+| more than `max_batch_records` records, or one over `max_payload_bytes` (the whole body is already capped at `max_payload_bytes` by the frame-length check, before it is read) | `PayloadTooLarge` (`0x04`) |
 | anything else — bad batch version, `record_count == 0`, a record length that disagrees with the body, trailing bytes | **`BadBatchFraming` (`0x0B`)** |
 
 `BadBatchFraming` is the reason a client sees for most malformed `PushBatch`

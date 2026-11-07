@@ -1478,6 +1478,32 @@ mod tests {
         assert_eq!(payload[0], NackReason::PayloadTooLarge as u8);
     }
 
+    /// `max_payload_bytes` caps the whole frame payload, so a `PushBatch`
+    /// body counts as one payload: two 600-byte records, each under a
+    /// 1024-byte cap, still make a body over it and are refused before the
+    /// body is read. `max_batch_records` and `max_payload_bytes` do not
+    /// multiply (docs/operations/configuration.md says so).
+    #[tokio::test]
+    async fn push_batch_body_over_config_cap_is_refused_even_when_each_record_fits() {
+        let cfg = ConnectionConfig {
+            max_payload_bytes: 1024,
+            ..test_cfg()
+        };
+        let mut client = spawn_handler(cfg).await;
+        let record = vec![0xabu8; 600];
+        let body = weir_core::encode_batch_body(&[&record[..], &record[..]]);
+        assert!(body.len() > 1024, "the body must exceed the cap");
+        let frame = Envelope::new(
+            Header::new(MessageType::PushBatch, Durability::Durable, 0),
+            body,
+        )
+        .encode();
+        client.write_all(&frame).await.unwrap();
+        let (msg_type, payload) = read_response(&mut client).await;
+        assert_eq!(msg_type, MessageType::Nack);
+        assert_eq!(payload[0], NackReason::PayloadTooLarge as u8);
+    }
+
     #[tokio::test]
     async fn bad_payload_crc_returns_nack_after_payload_read() {
         let mut client = spawn_handler(test_cfg()).await;

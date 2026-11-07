@@ -17,6 +17,10 @@ protocol** below.
 
 ### Fixed
 
+- The configuration reference no longer says `max_batch_records` and
+  `max_payload_bytes` multiply. `max_payload_bytes` caps a whole `PushBatch`
+  body, so a batch whose records each fit but whose body does not gets
+  `Nack(PayloadTooLarge)` and a closed connection; the docs now say so.
 - `WeirClient::push_batch` now rejects a batch whose encoded body exceeds
   the 16 MiB protocol hard cap locally, as a recoverable
   `ClientError::PayloadTooLarge`, even when every record fits. It used to

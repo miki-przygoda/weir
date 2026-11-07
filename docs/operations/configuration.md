@@ -939,7 +939,8 @@ alerts; those, with their runbooks, are in
 - **Env**: `WEIR_MAX_PAYLOAD_BYTES`
 - **TOML**: `max_payload_bytes`
 
-Maximum size of a single record payload. The hard cap of 16 MiB is
+Maximum size of a single frame payload: one record for a `Push`, the whole
+batch body for a `PushBatch`. The hard cap of 16 MiB is
 compiled into `weir-core` (`MAX_PAYLOAD_HARD_CAP`) and cannot be
 exceeded at runtime; raising the config value above the hard cap is a
 startup error.
@@ -986,10 +987,16 @@ arbitrary — it is the largest cap for which the `AckBatch` reply (3 bytes plus
 bound weir already publishes, so batching introduces no new largest response and
 no client gains a new allocation maximum.
 
-**When to tune**: lower it alongside `max_payload_bytes` on memory-constrained
-hosts — the two multiply, since a batch of N records each up to
-`max_payload_bytes` is one frame. Raising it toward 2048 trades a larger
-worst-case frame for fewer round trips.
+**When to tune**: the two caps do not multiply. A `PushBatch` is one frame, and
+`max_payload_bytes` caps that frame's whole payload (the batch body: every
+record plus its 4-byte length prefix) before it is read, so a batch can never
+be larger than one record may be. Two 600-byte records under a 1024-byte
+`max_payload_bytes` are refused with `Nack(PayloadTooLarge)` and the connection
+is closed, though each record fits on its own. Worst-case receive memory is
+therefore still `max_connections × max_payload_bytes` whatever this is set to;
+this knob bounds how many records one frame can declare, not the frame's size.
+Lower it to cap the per-record work of one frame; raising it toward 2048 allows
+fewer round trips for small records.
 
 ---
 
