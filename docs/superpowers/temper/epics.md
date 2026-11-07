@@ -5,7 +5,7 @@
 
 | Epic | Status | Needs (contracts from other epics) | Spec |
 |---|---|---|---|
-| cleanup-2026-11 | stabilising | none | [spec](cleanup-2026-11/spec.md) |
+| cleanup-2026-11 | ready | none | [spec](cleanup-2026-11/spec.md) |
 
 ## Contracts between epics
 

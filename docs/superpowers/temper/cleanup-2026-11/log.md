@@ -115,3 +115,19 @@
 - config-reload-and-startup-05/06/07 (unverified): admin socket under-wab_dir check is lexical; the invalid sink type error omits `s3`; `FEATURE_GATED_FLAGS` lacks the mysql/postgres `id_column` flags. test-strength-and-docs-01 (WEIR_DST_SEED printed in the repro line but never read) unverified.
 - weir-ctl-and-attest-r3-04: `.attest` sidecars are never removed after their segment drains. wire-socket-and-client-r3-03 (owner, public error type): `PayloadTooLarge` reports a record count as bytes. -r3-04: nack counters count frames, not records. -r3-05/-06: the TS/Python demo clients mis-handle a HealthCheckResponse and an empty Nack.
 - Leftover throwaway worktrees under beast's `~/work/weir/cleanup-2026-11/tmp/`, some holding dead agents' probe edits (usage-limit deaths, 5 Nov): for `/temper:cleanup` or by hand.
+
+## 2026-11-07 ~21:00: publish attempt 0: gate_failed (environment), relaunched
+
+- wf_2a30b1ff-18d: docs (96fca04) and evidence (5afbe2e) committed; the full gate (jq-01M6VSAM4P01NWSE7JS9T7880Q, tip 5afbe2e) ended `GATE full rc=1 (1 failed)`. Every step passed except `act-ci-sink-integration`, which never reached a test: docker could not bind `127.0.0.1:55432` for `weir-test-postgres` ("address already in use"). The other sink containers of that run (mysql, clickhouse, minio, compose project `test` from slot a's act-src) were left running; the head removed them and their network (weir's own, from this gate) and checked the four ports were free. Log: /srv/bulk/Projects/weir/logs/gate/gate-1660eb12/full-20261107T195618Z/.
+- Not a code failure; relaunched publish (attempt 1) so the gate runs live again on the same tip.
+- Native macOS tests (head, Mac, `mac-tests.sh` with the cross-build as a jobq job) at 5afbe2e: 20 test executables, 0 failing (weir-server bin: 971 passed, 8 ignored; weir-ctl bin: 162 passed). The darwin TLS smoke of the gate-built binaries was not run.
+
+## 2026-11-07 ~21:30: publish attempt 1: gate_failed again (environment, head's cleanup miss)
+
+- Full gate jq-01M6VVY8YW8TANE4HBGEH1HF89 at 5afbe2e: 27 of 28 steps passed; `act-ci-sink-integration` failed before any test with "network ac8ce520... not found". Cause: the head's cleanup after attempt 0 removed the running weir-test containers and `test_default` but missed the *stopped* `weir-test-postgres` and `weir-test-minio-init` (`docker ps` without `-a`), which compose reused against the deleted network. The gate agent removed all five afterwards. Not pushed. Next: confirm `docker ps -a` shows no weir-test-*, then relaunch publish (attempt 2).
+
+## 2026-11-07 ~22:20: publish attempt 2: ready, PR opened
+
+- Full gate jq-01M6VZK1V1EHDBCQM1HA5E8GXN at 5afbe2e: `GATE full rc=0 (0 failed)`; pre- and post-checks found no leftover weir-test containers or `test_default` network. Log: /srv/bulk/Projects/weir/logs/gate/gate-1660eb12/full-20261107T214546Z/.
+- Fetch-back clean (`ahead: []`); pushed `epic/cleanup-2026-11` (may_push: yes) and opened https://github.com/miki-przygoda/weir/pull/77 against `main`, with the gate and macOS results added to the PR body. Not merged: merging is the owner's.
+- This log commit (and epics.md → ready) follows the gated tip; it touches only `docs/superpowers/temper/`.
