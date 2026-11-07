@@ -17,6 +17,12 @@ protocol** below.
 
 ### Fixed
 
+- The Postgres sink now strands, rather than dead-letters, a batch the
+  server rejects with SQLSTATE `25006` (`read_only_sql_transaction`), as the
+  MySQL sink already does for its read-only error `1290`. A sink URL that
+  points at a hot standby after a failover, or a database with
+  `default_transaction_read_only = on` during maintenance, no longer
+  dead-letters the acked backlog while the condition lasts.
 - The S3 sink now strands, rather than dead-letters, a batch that S3 or
   MinIO rejects with `400 AuthorizationHeaderMalformed`, the answer to a
   request signed for the wrong region. A `sink_s3_region` that does not match

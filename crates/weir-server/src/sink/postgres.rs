@@ -501,6 +501,10 @@ pub(crate) fn is_transient_sqlstate(state: &SqlState) -> bool {
         || state == &SqlState::ADMIN_SHUTDOWN         // 57P01
         || state == &SqlState::CRASH_SHUTDOWN         // 57P02
         || state == &SqlState::CANNOT_CONNECT_NOW     // 57P03
+        // 25006: a hot standby (failover before DNS/proxy moves) or
+        // default_transaction_read_only = on. The target, not the record, is
+        // at fault, so strand and retry, matching MySQL 1290 (--read-only).
+        || state == &SqlState::READ_ONLY_SQL_TRANSACTION // 25006
         || state == &SqlState::UNIQUE_VIOLATION // 23505 — see module docs (Plain mode only)
 }
 
@@ -1137,6 +1141,9 @@ mod tests {
         assert!(is_transient_sqlstate(&SqlState::QUERY_CANCELED));
         assert!(is_transient_sqlstate(&SqlState::ADMIN_SHUTDOWN));
         assert!(is_transient_sqlstate(&SqlState::CANNOT_CONNECT_NOW));
+        // 25006: the target is a hot standby or default_transaction_read_only
+        // is on. Not the record's fault; strand like MySQL's 1290.
+        assert!(is_transient_sqlstate(&SqlState::READ_ONLY_SQL_TRANSACTION));
         // 23505 is in the transient list because under Plain mode the
         // drain should retry — see module docs.
         assert!(is_transient_sqlstate(&SqlState::UNIQUE_VIOLATION));
