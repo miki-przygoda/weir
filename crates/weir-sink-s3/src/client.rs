@@ -73,6 +73,10 @@ pub(crate) fn classify(status: u16, s3_code: Option<&str>) -> Classification {
                 | "InvalidBucketName"
                 // Sibling of ExpiredToken; an STS token problem, not a record one.
                 | "InvalidToken"
+                // A request signed for the wrong region (sink_s3_region does
+                // not match the bucket's or the endpoint's): a config fault,
+                // like SignatureDoesNotMatch.
+                | "AuthorizationHeaderMalformed"
                 // Produced by sink_s3_storage_class / sink_s3_sse / sink_s3_sse_kms_key_id
                 // -- headers THIS SINK adds. A config typo must not dead-letter
                 // a backlog; that is the same argument this module makes for 403.
@@ -400,6 +404,19 @@ mod tests {
                 "{code}"
             );
         }
+    }
+
+    #[test]
+    fn a_wrong_signing_region_strands_rather_than_dead_letters() {
+        // S3 and MinIO answer a request signed for the wrong region (bucket in
+        // eu-west-1, sink_s3_region left at us-east-1) with 400
+        // AuthorizationHeaderMalformed. That is a config fault that applies to
+        // every record in the backlog, so it must strand, like
+        // SignatureDoesNotMatch.
+        assert_eq!(
+            classify(400, Some("AuthorizationHeaderMalformed")),
+            Classification::Transient
+        );
     }
 
     #[test]

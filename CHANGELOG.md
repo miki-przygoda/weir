@@ -17,6 +17,11 @@ protocol** below.
 
 ### Fixed
 
+- The S3 sink now strands, rather than dead-letters, a batch that S3 or
+  MinIO rejects with `400 AuthorizationHeaderMalformed`, the answer to a
+  request signed for the wrong region. A `sink_s3_region` that does not match
+  the bucket or endpoint, such as the `us-east-1` default for a bucket in
+  `eu-west-1`, no longer dead-letters the whole acked backlog.
 - Startup now refuses, in preflight and before recovery, a `socket_path`
   whose parent directory is missing, not a directory, or not writable by the
   daemon user. Before, the refusal came only at the producer-socket bind,
