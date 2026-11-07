@@ -115,9 +115,9 @@ pub struct HttpSinkConfig {
 impl std::fmt::Debug for HttpSinkConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpSinkConfig")
-            // The URL may carry userinfo (user:password@host); redact the password
-            // so it never lands in a Debug-formatted log line (S25).
-            .field("url", &crate::sink::redact_url_password(&self.url))
+            // Only `scheme://host[:port]`: userinfo, path and query may all
+            // carry secrets (S25, security-r3-01).
+            .field("url", &crate::status::config_view::url_origin(&self.url))
             .field("timeout", &self.timeout)
             .field("max_batch_size", &self.max_batch_size)
             .field("batch_mode", &self.batch_mode)
@@ -234,6 +234,17 @@ impl HttpSink {
         self.send_and_classify(req.body(body)).await
     }
 
+    /// A reqwest error rendered without its URL, naming only the sink URL's
+    /// `scheme://host[:port]`: userinfo, path and query can all carry secrets
+    /// (security-r3-01).
+    fn transport_error_text(&self, e: reqwest::Error) -> String {
+        format!(
+            "{} for url ({})",
+            e.without_url(),
+            crate::status::config_view::url_origin(&self.config.url)
+        )
+    }
+
     /// Sends a prepared request and classifies the response into the
     /// committed / transient / permanent buckets the drain expects. Shared by
     /// the per-record and NDJSON-batch paths.
@@ -244,16 +255,13 @@ impl HttpSink {
                 // Network-layer errors are all transient. Connect refused,
                 // DNS failure, timeout, broken pipe — drain retries.
                 //
-                // Defence in depth (S31): this string is stored in
-                // `Transport` and re-logged at warn! by the drain on *every*
-                // retry, so a `scheme://user:pass@host` sink URL must never
-                // bleed its password here. reqwest 0.12 already strips URL
-                // userinfo from its error Display (it lifts it into a Basic-auth
-                // header), but we own the redaction rather than delegating the
-                // guarantee to a transitive dep's formatting — `redact_url_password`
-                // is a no-op when no userinfo is present, so the useful host
-                // diagnostic survives.
-                let rendered = crate::sink::redact_url_password(&e.to_string());
+                // This string is stored in `Transport`, re-logged at warn! by
+                // the drain on *every* retry and kept for the admin view, so
+                // the sink URL must never bleed a secret here (S31,
+                // security-r3-01). reqwest's Display appends the FULL url
+                // (path and query included), so drop it and name only
+                // `scheme://host[:port]`, which keeps the host diagnostic.
+                let rendered = self.transport_error_text(e);
                 debug!(error = %rendered, "sink POST failed at transport layer");
                 return Err(HttpSinkError::Transport(rendered));
             }
@@ -646,12 +654,9 @@ impl HttpSink {
                 SinkHealth::Degraded(format!("HEAD returned {}", resp.status()))
             }
             Ok(resp) => SinkHealth::Down(format!("HEAD returned {}", resp.status())),
-            // Redact any URL password the transport error might carry (S31); see
-            // the matching note on the commit path.
-            Err(e) => SinkHealth::Down(format!(
-                "HEAD failed: {}",
-                crate::sink::redact_url_password(&e.to_string())
-            )),
+            // Only the URL origin, never its path or query (S31,
+            // security-r3-01); see the matching note on the commit path.
+            Err(e) => SinkHealth::Down(format!("HEAD failed: {}", self.transport_error_text(e))),
         }
     }
 }
@@ -1094,6 +1099,60 @@ mod tests {
                 !msg.contains("s3cr3t-passw0rd"),
                 "URL password leaked into health Down message: {msg}"
             ),
+            other => panic!("expected Down for a closed port, got {other:?}"),
+        }
+    }
+
+    // security-r3-01: webhook URLs carry the secret in the path, presigned
+    // URLs in query keys no denylist can enumerate (`X-Amz-Signature`,
+    // `client_secret`, ...). Nothing past `scheme://host[:port]` of the sink
+    // URL may reach Debug output, a transport error or a health message.
+    const PATH_SECRET: &str = "PATHSECRETTOKEN";
+    const QUERY_SECRET: &str = "QUERYSECRETVALUE";
+
+    fn secret_url(authority: &str) -> String {
+        format!(
+            "http://{authority}/services/T0/B0/{PATH_SECRET}\
+             ?X-Amz-Signature={QUERY_SECRET}&client_secret={QUERY_SECRET}"
+        )
+    }
+
+    #[test]
+    fn debug_prints_only_the_url_origin() {
+        let dbg = format!("{:?}", cfg(&secret_url("hooks.example.com")));
+        assert!(
+            !dbg.contains(PATH_SECRET) && !dbg.contains(QUERY_SECRET),
+            "URL path/query secret leaked in Debug: {dbg}"
+        );
+        assert!(dbg.contains("http://hooks.example.com"), "{dbg}");
+    }
+
+    #[tokio::test]
+    async fn transport_error_prints_only_the_url_origin() {
+        let sink = HttpSink::new(cfg(&secret_url("127.0.0.1:1"))).unwrap();
+        let err = sink
+            .commit(SinkBatch::from(vec![p(b"alpha")]))
+            .await
+            .unwrap_err();
+        let rendered = err.to_string();
+        assert!(
+            !rendered.contains(PATH_SECRET) && !rendered.contains(QUERY_SECRET),
+            "URL path/query secret leaked into the transport error: {rendered}"
+        );
+        assert!(rendered.contains("http://127.0.0.1:1"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn health_down_prints_only_the_url_origin() {
+        let sink = HttpSink::new(cfg(&secret_url("127.0.0.1:1"))).unwrap();
+        match sink.health().await {
+            SinkHealth::Down(msg) => {
+                assert!(
+                    !msg.contains(PATH_SECRET) && !msg.contains(QUERY_SECRET),
+                    "URL path/query secret leaked into health Down message: {msg}"
+                );
+                assert!(msg.contains("http://127.0.0.1:1"), "{msg}");
+            }
             other => panic!("expected Down for a closed port, got {other:?}"),
         }
     }

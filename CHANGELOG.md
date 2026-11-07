@@ -15,6 +15,14 @@ protocol** below.
 
 ## [Unreleased]
 
+### Changed
+
+- The HTTP sink now prints only the `scheme://host[:port]` of `sink_url`
+  in its startup `sink: http` log line, its transport-error retries, its
+  health `Down` reason and the admin status text. A webhook token in the
+  path or a presigned signature in any query key used to be printed in
+  full, because the redactor only knew userinfo and ten query keys.
+
 ### Fixed
 
 - The configuration reference no longer says `max_batch_records` and
