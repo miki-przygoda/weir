@@ -22,6 +22,10 @@ protocol** below.
   health `Down` reason and the admin status text. A webhook token in the
   path or a presigned signature in any query key used to be printed in
   full, because the redactor only knew userinfo and ten query keys.
+- A config file that does not parse now names the line and column (or the
+  key) and what was expected, without quoting the offending line or value.
+  A TOML syntax error used to print the whole source line to stderr, and a
+  wrongly typed value was quoted, so a credential on that line was logged.
 
 ### Fixed
 
