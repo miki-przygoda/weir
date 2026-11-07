@@ -128,6 +128,16 @@ def main(argv=None):
     p.add_argument("run_dirs", nargs="+")
     p.add_argument("--allow-anomalies", action="store_true")
     args = p.parse_args(argv)
+    # Each run counts once. The same dir named twice, spelled differently
+    # (`runs/A` and `runs/A/`, a symlink), would count its cuts twice and
+    # could pass the floors with half the cuts, so a duplicate is refused.
+    seen = {}
+    for d in args.run_dirs:
+        real = os.path.realpath(d)
+        if real in seen:
+            print(f"FAIL: run dir {real} named twice ({seen[real]!r} and {d!r})")
+            return 1
+        seen[real] = d
     # run.py writes crash-postmortem.json only when the final pass did not
     # run; its presence is a crashed run whatever episodes.jsonl says.
     crashed = [d for d in args.run_dirs

@@ -107,5 +107,29 @@ class TestCampaignGate(unittest.TestCase):
             self.assertEqual(gate.main(dirs), 1)
 
 
+    def test_the_cli_refuses_a_run_dir_named_twice(self):
+        # The same run named twice, spelled differently, would count its cuts
+        # twice and could pass the floors with half the cuts.
+        with tempfile.TemporaryDirectory() as tmp:
+            dirs = self._write_campaign(tmp)
+            self.assertEqual(gate.main(dirs + [dirs[0] + os.sep]), 1)
+            self.assertEqual(gate.main(dirs + [os.path.join(dirs[1], ".")]), 1)
+            os.symlink(dirs[2], os.path.join(tmp, "alias"))
+            self.assertEqual(gate.main(dirs + [os.path.join(tmp, "alias")]), 1)
+
+    def test_the_cli_does_not_count_a_doubled_half_campaign_as_a_full_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            argv = []
+            for k in gate.GATE_TRIGGERS:
+                d = os.path.join(tmp, k)
+                os.makedirs(d)
+                with open(os.path.join(d, "episodes.jsonl"), "w") as f:
+                    for rec in [cut(i, k) for i in range(130)] + [
+                            {"episode": "final", "ok": True}]:
+                        f.write(json.dumps(rec) + "\n")
+                argv += [d, d + os.sep]
+            self.assertEqual(gate.main(argv), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -34,6 +34,10 @@ protocol** below.
   crashes on SIGTERM, and prints its log: the shutdown step only polled
   `kill -0` and never read the exit status, so a failed shutdown passed as
   "exited cleanly".
+- The chaos harness's Foundations gate (`chaos/orchestrator/gate.py`) now
+  refuses a run dir named twice: `runs/A` and `runs/A/` (or a symlink to it)
+  were keyed apart, so the run's cuts counted twice and a campaign could pass
+  the 1,000-cut and 200-per-schedule floors with half the cuts.
 
 ## [4.1.0] - 2026-10-26
 
