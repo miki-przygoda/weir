@@ -17,6 +17,13 @@ protocol** below.
 
 ### Fixed
 
+- `weir-ctl attest verify` no longer reports a `BROKEN_LINK` (exit 1,
+  `weir_attest_verify_failures` above 0) when the drain has reclaimed or
+  quarantined a segment out of order, as it does while an older segment is
+  stranded or parked. A gap whose missing segments all left a
+  `.wab.confirmed` tombstone or a copy in `quarantine/` now makes the next
+  survivor a chain origin, as spec 3.2 says; a segment deleted with no such
+  trace is still a broken link.
 - The MySQL sink now strands, rather than dead-letters, a batch that fails
   with server error `1040` (`ER_CON_COUNT_ERROR`, too many connections),
   `1203` (`ER_TOO_MANY_USER_CONNECTIONS`) or `1053` (`ER_SERVER_SHUTDOWN`), as
