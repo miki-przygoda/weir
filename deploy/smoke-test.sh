@@ -126,7 +126,10 @@ for metric in \
     weir_queue_depth \
     weir_wab_bytes_on_disk \
     weir_drain_state; do
-    if echo "$METRICS" | grep -q "$metric"; then
+    # A here-string, not `echo | grep -q`: under pipefail, grep -q exits on the
+    # first match and echo's write then fails with SIGPIPE, so a metric that is
+    # present was reported missing on about half the runs.
+    if grep -q -- "$metric" <<<"$METRICS"; then
         info "  ✓ $metric"
     else
         fail "Metric missing from /metrics output: $metric"

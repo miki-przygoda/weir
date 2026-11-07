@@ -38,6 +38,10 @@ protocol** below.
   refuses a run dir named twice: `runs/A` and `runs/A/` (or a symlink to it)
   were keyed apart, so the run's cuts counted twice and a campaign could pass
   the 1,000-cut and 200-per-schedule floors with half the cuts.
+- `deploy/smoke-test.sh` no longer reports a metric that is present as
+  missing from `/metrics` on about half its runs: it piped `echo | grep -q`
+  under `pipefail`, so `grep -q` exiting on the first match failed `echo` with
+  SIGPIPE. It now reads the body from a here-string, as `docker.yml` does.
 
 ## [4.1.0] - 2026-10-26
 
