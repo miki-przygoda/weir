@@ -29,6 +29,10 @@ protocol** below.
 
 ### Fixed
 
+- The test that `weir_drain_state` and `weir_sink_health` exist on the first
+  scrape now matches each whole sample line. It matched bare words such as
+  `draining`, which the `weir_drain_state` HELP text contains, so it passed
+  with the `draining` label never created.
 - The configuration reference and the Postgres sink module doc now list
   SQLSTATE `25006` (`read_only_sql_transaction`) as transient. They still
   said it dead-letters the batch after the sink began to strand and retry it.
