@@ -1837,3 +1837,56 @@ fn the_threat_model_covers_the_health_listener_and_the_admin_socket() {
         problems.join("\n  ")
     );
 }
+
+const POSTGRES_SRC: &str = include_str!("../src/sink/postgres.rs");
+
+/// Every SQLSTATE the Postgres sink retries must be named as transient in the
+/// configuration reference and in the module doc. `25006` was made transient
+/// while both still said it dead-letters the batch.
+#[test]
+fn every_transient_postgres_sqlstate_is_documented() {
+    let body = POSTGRES_SRC
+        .split("pub(crate) fn is_transient_sqlstate")
+        .nth(1)
+        .expect("postgres.rs no longer defines is_transient_sqlstate; update this guard")
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    let codes: Vec<&str> = body
+        .lines()
+        .filter(|l| l.trim_start().starts_with("||") || l.contains("state =="))
+        .filter_map(|l| l.split("// ").nth(1))
+        .map(|c| c.split_whitespace().next().unwrap_or(""))
+        .filter(|c| c.len() == 5 && *c != "23505")
+        .collect();
+    assert!(codes.len() >= 7, "parsed too few SQLSTATEs: {codes:?}");
+    let table = CONFIGURATION
+        .split("### Sink: Postgres")
+        .nth(1)
+        .expect("configuration.md has no Postgres section")
+        .split("#### Error classification")
+        .nth(1)
+        .expect("Postgres section has no Error classification table")
+        .split("####")
+        .next()
+        .unwrap();
+    let module_doc: String = POSTGRES_SRC
+        .lines()
+        .filter(|l| l.starts_with("//!"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut problems = Vec::new();
+    for code in &codes {
+        let tick = format!("`{code}`");
+        if !table
+            .lines()
+            .any(|l| l.contains(&tick) && l.contains("| transient |"))
+        {
+            problems.push(format!("configuration.md: no transient row for {code}"));
+        }
+        if !module_doc.contains(&tick) {
+            problems.push(format!("postgres.rs module doc: no mention of {code}"));
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}

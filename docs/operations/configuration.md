@@ -2118,6 +2118,7 @@ already stored, and both modes then drop the new record as a duplicate (see
 | `55P03` `lock_not_available` | transient | retry |
 | `57014` `query_canceled` | transient | retry |
 | `57P01` `admin_shutdown`, `57P02` `crash_shutdown`, `57P03` `cannot_connect_now` | transient | retry |
+| `25006` `read_only_sql_transaction` (a hot standby, or `default_transaction_read_only = on`) | transient | retry |
 | `23505` `unique_violation` (Plain mode only) | resolved row by row | see [Plain insert mode and duplicate keys](#plain-insert-mode-and-duplicate-keys-mysql-and-postgres) |
 | `42P01` `undefined_table`, `42703` `undefined_column`, `42601` `syntax_error`, `28P01` `invalid_password` | permanent | dead-letter the batch with the server-supplied message |
 | anything else | permanent | dead-letter the batch |

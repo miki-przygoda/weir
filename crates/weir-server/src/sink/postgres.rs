@@ -97,7 +97,9 @@
 //!   `57014` (`query_canceled`),
 //!   `57P01` (`admin_shutdown`),
 //!   `57P02` (`crash_shutdown`),
-//!   `57P03` (`cannot_connect_now`) → transient.
+//!   `57P03` (`cannot_connect_now`),
+//!   `25006` (`read_only_sql_transaction`: a hot standby, or
+//!   `default_transaction_read_only = on`) → transient.
 //! - `23505` (`unique_violation`) — never seen under
 //!   `OnConflictDoNothing`; under `Plain` mode resolved row by row as
 //!   described above, never retried as-is (retrying the identical statement

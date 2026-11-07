@@ -29,6 +29,9 @@ protocol** below.
 
 ### Fixed
 
+- The configuration reference and the Postgres sink module doc now list
+  SQLSTATE `25006` (`read_only_sql_transaction`) as transient. They still
+  said it dead-letters the batch after the sink began to strand and retry it.
 - The `weir starting` log line and the admin config view no longer print a
   `sink_url` or `sink_s3_endpoint` whose userinfo has no `@host` after it
   (`mysql://weir:password`). The `user:password` was taken for `host:port`
