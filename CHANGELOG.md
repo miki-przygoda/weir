@@ -26,13 +26,6 @@ protocol** below.
   `ClientError::PayloadTooLarge`, even when every record fits. It used to
   send the frame, get `Nack(PayloadTooLarge)` back and poison the
   connection.
-- `weir-ctl attest verify` no longer reports a `BROKEN_LINK` (exit 1,
-  `weir_attest_verify_failures` above 0) when the drain has reclaimed or
-  quarantined a segment out of order, as it does while an older segment is
-  stranded or parked. A gap whose missing segments all left a
-  `.wab.confirmed` tombstone or a copy in `quarantine/` now makes the next
-  survivor a chain origin, as spec 3.2 says; a segment deleted with no such
-  trace is still a broken link.
 - `weir-ctl attest seal` and `attest verify` now treat only `shard_<N>`
   directories under `wab_dir` as shards, as the daemon does. A foreign
   directory the weir user cannot read, such as a root-owned `lost+found` when

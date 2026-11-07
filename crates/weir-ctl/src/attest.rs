@@ -29,7 +29,6 @@
 //!   something outside this process's control (a log shipper, an operator
 //!   pasting it somewhere) captures it.
 
-use std::collections::BTreeSet;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -100,48 +99,6 @@ fn sealed_segments_in(shard_dir: &Path) -> Result<Vec<PathBuf>, String> {
         .filter(|(_, state)| *state == SegmentState::Sealed)
         .map(|(p, _)| p)
         .collect())
-}
-
-/// The sequence number in a segment file name (`seg_00000042.wab.sealed` →
-/// 42), or `None` for a name the daemon would not have written.
-fn segment_seq(path: &Path) -> Option<u64> {
-    seq_from_file_name(path.file_name()?.to_str()?)
-}
-
-fn seq_from_file_name(name: &str) -> Option<u64> {
-    let digits = name.strip_prefix("seg_")?;
-    let end = digits.find('.').unwrap_or(digits.len());
-    digits[..end].parse().ok()
-}
-
-/// Sequence numbers of this shard's segments that the daemon itself removed
-/// from the shard directory and left a trace of: a `.wab.confirmed` tombstone
-/// (`confirm_and_delete`, delivered) or a copy in the shared `quarantine/`
-/// directory, named `<shard dir>__<segment>[.N]` (`wab::recovery::quarantine`).
-///
-/// Best-effort: an unreadable directory contributes nothing, which can only
-/// leave a gap unexplained and so reported as a broken link — the
-/// conservative direction.
-fn disposed_seqs(wab_dir: &Path, shard_dir: &Path) -> BTreeSet<u64> {
-    let mut seqs: BTreeSet<u64> = weir_wab::list_segment_files(shard_dir)
-        .map(|files| {
-            files
-                .into_iter()
-                .filter(|(_, state)| *state == SegmentState::Confirmed)
-                .filter_map(|(p, _)| segment_seq(&p))
-                .collect()
-        })
-        .unwrap_or_default();
-    if let Some(shard_name) = shard_dir.file_name().and_then(|n| n.to_str())
-        && let Ok(entries) = std::fs::read_dir(wab_dir.join("quarantine"))
-    {
-        let prefix = format!("{shard_name}__");
-        seqs.extend(entries.flatten().filter_map(|e| {
-            let name = e.file_name();
-            seq_from_file_name(name.to_str()?.strip_prefix(&prefix)?)
-        }));
-    }
-    seqs
 }
 
 /// Best-effort decode of an existing sidecar. `None` on any failure to read or
@@ -663,35 +620,10 @@ pub(crate) fn cmd_attest_verify(
         // off-host anchor, not this walk — which cannot tell retention from
         // deletion, because after either one the predecessor is simply gone.
         let mut expected_head: Option<ChainHead> = None;
-        // Seqs the daemon removed and accounted for; computed only if a gap
-        // between surviving segments actually needs explaining.
-        let mut disposed: Option<BTreeSet<u64>> = None;
-        let mut prev_seq: Option<u64> = None;
         for seg in segments {
             segments_total += 1;
             let name = segment_name_for(&seg);
             let decoded = read_sidecar(&seg);
-
-            // A gap between the predecessor observed and this segment. The
-            // drain does not reclaim strictly in order: it moves on past a
-            // stranded or parked segment and quarantines a bad one, so a
-            // LATER segment can be gone while an earlier one survives. When
-            // every missing seq left the daemon's own trace (a `.wab.confirmed`
-            // tombstone or a quarantined copy), this segment's predecessor is
-            // missing for a known reason and it is a chain origin (spec 3.2).
-            // A gap with no such trace keeps the observed predecessor as the
-            // expected head, so deleting a segment outright is still a broken
-            // link.
-            let seq = segment_seq(&seg);
-            if let (Some(prev), Some(cur)) = (prev_seq, seq)
-                && cur > prev.saturating_add(1)
-            {
-                let disposed = disposed.get_or_insert_with(|| disposed_seqs(wab_dir, dir));
-                if disposed.range(prev + 1..cur).count() as u64 == cur - prev - 1 {
-                    expected_head = None;
-                }
-            }
-            prev_seq = seq;
 
             // A chain origin: no predecessor was observed (the first segment
             // of a shard, or the oldest to survive reclamation or a quarantine
@@ -1516,77 +1448,6 @@ mod tests {
              as one — an unexpected origin is what an operator alerts on, and \
              that signal only works if expected ones land here too: {body}"
         );
-    }
-
-    /// Seals three segments, then removes the middle one the way the daemon
-    /// itself would (`dispose`), and returns verify's exit code and metrics.
-    fn verify_after_middle_disposed(
-        label: &str,
-        dispose: impl FnOnce(&Path, &Path),
-    ) -> (ExitCode, String) {
-        let scratch = Scratch::new(label);
-        let shard = scratch.path().join("shard_00");
-        let seg1 = shard.join("seg_00000001.wab.sealed");
-        write_segment(&shard.join("seg_00000000.wab.sealed"), 0, &[b"a"]);
-        write_segment(&seg1, 0, &[b"b"]);
-        write_segment(&shard.join("seg_00000002.wab.sealed"), 0, &[b"c"]);
-        cmd_attest_seal(scratch.path(), None, false).unwrap();
-
-        dispose(scratch.path(), &seg1);
-
-        let metrics_path = scratch.path().join("weir_attest.prom");
-        let code = cmd_attest_verify(scratch.path(), None, Some(&metrics_path), false);
-        (code, std::fs::read_to_string(&metrics_path).unwrap())
-    }
-
-    #[test]
-    fn a_middle_segment_drained_out_of_order_is_a_chain_origin_not_a_broken_link() {
-        // The drain moves on past a stranded or parked segment, so a LATER
-        // segment can drain and be reclaimed while an older one is still on
-        // disk. `confirm_and_delete` leaves the `.wab.confirmed` tombstone
-        // behind: that gap is normal operation, not tampering (spec 3.2: a
-        // segment whose predecessor is missing is a chain origin).
-        let (code, body) = verify_after_middle_disposed("drained_out_of_order", |_, seg1| {
-            let shard = seg1.parent().unwrap();
-            std::fs::write(shard.join("seg_00000001.wab.confirmed"), b"1").unwrap();
-            std::fs::remove_file(seg1).unwrap();
-        });
-        assert_eq!(
-            code,
-            ExitCode::SUCCESS,
-            "a gap the drain accounts for with a tombstone must not exit 1: {body}"
-        );
-        assert!(body.contains("weir_attest_verify_failures 0"), "{body}");
-        assert!(body.contains("weir_attest_chain_origins 2"), "{body}");
-    }
-
-    #[test]
-    fn a_middle_segment_quarantined_by_the_drain_is_a_chain_origin_not_a_broken_link() {
-        let (code, body) = verify_after_middle_disposed("quarantined_middle", |wab_dir, seg1| {
-            let q = wab_dir.join("quarantine");
-            std::fs::create_dir_all(&q).unwrap();
-            std::fs::rename(seg1, q.join("shard_00__seg_00000001.wab.sealed")).unwrap();
-        });
-        assert_eq!(
-            code,
-            ExitCode::SUCCESS,
-            "a gap the daemon accounts for with a quarantined copy must not exit 1: {body}"
-        );
-        assert!(body.contains("weir_attest_chain_origins 2"), "{body}");
-    }
-
-    #[test]
-    fn a_tombstone_for_another_shard_does_not_excuse_a_gap() {
-        // The quarantine directory is shared by every shard: a copy of
-        // shard_01's seg 1 says nothing about shard_00's.
-        let (code, body) =
-            verify_after_middle_disposed("other_shard_quarantine", |wab_dir, seg1| {
-                let q = wab_dir.join("quarantine");
-                std::fs::create_dir_all(&q).unwrap();
-                std::fs::write(q.join("shard_01__seg_00000001.wab.sealed"), b"x").unwrap();
-                std::fs::remove_file(seg1).unwrap();
-            });
-        assert_eq!(code, ExitCode::from(1), "{body}");
     }
 
     #[test]

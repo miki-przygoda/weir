@@ -748,14 +748,10 @@ longer matches its recorded hash chain, or a segment's recorded link to its
 predecessor no longer matches what that predecessor actually produced (a
 **broken link** — reported as `BROKEN_LINK` in `verify`'s text output —
 which is what deleting or substituting a whole segment out of a chain looks
-like). Reclaiming segments is not this: retention removes them
+like). Reclaiming the *oldest* segments is not this: retention removes them
 continuously, the oldest survivor is reported as a chain origin instead, and
-`weir_attest_chain_origins` is where that shows up. The same holds for a gap
-in the middle of a shard when every missing segment left the daemon's own
-trace, a `.wab.confirmed` tombstone or a copy in `quarantine/`: the drain
-reclaims out of order while an older segment is stranded or parked. A broken
-link always names a boundary between two segments that are both still on
-disk, with nothing but untraced deletions between them.
+`weir_attest_chain_origins` is where that shows up. A broken link always
+names a boundary between two segments that are both still on disk.
 
 **This is an integrity incident, not a durability one.** The records were
 acked and fsynced correctly at the time; the bytes on disk (or the set of
