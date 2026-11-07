@@ -86,6 +86,9 @@
 //!   so the drain retries until it's fixed rather than dead-lettering live data.
 //!   This matches the Postgres sink, where a connection-time auth failure is a
 //!   non-DbError and already transient.
+//! - Server capacity and shutdown codes 1040 (`ER_CON_COUNT_ERROR`), 1203
+//!   (`ER_TOO_MANY_USER_CONNECTIONS`) and 1053 (`ER_SERVER_SHUTDOWN`) →
+//!   transient: a connection storm or a restart, not the record's fault.
 //! - Code 1062 (`ER_DUP_ENTRY`) — never seen under `INSERT IGNORE`; under
 //!   `plain` mode resolved row by row as described above, never retried
 //!   as-is (retrying the identical statement was a livelock).
@@ -365,6 +368,14 @@ pub(crate) fn is_transient_server_code(code: u16) -> bool {
             | 1045  // ER_ACCESS_DENIED_ERROR (bad user/password)
             | 1044  // ER_DBACCESS_DENIED_ERROR (no access to database)
             | 1142 // ER_TABLEACCESS_DENIED_ERROR (no access to table)
+            // Server capacity and shutdown — a transient server condition, not
+            // the record's fault. 1040/1203 arrive as a Server error from the
+            // connection handshake when the server is at its connection limit;
+            // 1053 kills an in-flight statement during a restart. The Postgres
+            // sink retries the same conditions (pool errors, 57P01).
+            | 1040 // ER_CON_COUNT_ERROR (too many connections)
+            | 1203 // ER_TOO_MANY_USER_CONNECTIONS (max_user_connections)
+            | 1053 // ER_SERVER_SHUTDOWN (server shutdown in progress)
     )
 }
 
@@ -964,6 +975,12 @@ mod tests {
         assert!(is_transient_server_code(1045)); // access denied (bad password)
         assert!(is_transient_server_code(1044)); // db access denied
         assert!(is_transient_server_code(1142)); // table access denied
+        // Server-side capacity and shutdown: transient server conditions, not
+        // the record's fault, so strand and retry (the Postgres sink retries
+        // pool errors and 57P01 admin_shutdown the same way).
+        assert!(is_transient_server_code(1040)); // too many connections
+        assert!(is_transient_server_code(1203)); // max_user_connections
+        assert!(is_transient_server_code(1053)); // server shutdown in progress
 
         // Things that must dead-letter — retrying won't help (the data is at fault).
         assert!(!is_transient_server_code(1064)); // syntax error
@@ -990,6 +1007,14 @@ mod tests {
         assert!(
             classify(server(1045)).is_transient(),
             "access-denied (1045) is a fixable misconfig — transient, not dead-letter (F31)"
+        );
+        assert!(
+            classify(server(1040)).is_transient(),
+            "too-many-connections (1040) at handshake must strand, not dead-letter"
+        );
+        assert!(
+            classify(server(1053)).is_transient(),
+            "server-shutdown (1053) on a restart must strand, not dead-letter"
         );
         assert!(
             !classify(server(1064)).is_transient(),

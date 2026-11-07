@@ -1923,6 +1923,7 @@ How to phrase the INSERT statement.
 | 1213 `ER_LOCK_DEADLOCK` | transient | retry |
 | 1290 `ER_OPTION_PREVENTS_STATEMENT` (e.g. `--read-only`) | transient | retry |
 | 1317 `ER_QUERY_INTERRUPTED` | transient | retry |
+| 1040 `ER_CON_COUNT_ERROR`, 1203 `ER_TOO_MANY_USER_CONNECTIONS`, 1053 `ER_SERVER_SHUTDOWN` | transient | retry (the server is at its connection limit or restarting) |
 | 1045 `ER_ACCESS_DENIED_ERROR`, 1044 `ER_DBACCESS_DENIED_ERROR`, 1142 `ER_TABLEACCESS_DENIED_ERROR` | transient | retry until the grant or password is fixed (a misconfiguration, not the record's fault) |
 | 1062 `ER_DUP_ENTRY` (Plain mode only) | resolved row by row | see [Plain insert mode and duplicate keys](#plain-insert-mode-and-duplicate-keys-mysql-and-postgres) |
 | 1064 `ER_PARSE_ERROR`, 1146 `ER_NO_SUCH_TABLE`, 1054 `ER_BAD_FIELD_ERROR` | permanent | dead-letter the batch with the server-supplied message |

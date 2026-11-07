@@ -17,6 +17,12 @@ protocol** below.
 
 ### Fixed
 
+- The MySQL sink now strands, rather than dead-letters, a batch that fails
+  with server error `1040` (`ER_CON_COUNT_ERROR`, too many connections),
+  `1203` (`ER_TOO_MANY_USER_CONNECTIONS`) or `1053` (`ER_SERVER_SHUTDOWN`), as
+  the Postgres sink already does for pool errors and `57P01`. A server at its
+  `max_connections` limit, or a routine MySQL restart, no longer dead-letters
+  acked records.
 - The Postgres sink now strands, rather than dead-letters, a batch the
   server rejects with SQLSTATE `25006` (`read_only_sql_transaction`), as the
   MySQL sink already does for its read-only error `1290`. A sink URL that
