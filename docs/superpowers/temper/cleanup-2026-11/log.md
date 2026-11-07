@@ -94,3 +94,24 @@
   - Attest: **revert both** 72bae97 and fe31ac1 (head: e8a93fb, 523afa5; the CHANGELOG conflict resolved by dropping only 72bae97's bullet). The original false-positive (out-of-order drain deletes read as BROKEN_LINK) and the deleted-mid-run NotFound go back to the open owner items for a proper design. f1a1e0d (lost+found) stays.
   - Dedup keys: **owner items for now.** sinks-r3-02 (HTTP NDJSON batch Idempotency-Key, content-only) and sinks-r3-01 (ClickHouse insert_deduplication_token, pinned to 1.x) stay unchanged in this PR and are written up with their evidence; a coordinate-based key (like S3's) is a separate change with a `Changed` note.
 - Fix round 4 launched: security-r3-01, security-r3-02, status-metrics-and-admin-r3-02, security-r3-04, postgres-docs-25006 (attempt 4).
+
+## 2026-11-07 ~20:00: fix round 4 stable, stage 4 done
+
+- wf_ebee96d0-462 returned `stable`: security-r3-01 (9c7b33e), security-r3-02 (4179b12), status-metrics-and-admin-r3-02 (972b42f), postgres-docs-25006 (ef52f0b), security-r3-04 (e15903d). No regressions, none reverted or blocked, no flaky reruns. Shas verified.
+- Stage 4 ends here (`sweeps: 1` per round; every area of the repo was reviewed once across the r1/r3 batches). Stage 5 (publish) launched.
+
+## Open items (for the PR body)
+
+**Owner decisions needed**
+- sinks-r3-01 (critical): ClickHouse `insert_deduplication_token` is the content-only DedupToken, pinned to its 1.x value by `dedup_token_is_unchanged_from_weir_1_x`: two distinct batches with identical bytes (e.g. heartbeats) collide inside the dedup window and ClickHouse silently drops the second with HTTP 200. Owner: left for a separate change (7 Nov).
+- sinks-r3-02 (critical, returned `contract`): HTTP NDJSON batch mode sends the content-only DedupToken as `Idempotency-Key`, so an idempotent endpoint drops a later byte-identical batch. Owner: left for a separate change with a coordinate-based key like the S3 sink's (7 Nov).
+- weir-ctl-and-attest-r3-01 and -r3-03 (important): `attest verify` reports BROKEN_LINK when the drain reclaims a segment out of order, and errors (exit 2) on a segment the drain deletes mid-run. The fixes (72bae97, fe31ac1) were reverted at the owner's call (7 Nov) because they let `rm` + an empty `touch seg_N.wab.confirmed` hide a deleted segment; needs a design that can't be forged by a file name.
+- D10: an explicit missing `--config` still only WARNs (deferred decision, unchanged).
+- Possible pre-existing flake: `weir-server system::sigterm_unlinks_the_socket_at_once_and_metrics_stay_up_until_exit` failed once (ECONNRESET instead of EOF, system.rs:6183) in a quick gate on 7 Nov; the full gate decides.
+
+**Minor (not fixed)**
+- deploy-ci-and-chaos-harness-04: `run_bare_metal_bench.sh` reports /run's mount options for a tmpfs /tmp. -05: `deploy/smoke-test.sh` says it pushes 30 records across three tiers; it pushes 20 across two.
+- docs.yml's `workflow_dispatch` builds the book but never deploys it; chaos `SETUP.md` / `run-soak.sh` label power-loss schedules as "kill -9 only".
+- config-reload-and-startup-05/06/07 (unverified): admin socket under-wab_dir check is lexical; the invalid sink type error omits `s3`; `FEATURE_GATED_FLAGS` lacks the mysql/postgres `id_column` flags. test-strength-and-docs-01 (WEIR_DST_SEED printed in the repro line but never read) unverified.
+- weir-ctl-and-attest-r3-04: `.attest` sidecars are never removed after their segment drains. wire-socket-and-client-r3-03 (owner, public error type): `PayloadTooLarge` reports a record count as bytes. -r3-04: nack counters count frames, not records. -r3-05/-06: the TS/Python demo clients mis-handle a HealthCheckResponse and an empty Nack.
+- Leftover throwaway worktrees under beast's `~/work/weir/cleanup-2026-11/tmp/`, some holding dead agents' probe edits (usage-limit deaths, 5 Nov): for `/temper:cleanup` or by hand.
