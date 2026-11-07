@@ -33,9 +33,6 @@ protocol** below.
   scrape now matches each whole sample line. It matched bare words such as
   `draining`, which the `weir_drain_state` HELP text contains, so it passed
   with the `draining` label never created.
-- The configuration reference and the Postgres sink module doc now list
-  SQLSTATE `25006` (`read_only_sql_transaction`) as transient. They still
-  said it dead-letters the batch after the sink began to strand and retry it.
 - The `weir starting` log line and the admin config view no longer print a
   `sink_url` or `sink_s3_endpoint` whose userinfo has no `@host` after it
   (`mysql://weir:password`). The `user:password` was taken for `host:port`
@@ -65,7 +62,9 @@ protocol** below.
   MySQL sink already does for its read-only error `1290`. A sink URL that
   points at a hot standby after a failover, or a database with
   `default_transaction_read_only = on` during maintenance, no longer
-  dead-letters the acked backlog while the condition lasts.
+  dead-letters the acked backlog while the condition lasts. The
+  configuration reference and the sink's module doc list `25006` as
+  transient.
 - The S3 sink now strands, rather than dead-letters, a batch that S3 or
   MinIO rejects with `400 AuthorizationHeaderMalformed`, the answer to a
   request signed for the wrong region. A `sink_s3_region` that does not match

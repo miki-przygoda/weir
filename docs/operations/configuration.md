@@ -1409,15 +1409,22 @@ Mind the other exposure surfaces: passing `--sink-url` on the **command line**
 puts the credential in the process argv, visible via `ps aux` to any same-uid
 process; and even `WEIR_SINK_URL` is readable via `/proc/<pid>/environ` or
 `ps eww`. The env var is the best of the three (off disk, out of `ps aux`);
-restrict who can read the daemon's `/proc` entry. weir redacts credentials in
-its own logs and the config-debug line: both the URL **userinfo** password
+restrict who can read the daemon's `/proc` entry. weir keeps the URL's
+credentials out of its own logs. The `weir starting` line and the admin config
+view show only `scheme://host[:port]`, and a URL whose userinfo has no `@host`
+after it (`mysql://weir:password`) shows as `<unparseable>`. The HTTP sink also
+prints only `scheme://host[:port]` of `sink_url` in its `sink: http` startup
+line, its transport-error retries, its health `Down` reason and the admin status
+text, so a webhook token in the path or a presigned signature in any query key
+(`X-Amz-Signature`, `client_secret`, ...) is never printed. The SQL sinks
+(MySQL, Postgres, ClickHouse) scrub the URL **userinfo** password
 (`scheme://user:<redacted>@host`) and the values of known **credential query
 parameters** (`?password=`, `?token=`, `?access_token=`, `?secret=`,
-`?api_key=`/`?apikey=`, `?sig=`/`?signature=`, `?passwd=`/`?pwd=`) are scrubbed
-wherever a sink URL is logged, including inside transport-error strings on every
-retry. This is a defence-in-depth denylist, not a guarantee for arbitrary custom
-credential parameters — prefer a bearer token (`WEIR_SINK_BEARER_TOKEN`) or the
-userinfo form, and treat the `/proc`/`ps` surfaces above as the real boundary.
+`?api_key=`/`?apikey=`, `?sig=`/`?signature=`, `?passwd=`/`?pwd=`) wherever
+they log a URL, including inside transport-error strings on every retry. That
+is a defence-in-depth denylist, not a guarantee for arbitrary custom credential
+parameters — prefer a bearer token (`WEIR_SINK_BEARER_TOKEN`) or the userinfo
+form, and treat the `/proc`/`ps` surfaces above as the real boundary.
 
 For HTTP, the body is the raw payload bytes; `Content-Type` is
 `application/octet-stream`. The endpoint is expected to return:

@@ -713,7 +713,11 @@ A non-Rust client that satisfies the following is wire-compatible:
       a priori. Treat a `Nack(PayloadTooLarge 0x04)` as **authoritative**: the
       frame exceeded the daemon's effective cap regardless of the client's own
       estimate. Sending larger frames is wasted I/O; the daemon closes the
-      connection after the Nack without reading the payload.
+      connection after the Nack without reading the payload. For a
+      `PushBatch` the cap applies to the **whole batch body**, not to each
+      record: a batch of records that each fit can still be refused.
+      `weir-client`'s `push_batch` checks the encoded body against the hard
+      cap locally and returns a recoverable `ClientError::PayloadTooLarge`.
 - [ ] Handles connection close mid-stream as "in-flight requests had
       unknown outcomes; retry on a fresh connection."
 
