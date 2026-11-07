@@ -556,24 +556,19 @@ pub(crate) fn scan_unconfirmed_sealed(
     let mut unconfirmed = Vec::new();
     let mut incomplete = false;
     for sdir in shard_dirs {
+        // Only `shard_<N>` directories are shards (mirrors
+        // recover_open_segments). That skips quarantine/ (parked segments),
+        // dead_letter/ (owned by the DeadLetterWriter, never replayed as a
+        // shard) and anything foreign, such as a root-owned `lost+found` at a
+        // mount root, whose EACCES would otherwise fail startup replay and
+        // mark every rescan incomplete.
+        let Some(idx) = segment::shard_id_from_path(&sdir) else {
+            continue;
+        };
         if !sdir.is_dir() {
             continue;
         }
-        let name = sdir
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned();
-        // Skip the daemon's reserved subdirs (mirrors recover_open_segments):
-        // quarantine/ holds parked segments; dead_letter/ is owned by the
-        // DeadLetterWriter and must not be replayed as a shard.
-        if name == "quarantine" || name == "dead_letter" {
-            continue;
-        }
         if let Some(shard_count) = shard_count
-            && let Some(idx) = name
-                .strip_prefix("shard_")
-                .and_then(|n| n.parse::<usize>().ok())
             && idx >= shard_count
         {
             warn!(
@@ -1943,6 +1938,43 @@ mod tests {
         let healed = scan_unconfirmed_sealed(&dir, None, &m, &|_| false, false).unwrap();
         assert_eq!(healed.segments, vec![first, hidden, last]);
         assert!(!healed.incomplete);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// A directory under `wab_dir` that is not `shard_<N>` (here `lost+found`
+    /// at a mount root, root-owned and unreadable) is not a shard: startup
+    /// replay must not fail on it, and the rescan must not mark every poll
+    /// incomplete because of it.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_foreign_directory_is_not_a_shard() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp_dir("scan_unreadable_foreign");
+        let first = sealed_in_shard(&shard_dir_path(&dir, 0), 1, b"first");
+        let foreign = dir.join("lost+found");
+        crate::testutil::mkdir_p(&foreign);
+        fs::set_permissions(&foreign, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_dir(&foreign).is_ok() {
+            fs::set_permissions(&foreign, fs::Permissions::from_mode(0o700)).unwrap();
+            eprintln!("skipping: a mode-000 directory is still readable (root?)");
+            fs::remove_dir_all(dir).ok();
+            return;
+        }
+
+        let (m, _reg) = crate::metrics::Metrics::new();
+        let startup = scan_unconfirmed_sealed(&dir, Some(1), &m, &|_| false, false);
+        let rescan = scan_unconfirmed_sealed(&dir, None, &m, &|_| false, false);
+        fs::set_permissions(&foreign, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let startup = startup.expect("startup replay ignores a non-shard directory");
+        assert_eq!(startup.segments, vec![first.clone()]);
+        assert!(!startup.incomplete);
+        let rescan = rescan.expect("the rescan ignores a non-shard directory");
+        assert_eq!(rescan.segments, vec![first]);
+        assert!(
+            !rescan.incomplete,
+            "a foreign directory is not a skipped shard"
+        );
         fs::remove_dir_all(dir).ok();
     }
 

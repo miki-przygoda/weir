@@ -17,6 +17,10 @@ protocol** below.
 
 ### Fixed
 
+- Startup recovery and replay now treat only `shard_<N>` directories under
+  `wab_dir` as shards, so a foreign directory the daemon cannot read, such as
+  a root-owned `lost+found` when `wab_dir` is a mount root, no longer fails
+  startup, and no longer marks every drain rescan incomplete.
 - Recovery now fsyncs `wab_dir` after creating `quarantine/`, so the copy of
   a mid-file-corrupt segment, the only place the acked records after the
   corruption survive once the original is truncated, can no longer be lost

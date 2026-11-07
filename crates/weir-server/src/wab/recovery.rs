@@ -37,18 +37,16 @@ pub(crate) fn recover_open_segments(wab_dir: &Path, metrics: &Arc<Metrics>) -> i
     shard_dirs.sort_by_key(|p| shard_id_from_path(p));
 
     for shard_dir in shard_dirs {
-        if !shard_dir.is_dir() {
-            continue;
-        }
-        let name = shard_dir.file_name().unwrap_or_default().to_string_lossy();
-        // Skip the daemon's own reserved subdirectories. `quarantine/` holds
-        // unrecoverable segments parked for an operator. `dead_letter/` holds
-        // segment-format files (dl_NNNNNNNN.wab[.sealed]) owned by the
-        // DeadLetterWriter, which manages their dl_ counter and size accounting;
-        // a crash mid-write can leave an active dl_*.wab there, and recovery must
-        // NOT treat dead_letter/ as a shard dir and re-seal that file — doing so
-        // bypasses dead-letter accounting and counter ownership (F16).
-        if name == "quarantine" || name == "dead_letter" {
+        // Only `shard_<N>` directories are shards. That skips the daemon's own
+        // reserved subdirectories: `quarantine/` holds unrecoverable segments
+        // parked for an operator, and `dead_letter/` holds segment-format files
+        // (dl_NNNNNNNN.wab[.sealed]) owned by the DeadLetterWriter, which manages
+        // their dl_ counter and size accounting; a crash mid-write can leave an
+        // active dl_*.wab there, and recovery must NOT re-seal that file (F16).
+        // It also skips anything foreign, such as a root-owned `lost+found` when
+        // `wab_dir` is a mount root: listing it would fail with EACCES and refuse
+        // startup over a directory the daemon never wrote.
+        if shard_id_from_path(&shard_dir).is_none() || !shard_dir.is_dir() {
             continue;
         }
         audit_segment_modes(&shard_dir, metrics);
@@ -1867,6 +1865,41 @@ mod tests {
             "recovery must not re-seal a dead_letter segment"
         );
 
+        fs::remove_dir_all(wab_dir).ok();
+    }
+
+    /// `wab_dir` at a filesystem mount root holds a root-owned 0700
+    /// `lost+found`. Recovery must treat only `shard_<N>` directories as
+    /// shards: listing a foreign directory it cannot read used to propagate
+    /// EACCES and refuse startup, so no WAB recovery ran at all.
+    #[cfg(unix)]
+    #[test]
+    fn recover_open_segments_ignores_an_unreadable_foreign_directory() {
+        use crate::wab::segment::{WabSegment, segment_path};
+        use std::os::unix::fs::PermissionsExt;
+        let wab_dir = tmp_dir("recover_ignores_foreign");
+        let shard_dir = wab_dir.join("shard_00");
+        crate::testutil::mkdir_p(&shard_dir);
+        let seg = segment_path(&shard_dir, 1);
+        WabSegment::create(&seg, 0, Compression::None)
+            .unwrap()
+            .write_record(b"live")
+            .unwrap();
+        let foreign = wab_dir.join("lost+found");
+        crate::testutil::mkdir_p(&foreign);
+        fs::set_permissions(&foreign, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_dir(&foreign).is_ok() {
+            fs::set_permissions(&foreign, fs::Permissions::from_mode(0o700)).unwrap();
+            eprintln!("skipping: a mode-000 directory is still readable (root?)");
+            fs::remove_dir_all(wab_dir).ok();
+            return;
+        }
+
+        let result = recover_open_segments(&wab_dir, &noop_metrics());
+        fs::set_permissions(&foreign, fs::Permissions::from_mode(0o700)).unwrap();
+
+        result.expect("a foreign directory must not fail recovery");
+        assert!(!seg.exists(), "the real shard segment is still recovered");
         fs::remove_dir_all(wab_dir).ok();
     }
 
