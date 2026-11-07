@@ -16,7 +16,14 @@
     "quick": "ssh beast 'cd <worktree> && JOBQ_SUBMITTER=temper-cleanup ~/.local/bin/jobq submit --profile rust --project weir --cores 4 --mem 4G --timeout 3h --cwd \"$(pwd -P)\" --name <label>-quick -- bash .temper/gate-quick.sh', then `~/.local/bin/jobq wait <id>` until it ends (see the build rule)",
     "full": "ssh beast 'cd <worktree> && JOBQ_SUBMITTER=temper-cleanup ~/.local/bin/jobq submit --profile rust --project weir --cores 4 --mem 8G --timeout 5h --cwd \"$(pwd -P)\" --name <label>-full -- bash .temper/gate-full.sh', then `~/.local/bin/jobq wait <id>` until it ends (see the build rule)"
   },
-  "done": [],
+  "done": [
+    "fix:config-reload-and-startup-02",
+    "fix:config-reload-and-startup-04",
+    "fix:deploy-ci-and-chaos-harness-01",
+    "fix:deploy-ci-and-chaos-harness-02",
+    "fix:deploy-ci-and-chaos-harness-03",
+    "fix:deploy-ci-and-chaos-harness-06"
+  ],
   "lenses": [
     "security",
     "failure paths and lifecycle",
@@ -32,9 +39,76 @@
     "deploy ci and chaos harness"
   ],
   "severity_notes": "- An acked `Durable` record that is not on disk, or does not replay after a crash, is severe. So is anything that lets two daemons own one `wab_dir`.\n- A change to the on-disk WAB format, the wire protocol or a published crate's public API without a version decision is severe: it needs the owner (semver, the `docs_drift` guards).\n- A panic reachable from a client frame, a stored segment or a config value is critical.\n- A secret (sink URL credentials, bearer token, crates.io token) reaching a log, a `Debug` string, argv or `/status` is critical.\n- Anything that loosens a security default (peer UID check, socket permissions, mTLS on TCP) is severe, and is never fixed overnight without the owner.\n\nScope of this epic (from its spec, docs/superpowers/temper/cleanup-2026-11/spec.md): the whole repository at the branch tip, NOT only `git diff main...epic/cleanup-2026-11` (the branch starts equal to main, so that diff is just the spec). Review the code itself, in your lens's area (the spec's Scope table). A finding needs an input and a wrong result that a verifier can reproduce; style, refactors and perf ideas are not findings.\nThese are owner items (kind owner), never fixes: a change to the WAB or `.confirmed` format, the wire protocol, `--json` shapes or a published crate's public API; loosening a security default; a new or upgraded dependency; D10 (explicit missing --config only WARNs: a deferred owner decision).",
-  "sweeps": 2,
+  "sweeps": 1,
   "build_rule": "Every build, test, clippy or gate on beast runs as a jobq job: never run cargo, a gate script or a test binary directly in your ssh session (beast's ~/agents/CLAUDE.md; a session that compiled outside jobq was OOM-killed). Work in a worktree under ~/work/weir/ on beast; jobq's --cwd is that worktree's physical path (`pwd -P`).\n\nSubmit, then wait in the foreground (a single Bash call must stay under 10 minutes, so never use `jobq run` for a gate, and never end your turn while a job of yours is queued or running):\n  ssh beast 'cd <worktree> && JOBQ_SUBMITTER=temper-cleanup ~/.local/bin/jobq submit --profile rust --project weir --cores 4 --mem 4G --timeout 3h --cwd \"$(pwd -P)\" --name <your-label>-quick -- bash .temper/gate-quick.sh'\n  ssh beast '~/.local/bin/jobq wait <id>'   (call it again, with a Bash timeout of 600000 ms, until the job ends; its exit status is the gate's)\nThe full gate is the same with `--mem 8G --timeout 5h --name <your-label>-full -- bash .temper/gate-full.sh`. One cargo command (a reproduction, a single test) is the same with `--mem 4G --timeout 1h --name <your-label>-run -- bash .temper/gate-run.sh <cargo args>`, e.g. `... -- bash .temper/gate-run.sh test -p weir-wab segment`.\nA job's env is cleared: pass variables as `-- env VAR=value bash .temper/gate-run.sh ...`. Read results from `~/.local/bin/jobq logs <id> --tail 400` (it prints only the last 200 lines by default) and from the gate's summary, /srv/bulk/Projects/weir/logs/gate/<worktree dir name>/latest-<quick|full|run>/summary.txt, whose last line is `GATE <name> rc=N`. A job's peak memory includes page cache: if a job is OOM-killed, resubmit once with a 2G larger --mem and say so in your result. Never cancel or touch another submitter's jobs. Keep at most one job of yours queued or running at a time. Beast's rule is at most 4 builds of this run at once: before each submit, run `ssh beast 'JOBQ_SUBMITTER=temper-cleanup ~/.local/bin/jobq list --mine | grep -cE \" (queued|running) \"'`; while it prints 4 or more, wait with `ssh beast 'sleep 120'` and check again.\nNever set CARGO_TARGET_DIR or make another target dir: the gate slots are the build dirs; a gate that waits for a slot or for jobq's memory is normal. Never run sudo, never run the chaos harness's power-cut campaign, never touch docker images, volumes or containers that aren't weir's, never write the CI-skip token in a commit message. Commits carry only the `Temper-Task` trailer: no Co-Authored-By, Claude-Session or \"Generated with\" lines. Never print a secret or token.\nA fix also adds one line under CHANGELOG.md `## [Unreleased]` (replace its \"Nothing yet.\" line), in `### Fixed`, or `### Changed` for a behaviour an operator can notice, in the file's existing style. The `docs_drift` and `demo_drift` tests guard figures and version strings in the docs: if a fix trips one, fix the doc, never weaken the guard.\nClean up what you start on beast (test processes, tmux servers); leave worktrees in place.",
   "flaky": [],
   "gate_slots": 2,
-  "part": "sweep"
+  "part": "fix",
+  "selected": [
+    {
+      "id": "wab-and-recovery-r3-01",
+      "lens": "wab and recovery r3",
+      "file": "crates/weir-server/src/wab/recovery.rs",
+      "line": 518,
+      "summary": "Recovery treats a short payload read as a torn tail and truncates without a quarantine copy, even when a corrupted length field (within the cap) is what ran past EOF. Fully written, acked records after it are destroyed with only a WARN.",
+      "input": "Take an active seg_00000001.wab holding records record1, record2 and record3, all fsynced and acked Durable. Flip one bit in record2's length field (byte 41: 7 becomes 65543, which is under MAX_PAYLOAD_HARD_CAP), then run recovery (recover_segment or a daemon restart).",
+      "wrong_result": "The 65543-byte payload read hits EOF, the code takes the 'truncated mid-payload' branch, and quarantine_reason stays None. The segment is truncated to record1 and sealed. record2 and record3 are deleted: no quarantine/ copy is made and recovery_segments_quarantined stays 0. Reproduced on beast in a temporary test, which printed 'recovered=1 quarantine_exists=false quarantined_metric=0'. The neighbouring CRC-mismatch, oversized-length and zero-length branches all preserve the tail in this situation.",
+      "severity": "critical",
+      "kind": "fix"
+    },
+    {
+      "id": "durability-and-ack-semantics-r3-01",
+      "lens": "durability and ack semantics r3",
+      "file": "crates/weir-server/src/wab/mod.rs",
+      "line": 328,
+      "summary": "Startup creates the shard_NN directories with mkdir and never fsyncs wab_dir, so the first Durable acks on a fresh wab_dir go out while the shard directory's own entry is not yet crash-durable.",
+      "input": "Start a daemon on an empty wab_dir (`weir-server --wab-dir <empty dir> ...`) under `strace -f -e trace=mkdir,openat,fsync,fdatasync` and push one record with `weir-ctl push hello` (Durable). Reproduced on beast with the v4.1.0 binary.",
+      "wrong_result": "The trace shows mkdir(\"<wab>/shard_00\"), then the segment openat(O_CREAT|O_EXCL), fsync of shard_00 and fdatasync of the segment. weir-ctl then prints 'ack 5 bytes, Durable'. wab_dir itself is never fsynced. A power loss that drops the shard_00 dirent therefore removes an acked Durable record, and replay never finds it. The code's own rule says a new entry is crash-durable only after a parent-dir fsync: segment.rs:91-95 for segments, and DeadLetterWriter::make_dir_entry_durable (conf-durability-4) for dead_letter/. recover() applies neither to the shard directories. The fix is to fsync wab_dir after the create_dir_private loop in recover(), before any flusher starts.",
+      "severity": "important",
+      "kind": "fix"
+    },
+    {
+      "id": "durability-and-ack-semantics-r3-02",
+      "lens": "durability and ack semantics r3",
+      "file": "crates/weir-server/src/wab/recovery.rs",
+      "line": 781,
+      "summary": "copy_to_quarantine creates quarantine/ and fsyncs only the copy and quarantine/, not wab_dir. Recovery then durably truncates the original, so the only copy of the acked records after the corruption is not crash-durable.",
+      "input": "Push three Durable records (aaaa, bbbb, cccc) to a fresh daemon and kill -9 it, which leaves shard_00/seg_00000001.wab. Overwrite one payload byte of bbbb (offset 44) and restart under strace. Reproduced on beast with the v4.1.0 binary.",
+      "wrong_result": "The trace shows mkdir(\"<wab>/quarantine\"), copy_file_range into quarantine/shard_00__seg_00000001.wab, fsync(copy), fsync(quarantine dir), then ftruncate(original, 36) and fsync. wab_dir is never fsynced after the mkdir. The truncate removes cccc, an acked Durable record, from the shard segment, and the truncate is durable. The quarantine copy is the only place cccc survives, yet the quarantine/ dirent can still be lost on power loss. That breaks the function's own comment ('Make the quarantine artifact crash-durable BEFORE the caller truncates the original'). The fix is to fsync wab_dir after creating quarantine/, before returning Ok. The same gap applies to quarantine()'s rename into a freshly created quarantine/.",
+      "severity": "important",
+      "kind": "fix"
+    },
+    {
+      "id": "wab-and-recovery-r3-02",
+      "lens": "wab and recovery r3",
+      "file": "crates/weir-server/src/wab/recovery.rs",
+      "line": 112,
+      "summary": "Startup recovery and replay treat every subdirectory of wab_dir as a shard directory and propagate its read_dir error. One unreadable foreign directory, such as lost+found when wab_dir is a filesystem mount root, aborts daemon startup.",
+      "input": "Point wab_dir at the root of an ext4 volume (for example a k8s PVC or a dedicated disk) that contains root-owned 0700 lost+found, and run weir-server as a non-root user. To reproduce: mkdir wab_dir/lost+found, chmod 000 it, then call recover_open_segments and scan_unconfirmed_sealed(Some(n)).",
+      "wrong_result": "recover_open_segments returns Err(PermissionDenied) from fs::read_dir(lost+found), and so does scan_unconfirmed_sealed with Some(shard_count). wab::recover therefore fails and the daemon refuses to start, so no WAB recovery or replay runs. Reproduced on beast as euid 1000: 'recover=Err(Os { code: 13 ... }) scan_replay=Err(Os { code: 13 ... })'.",
+      "severity": "important",
+      "kind": "fix"
+    },
+    {
+      "id": "wab-and-recovery-r3-03",
+      "lens": "wab and recovery r3",
+      "file": "crates/weir-server/src/wab/mod.rs",
+      "line": 874,
+      "summary": "A failed timed seal (segment_max_age or segment_max_lifetime) does not keep the segment active or retry it, although the code says it does. seal_current takes the segment before sealing, so already-acked records are stranded in an unsealed .wab until the daemon restarts.",
+      "input": "Set segment_max_age or segment_max_lifetime, write and ack Durable records, then make WabSegment::seal fail when the timer fires (an ENOSPC or EIO at the sentinel, footer, fsync or rename; the test used an existing .wab.sealed name).",
+      "wrong_result": "The log says 'timed seal failed; will retry next cycle (segment stays active)' and the function returns false. In fact ShardWriter::seal_current has already set active and active_path to None, so has_active_segment() is false and no retry ever happens. The next write opens a new segment. The acked records stay in an unsealed .wab that nothing rescans at runtime, so they are not delivered until a restart, and no metric records this. Reproduced on beast: after a failed seal_current, has_active_segment() returned false.",
+      "severity": "important",
+      "kind": "fix"
+    }
+  ],
+  "attempt": 2,
+  "answers": {},
+  "first_fix_round": [
+    "config-reload-and-startup-02",
+    "config-reload-and-startup-04",
+    "deploy-ci-and-chaos-harness-01",
+    "deploy-ci-and-chaos-harness-02",
+    "deploy-ci-and-chaos-harness-03",
+    "deploy-ci-and-chaos-harness-06"
+  ]
 }
