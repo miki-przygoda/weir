@@ -17,6 +17,12 @@ protocol** below.
 
 ### Fixed
 
+- Startup now refuses, in preflight and before recovery, a `socket_path`
+  whose parent directory is missing, not a directory, or not writable by the
+  daemon user. Before, the refusal came only at the producer-socket bind,
+  after the drain had begun replaying the backlog, so under
+  `Restart=on-failure` each restart re-delivered the head of the oldest
+  unconfirmed segment.
 - The ClickHouse sink now redacts its transport errors, so a password
   passed as a `?password=` query parameter in the sink URL no longer appears
   in the drain's WARN retry log, the sink failure status or the health

@@ -260,9 +260,11 @@ case (conf-security-7).
 The probe runs twice on a normal start:
 
 1. **Preflight**, before the WAB is read. It refuses a non-socket entry, then
-   a `Live` or `Unknown` verdict. It does not unlink a stale socket; that is
-   left to the bind. This is what makes a duplicate instance refuse *before*
-   its recovery and drain start (see the [threat
+   a `Live` or `Unknown` verdict, then a parent directory that is missing, not
+   a directory, or not writable by the daemon user (the probe reports such a
+   path `Absent`, but the bind would fail on it). It does not unlink a stale
+   socket; that is left to the bind. This is what makes a duplicate instance
+   refuse *before* its recovery and drain start (see the [threat
    model](threat-model.md#single-ownership-of-wab_dir-and-socket_path)).
 2. **`bind_hardened` step 4**, after recovery. This is the authoritative
    check. It unlinks a stale socket through the dirfd, after re-checking that

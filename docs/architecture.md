@@ -63,7 +63,8 @@ umask 0o077 + SIGHUP ignored
 → Metrics::new → lock-integrity thread (1 s, from here to exit)
 → initializing         StatusBoard                        (src/status/board.rs)
 → preflight            socket_path format + length, non-socket refusal, connect-only
-                       liveness probe (never unlinks), metrics test-bind,
+                       liveness probe (never unlinks), socket parent directory
+                       (exists, writable), metrics test-bind,
                        [tls + tcp_bind: TLS load + TCP test-bind]       (src/preflight.rs)
 → queue, drain channel, DrainControl (attached), Lifecycle   (src/lifecycle.rs)
 → tokio runtime        reload loop + SIGHUP handler, SIGTERM/SIGINT task,

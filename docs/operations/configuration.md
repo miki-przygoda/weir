@@ -113,7 +113,9 @@ Each option below lists: **type**, **default**, **valid range**,
 - **Type**: absolute path
 - **Default**: `/run/weir/weir.sock`
 - **Validation**: must be absolute, no `..` components, no null bytes.
-  The parent directory must exist; weir does not create it.
+  The parent directory must exist and be writable by the daemon user;
+  weir does not create it, and refuses to start (before recovery) if it is
+  missing or not writable.
 - **CLI**: `--socket-path <path>`
 - **Env**: `WEIR_SOCKET_PATH`
 - **TOML**: `socket_path`
