@@ -30,6 +30,10 @@ protocol** below.
   non-chaos instance's drain has stopped or its `weir_drain_state` series is
   missing: it summed only the `retrying_transient` and
   `blocked_dead_letter_full` states, so a drain that had exited passed.
+- `deploy/smoke-test.sh` now fails when `weir-server` exits non-zero or
+  crashes on SIGTERM, and prints its log: the shutdown step only polled
+  `kill -0` and never read the exit status, so a failed shutdown passed as
+  "exited cleanly".
 
 ## [4.1.0] - 2026-10-26
 

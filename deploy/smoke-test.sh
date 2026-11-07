@@ -160,8 +160,18 @@ if kill -0 "$SERVER_PID" 2>/dev/null; then
     kill -KILL "$SERVER_PID" 2>/dev/null || true
     fail "Graceful shutdown timed out"
 fi
+# The daemon is our child, so wait reaps it and returns its exit status: a
+# panic or a non-zero exit on the way out (spec: exit 0 for every SIGTERM
+# shutdown) must fail the smoke test, not pass as a clean exit.
+SERVER_RC=0
+wait "$SERVER_PID" 2>/dev/null || SERVER_RC=$?
 SERVER_PID=""  # prevent double-kill in cleanup
-info "weir-server exited cleanly."
+if [[ "$SERVER_RC" -ne 0 ]]; then
+    error "weir-server exited with status $SERVER_RC after SIGTERM. Logs:"
+    cat "$LOG_PATH"
+    exit 1
+fi
+info "weir-server exited cleanly (status 0)."
 
 echo ""
 echo -e "${GREEN}✓ All smoke checks passed.${NC}"
