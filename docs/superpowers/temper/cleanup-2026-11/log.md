@@ -73,3 +73,24 @@
 
 - wf_02b45796-636 returned `stable`: fixed wab-and-recovery-r3-01 (1aa2c4f), durability-and-ack-semantics-r3-01 (04f0d4c), -r3-02 (1b004da), wab-and-recovery-r3-02 (f7efcc9), -r3-03 (5cb6066). Regression check per fix: none; none reverted, none blocked, no flaky reruns. Shas verified on the branch.
 - Fix round 3 launched with the 11 batch-2 findings (attempt 3), and a `security r3` re-review for the first night's unverified secret leaks.
+
+## 2026-11-07 ~17:00: security re-review (r3) returned
+
+- Run wf_85b3fbd2-dc9 (security r3, status metrics and admin r3): all 10 agents finished; 8 findings verified, 0 refuted. The two lenses found the same four defects, so the head deduplicated them to four:
+  - critical security-r3-01 (= status-metrics-and-admin-r3-01): HTTP sink URL secrets in the path or in query keys outside the 10-key denylist (`?code=`, `X-Amz-Signature`, `X-Amz-Security-Token`, `client_secret`) reach the startup INFO line, every transport-error retry and the admin /status sink-failure text.
+  - critical security-r3-02 (= status-metrics-and-admin-r3-03): a TOML syntax error prints the offending line, so a credential on it reaches stderr.
+  - critical status-metrics-and-admin-r3-02 (= security-r3-03, rated minor by its other verifier; the head keeps critical, per the severity notes: a secret in a log and /status): `url_origin` echoes `user:password` when no `@host` follows.
+  - important security-r3-04 (= status-metrics-and-admin-r3-04): `drain_state_and_sink_health_pre_initialised` cannot fail, since the HELP text always contains "draining".
+- These confirm the first night's unverified security-01, config-reload-and-startup-01, status-metrics-and-admin-01 and the metrics-test finding. Selected for fix round 4, after round 3 (same epic worktree).
+
+## 2026-11-07 ~18:45: fix round 3 handover, owner decisions
+
+- wf_2eaee17b-c89 returned `handover`. Fixed: sinks-r3-03 (126e8a3), failure-paths-and-lifecycle-r3-01 (e358b82), sinks-r3-04 (ed290f8), sinks-r3-05 (05b1d00), sinks-r3-06 (ade74f3), weir-ctl-and-attest-r3-01 (72bae97), -r3-02 (f1a1e0d), -r3-03 (fe31ac1), wire-socket-and-client-r3-01 (87a6332), -r3-02 (4228ac2). Contract: sinks-r3-02. No flaky reruns. Shas verified after the fetch-back.
+- Regressions the per-fix checks proved:
+  - fix:sinks-r3-05: docs regression (minor): `configuration.md`'s Postgres classification table and the `postgres.rs` module doc still say 25006 dead-letters. Goes into fix round 4 as `postgres-docs-25006`.
+  - fix:weir-ctl-and-attest-r3-01 (72bae97): weakens tamper detection: any file named `seg_N.wab.confirmed` (even empty) or a junk-named `quarantine/` entry excuses a gap, so `rm` + `touch` hides a deleted segment (verify exit 0, was 1). A security decision.
+  - fix:weir-ctl-and-attest-r3-03 (fe31ac1): under a drain race after the cached disposed set, an honest exit 2 becomes a false BROKEN_LINK (exit 1).
+- **Owner decisions (7 Nov, asked in session):**
+  - Attest: **revert both** 72bae97 and fe31ac1 (head: e8a93fb, 523afa5; the CHANGELOG conflict resolved by dropping only 72bae97's bullet). The original false-positive (out-of-order drain deletes read as BROKEN_LINK) and the deleted-mid-run NotFound go back to the open owner items for a proper design. f1a1e0d (lost+found) stays.
+  - Dedup keys: **owner items for now.** sinks-r3-02 (HTTP NDJSON batch Idempotency-Key, content-only) and sinks-r3-01 (ClickHouse insert_deduplication_token, pinned to 1.x) stay unchanged in this PR and are written up with their evidence; a coordinate-based key (like S3's) is a separate change with a `Changed` note.
+- Fix round 4 launched: security-r3-01, security-r3-02, status-metrics-and-admin-r3-02, security-r3-04, postgres-docs-25006 (attempt 4).
