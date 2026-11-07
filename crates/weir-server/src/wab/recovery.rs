@@ -737,6 +737,18 @@ pub(crate) fn recover_segment(
     Ok(sealed)
 }
 
+/// Creates `<wab_dir>/quarantine/` (if needed) and fsyncs `wab_dir`, so the
+/// `quarantine` entry is crash-durable before anything is moved or copied into
+/// it. Without the `wab_dir` fsync a power loss could drop the whole directory
+/// after the caller has already made a truncate of the original durable,
+/// losing the only copy of the records after a mid-file corruption.
+fn create_quarantine_dir(wab_dir: &Path) -> io::Result<PathBuf> {
+    let quarantine_dir = wab_dir.join("quarantine");
+    super::create_dir_private(quarantine_dir.clone())?;
+    super::segment::fsync_parent_dir(&quarantine_dir)?;
+    Ok(quarantine_dir)
+}
+
 /// Moves a corrupt file to `<wab_dir>/quarantine/` and logs the reason.
 /// Failure to quarantine is returned as an error so the caller can decide
 /// whether to abort or continue.
@@ -751,8 +763,7 @@ pub(crate) fn recover_segment(
 /// original is moved out of the shard dir and the counter resets) — a free
 /// suffix is found first.
 pub(crate) fn quarantine(path: &Path, wab_dir: &Path, reason: &str) -> io::Result<()> {
-    let quarantine_dir = wab_dir.join("quarantine");
-    super::create_dir_private(quarantine_dir.clone())?;
+    let quarantine_dir = create_quarantine_dir(wab_dir)?;
     let file_name = path
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
@@ -785,8 +796,7 @@ pub(crate) fn quarantine(path: &Path, wab_dir: &Path, reason: &str) -> io::Resul
 /// the preserved artifact lands next to (and is named like) move-quarantined ones.
 /// Returns the destination path on success.
 fn copy_to_quarantine(path: &Path, wab_dir: &Path, reason: &str) -> io::Result<PathBuf> {
-    let quarantine_dir = wab_dir.join("quarantine");
-    super::create_dir_private(quarantine_dir.clone())?;
+    let quarantine_dir = create_quarantine_dir(wab_dir)?;
     let file_name = path
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
@@ -809,8 +819,8 @@ fn copy_to_quarantine(path: &Path, wab_dir: &Path, reason: &str) -> io::Result<P
     // fsyncs a crash after the (durable) truncate+seal but before the copy's data
     // and dirent reach disk would lose the ONLY copy of the corrupt tail — the
     // exact opposite of the "PRESERVED in quarantine" guarantee the caller logs.
-    // Order: copy → fsync the copied file's data → fsync the quarantine dir so the
-    // new dirent survives a crash. `fsync_parent_dir(&dest)` fsyncs dest's parent,
+    // Order: (quarantine/ created and wab_dir fsynced) → copy → fsync the copied
+    // file's data → fsync the quarantine dir so the new dirent survives a crash. `fsync_parent_dir(&dest)` fsyncs dest's parent,
     // i.e. the quarantine dir, and is a no-op on non-Unix. The caller only truncates
     // after we return Ok, so durability is established first.
     fs::File::open(&dest)?.sync_all()?;
@@ -1407,6 +1417,83 @@ mod tests {
         assert_eq!(metrics.recovery_segments_quarantined.get(), 0);
 
         fs::remove_dir_all(dir).ok();
+    }
+
+    /// `copy_to_quarantine` creates `quarantine/` and the copy in it is the
+    /// ONLY place the records after a mid-file corruption survive once the
+    /// caller truncates the original. The copy and `quarantine/` are fsynced,
+    /// but the `quarantine` entry itself lives in `wab_dir`: until `wab_dir` is
+    /// fsynced a power loss can drop the whole directory, copy included, after
+    /// the truncate is already durable. So recovery must fsync `wab_dir` before
+    /// it truncates, and a failed fsync must fail closed (segment untouched).
+    #[cfg(unix)]
+    #[test]
+    fn recovery_mid_file_corruption_fsyncs_wab_dir_before_truncating() {
+        use crate::wab::segment::{WabSegment, segment_path, sync_hook};
+        let dir = tmp_dir("mid_file_fsyncs_wab_dir");
+        // The segment sits in a shard dir, as in production, so every fsync of
+        // `dir` itself comes from the quarantine path.
+        let shard = dir.join("shard_00");
+        crate::testutil::mkdir_p(&shard);
+        let path = segment_path(&shard, 1);
+        let payloads: &[&[u8]] = &[b"rec--00", b"rec--01", b"rec--02", b"rec--03", b"rec--04"];
+        {
+            let mut seg = WabSegment::create(&path, 0, Compression::None).unwrap();
+            for p in payloads {
+                seg.write_record(p).unwrap();
+            }
+        }
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[24 + 2 * 15 + 8] ^= 0xff;
+        fs::write(&path, &bytes).unwrap();
+
+        let metrics = noop_metrics();
+        sync_hook::fail(&dir, libc::EIO, u32::MAX);
+        recover_segment(&path, &dir, &metrics)
+            .expect_err("a failed wab_dir fsync must fail the quarantine, not truncate");
+        assert!(
+            sync_hook::calls(&dir) >= 1,
+            "recovery must fsync wab_dir after creating quarantine/"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            bytes,
+            "the segment must be left untouched when wab_dir cannot be fsynced"
+        );
+
+        sync_hook::clear(&dir);
+        recover_segment(&path, &dir, &metrics).unwrap();
+        assert!(sync_hook::calls(&dir) >= 2);
+        sync_hook::forget(&dir);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// The same rule for the move-quarantine: `quarantine/` may be freshly
+    /// created, so its entry in `wab_dir` must be fsynced, and a failed fsync
+    /// is an error with the segment left where it was.
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_fsyncs_wab_dir_after_creating_quarantine_dir() {
+        use crate::wab::segment::sync_hook;
+        let wab_dir = tmp_dir("quarantine_fsyncs_wab_dir");
+        let shard = wab_dir.join("shard_00");
+        crate::testutil::mkdir_p(&shard);
+        let seg = shard.join("seg_00000001.wab");
+        fs::write(&seg, b"corrupt").unwrap();
+
+        sync_hook::fail(&wab_dir, libc::EIO, 1);
+        let err = quarantine(&seg, &wab_dir, "test").unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EIO));
+        assert!(
+            seg.exists(),
+            "a failed fsync must leave the segment in place"
+        );
+
+        quarantine(&seg, &wab_dir, "test").unwrap();
+        assert_eq!(sync_hook::calls(&wab_dir), 2);
+        assert!(!seg.exists());
+        sync_hook::forget(&wab_dir);
+        fs::remove_dir_all(wab_dir).ok();
     }
 
     /// Counterpart to the headline test: the TORN-TAIL (clean EOF) crash-recovery

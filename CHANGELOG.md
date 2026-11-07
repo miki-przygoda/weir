@@ -17,6 +17,11 @@ protocol** below.
 
 ### Fixed
 
+- Recovery now fsyncs `wab_dir` after creating `quarantine/`, so the copy of
+  a mid-file-corrupt segment, the only place the acked records after the
+  corruption survive once the original is truncated, can no longer be lost
+  with the directory on power loss. A failed fsync leaves the segment
+  untouched.
 - Startup now fsyncs `wab_dir` after creating the `shard_NN` directories, so
   the first `Durable` acks on a fresh `wab_dir` no longer land in a shard
   directory whose own entry a power loss could still remove. A failed fsync
