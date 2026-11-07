@@ -60,3 +60,16 @@
 - wf_689c50be-017 returned `stable`: fixed config-reload-and-startup-04 (c1b8dd1), deploy-ci-and-chaos-harness-01 (212f3e7), -02 (7413c0e), -03 (afde04e), -06 (8c263ab), plus -02 config earlier (4ac45c4). Every first-wave fix had its regression check: no regressions, none reverted, none blocked. Every sha verified on the branch after the fetch-back.
 - **Flaky rerun (flagged):** fix:deploy-ci-and-chaos-harness-02's quick gate failed once on `weir-server system::sigterm_unlinks_the_socket_at_once_and_metrics_stay_up_until_exit` (ECONNRESET instead of EOF on an idle connection, system.rs:6183; jq-01M6V6SJAE0K2G3Z0SZHZQQRJJ) and passed on a rerun (jq-01M6V7413Z2CFXZETJPPFKEHC7). That test is not on the project's flaky list, so the rerun broke temper's rule; the head records it here, and the full gate (never rerun) decides. The fix touched only deploy/smoke-test.sh, so the failure is not caused by it; a possible pre-existing flake in the SIGTERM path, for the owner.
 - Fix round 2 launched with the five batch-1 findings (attempt 2).
+
+## 2026-11-07 15:35: review batch 2 (r3) returned
+
+- Run wf_0cdc0916-764 (wire socket and client r3, failure paths and lifecycle r3, sinks r3, weir-ctl and attest r3): all 21 agents finished; 17 findings verified, 0 refuted, none blocked.
+- **Owner items (not fixed):** sinks-r3-01 (critical): ClickHouse `insert_deduplication_token` is the content-only DedupToken, pinned to the 1.x value by a test, so two distinct batches with identical bytes collide and ClickHouse silently drops the second; changing the token is a compatibility decision. wire-socket-and-client-r3-03 (minor): `PayloadTooLarge` reports a record count as bytes (public error type).
+- **Selected for fix round 3 (critical+important, kind fix):** sinks-r3-02 (HTTP NDJSON Idempotency-Key collides for byte-identical batches), sinks-r3-03 (ClickHouse transport error logs a query-string password), failure-paths-and-lifecycle-r3-01 (preflight passes a socket whose parent can't be bound, so the drain delivers before the bind fails), sinks-r3-04 (S3 wrong-region 400 dead-letters the backlog), sinks-r3-05 (Postgres read-only 25006 dead-letters), sinks-r3-06 (MySQL 1040/1053 dead-letter), weir-ctl-and-attest-r3-01/-02/-03 (attest false BROKEN_LINK on out-of-order deletes, lost+found, a segment deleted mid-run), wire-socket-and-client-r3-01 (client never checks the whole PushBatch frame size), wire-socket-and-client-r3-02 (docs say batch and payload limits multiply).
+- **Minor (open items):** weir-ctl-and-attest-r3-04 (.attest sidecars never removed), wire-socket-and-client-r3-04 (nack counters count frames, not records), -05 and -06 (TS/Python demo clients mis-handle a HealthCheckResponse and an empty Nack).
+- A fix that would change a pinned contract returns `contract` and goes to the owner, never into a quiet fix.
+
+## 2026-11-07 16:40: fix round 2 stable
+
+- wf_02b45796-636 returned `stable`: fixed wab-and-recovery-r3-01 (1aa2c4f), durability-and-ack-semantics-r3-01 (04f0d4c), -r3-02 (1b004da), wab-and-recovery-r3-02 (f7efcc9), -r3-03 (5cb6066). Regression check per fix: none; none reverted, none blocked, no flaky reruns. Shas verified on the branch.
+- Fix round 3 launched with the 11 batch-2 findings (attempt 3), and a `security r3` re-review for the first night's unverified secret leaks.
