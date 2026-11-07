@@ -60,13 +60,14 @@ fn shard_id_from_dir_name(path: &Path) -> Option<usize> {
 /// Shard directories under `wab_dir`, optionally narrowed to one shard id,
 /// in ascending numeric shard order (see [`shard_id_from_dir_name`]).
 ///
-/// Mirrors the walk `scan_segments` (in `main.rs`) uses for `weir-ctl
-/// segments`, plus the daemon's own reserved-subdir exclusion
-/// (`weir-server`'s `wab/mod.rs` and `wab/recovery.rs` both skip
-/// `quarantine` and `dead_letter` for the same reason): every OTHER
-/// subdirectory is a shard directory, named `shard_NN` by the daemon
-/// (`weir-server`'s `shard_dir_path`), which is what a `--shard` filter
-/// reconstructs directly rather than scanning for it.
+/// Only `shard_<N>` directories are shards, the same rule the daemon's own
+/// walks use (`weir-server`'s `wab/mod.rs` and `wab/recovery.rs`): the
+/// daemon names them `shard_NN` (`shard_dir_path`), which is also what a
+/// `--shard` filter reconstructs directly rather than scanning for it.
+/// Everything else is skipped: the reserved `quarantine/` and `dead_letter/`
+/// and anything foreign, such as a root-owned `lost+found` at a mount root,
+/// whose unreadable listing would otherwise abort every `seal` and fail
+/// every `verify`.
 ///
 /// Excluding `quarantine` here is load-bearing, not cosmetic: it is one flat
 /// directory shared by every shard's parked forensic copies, so chaining it
@@ -82,13 +83,7 @@ fn shard_dirs(wab_dir: &Path, shard: Option<u16>) -> Result<Vec<PathBuf>, String
     let mut dirs: Vec<PathBuf> = entries
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.is_dir())
-        .filter(|p| {
-            !matches!(
-                p.file_name().and_then(|n| n.to_str()),
-                Some("dead_letter") | Some("quarantine")
-            )
-        })
+        .filter(|p| shard_id_from_dir_name(p).is_some() && p.is_dir())
         .collect();
     dirs.sort_by_key(|p| shard_id_from_dir_name(p));
     Ok(dirs)
@@ -1115,6 +1110,41 @@ mod tests {
             names,
             vec!["shard_00", "shard_01"],
             "quarantine/ and dead_letter/ must never be treated as shard directories"
+        );
+    }
+
+    /// A directory under `wab_dir` that is not `shard_<N>` (here a root-owned
+    /// `lost+found` at a mount root, unreadable to the weir user) is not a
+    /// shard: `seal` must still chain the real shards and `verify` must not
+    /// count it as an error on every run.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_foreign_directory_is_not_a_shard() {
+        use std::os::unix::fs::PermissionsExt;
+        let scratch = Scratch::new("unreadable_foreign");
+        let real = scratch
+            .path()
+            .join("shard_00")
+            .join("seg_00000001.wab.sealed");
+        write_segment(&real, 0, &[b"a"]);
+        let foreign = scratch.path().join("lost+found");
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::set_permissions(&foreign, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&foreign).is_ok() {
+            std::fs::set_permissions(&foreign, std::fs::Permissions::from_mode(0o700)).unwrap();
+            eprintln!("skipping: a mode-000 directory is still readable (root?)");
+            return;
+        }
+
+        let dirs = shard_dirs(scratch.path(), None);
+        let sealed = cmd_attest_seal(scratch.path(), None, false);
+        std::fs::set_permissions(&foreign, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(dirs.unwrap(), vec![scratch.path().join("shard_00")]);
+        sealed.unwrap();
+        assert!(
+            sidecar_path(&real).exists(),
+            "the real shard segment must be chained despite the foreign directory"
         );
     }
 
