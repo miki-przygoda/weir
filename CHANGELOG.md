@@ -42,6 +42,12 @@ protocol** below.
   missing from `/metrics` on about half its runs: it piped `echo | grep -q`
   under `pipefail`, so `grep -q` exiting on the first match failed `echo` with
   SIGPIPE. It now reads the body from a here-string, as `docker.yml` does.
+- Crash recovery no longer destroys acked records behind a corrupted record
+  length that is under the cap but runs past the end of the segment: it took
+  the short payload read for a torn tail and truncated with only a WARN. When
+  a shorter prefix of the bytes on disk matches the record's CRC, the segment
+  is now copied to `quarantine/` and counted, as the CRC-mismatch,
+  oversized-length and zero-length branches already did.
 
 ## [4.1.0] - 2026-10-26
 

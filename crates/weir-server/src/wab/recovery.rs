@@ -300,8 +300,10 @@ pub(crate) fn recover_segment(
     //     `quarantine_reason` as None for these.
     //
     //   * MID-FILE CORRUPTION (bytes remain after the truncation point): a CRC
-    //     mismatch on a record whose length+CRC+payload were ALL fully read, or an
-    //     oversized `payload_len` field with more data behind it. Here the bytes
+    //     mismatch on a record whose length+CRC+payload were ALL fully read, an
+    //     oversized `payload_len` field with more data behind it, or a short
+    //     payload read whose bytes on disk hold a prefix matching the record's
+    //     CRC (a length corrupted upward, still under the cap). Here the bytes
     //     past `valid_end_offset` were fully written and may include
     //     individually-valid, acked-durable records that happen to sit after the
     //     corrupt one. Silently truncating them away is invisible data loss. So we
@@ -514,14 +516,48 @@ pub(crate) fn recover_segment(
         }
         let expected_crc = u32::from_le_bytes(crc_buf);
 
-        let mut payload = vec![0u8; payload_len];
-        match reader.read_exact(&mut payload) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                warn!(path = %path.display(), records = record_count, "WAB segment truncated mid-payload; truncating at last valid record");
-                break;
+        let mut payload = Vec::with_capacity(payload_len);
+        (&mut reader)
+            .take(payload_len as u64)
+            .read_to_end(&mut payload)?;
+        if payload.len() < payload_len {
+            // The file ended inside this payload. A torn tail does that, but so
+            // does a length field corrupted UPWARD (still under the cap), which
+            // runs the read past fully written, possibly acked-durable records.
+            // Tell them apart by the record's own CRC: if a shorter prefix of
+            // the bytes on disk hashes to the stored CRC, this record was written
+            // whole and its length is what is wrong, so the segment is preserved
+            // in quarantine like the neighbouring corruption branches. A torn
+            // payload matches only by a 2^-32 collision per prefix, and a false
+            // match costs only a copy.
+            let available = payload.len();
+            let mut hasher = crc32fast::Hasher::new();
+            let mut whole_record_len = None;
+            for (i, b) in payload.iter().enumerate() {
+                hasher.update(std::slice::from_ref(b));
+                if hasher.clone().finalize() == expected_crc {
+                    whole_record_len = Some(i + 1);
+                    break;
+                }
             }
-            Err(e) => return Err(e),
+            if let Some(real_len) = whole_record_len {
+                warn!(
+                    path = %path.display(),
+                    records = record_count,
+                    payload_len,
+                    real_len,
+                    "payload_len runs past EOF but a shorter prefix matches the record CRC; \
+                     likely a corrupt length; truncating at last valid record"
+                );
+                quarantine_reason = Some(format!(
+                    "payload_len {payload_len} at offset {valid_end_offset} runs past EOF ({available} byte(s) \
+                     on disk), but the first {real_len} byte(s) match the record CRC {expected_crc:#010x}: \
+                     a whole record behind a corrupt length, not a torn tail"
+                ));
+            } else {
+                warn!(path = %path.display(), records = record_count, "WAB segment truncated mid-payload; truncating at last valid record");
+            }
+            break;
         }
 
         let computed_crc = crc32fast::hash(&payload);
@@ -1466,6 +1502,69 @@ mod tests {
         assert!(!path.exists());
         assert!(sealed.to_str().unwrap().ends_with(".wab.sealed"));
 
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// wab-and-recovery-r3-01. A corrupted length field that is still under the
+    /// cap makes the payload read run past EOF — the same `UnexpectedEof` a torn
+    /// tail produces. But here record2 and record3 were fully written (and could
+    /// be acked `Durable`), so truncating them with only a WARN is silent loss.
+    /// Flipping bit 0 of byte 41 (record2 length 7 -> 65543) must preserve the
+    /// segment in quarantine, as the CRC-mismatch, oversized-length and
+    /// zero-length branches do.
+    #[test]
+    fn corrupt_length_running_past_eof_is_quarantined_not_truncated() {
+        use crate::metrics::{SegmentState, SegmentStateLabel};
+        let dir = tmp_dir("corrupt_len_past_eof");
+        let path = make_segment(&dir, 0, &[b"record1", b"record2", b"record3"]);
+
+        // record2 length field is bytes 39..43 (header 24 + rec1 15).
+        let mut bytes = fs::read(&path).unwrap();
+        assert_eq!(&bytes[39..43], &7u32.to_le_bytes());
+        bytes[41] ^= 0x01;
+        assert_eq!(u32::from_le_bytes(bytes[39..43].try_into().unwrap()), 65543);
+        fs::write(&path, &bytes).unwrap();
+
+        let metrics = noop_metrics();
+        let sealed = recover_segment(&path, &dir, &metrics).unwrap();
+
+        let recovered: Vec<weir_core::Payload> = crate::wab::SegmentReader::open(&sealed)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            recovered.len(),
+            1,
+            "the valid prefix (record1) is still sealed"
+        );
+        assert_eq!(recovered[0], b"record1" as &[u8]);
+
+        let quarantine = dir.join("quarantine");
+        assert!(
+            quarantine.exists(),
+            "a corrupt length that runs past EOF must preserve the tail in quarantine"
+        );
+        let copies: Vec<_> = fs::read_dir(&quarantine)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) != Some("reason"))
+            .collect();
+        assert!(
+            copies
+                .iter()
+                .any(|p| fs::read(p).map(|b| b == bytes).unwrap_or(false)),
+            "the quarantine copy must hold the original bytes, record2 and record3 included: {copies:?}"
+        );
+        assert_eq!(metrics.recovery_segments_quarantined.get(), 1);
+        assert_eq!(
+            metrics
+                .wab_segments
+                .get_or_create(&SegmentStateLabel {
+                    state: SegmentState::quarantined,
+                })
+                .get(),
+            1
+        );
         fs::remove_dir_all(dir).ok();
     }
 
