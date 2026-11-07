@@ -17,6 +17,11 @@ protocol** below.
 
 ### Fixed
 
+- A failed timed seal (`segment_max_age` or `segment_max_lifetime`) no longer
+  logs that the segment "stays active" and will be retried: it was already
+  retired, so its acked records were silently stranded in the unsealed `.wab`
+  until a restart. The failure is now logged at ERROR saying so, and every
+  failed seal is counted in the new `weir_wab_seal_failures_total`.
 - Startup recovery and replay now treat only `shard_<N>` directories under
   `wab_dir` as shards, so a foreign directory the daemon cannot read, such as
   a root-owned `lost+found` when `wab_dir` is a mount root, no longer fails

@@ -722,6 +722,7 @@ impl ShardWriter {
             let sealed = match self.active.take().unwrap().seal() {
                 Ok(sealed) => sealed,
                 Err(e) => {
+                    self.metrics.wab_seal_failures.inc();
                     self.last_write_failure = Some(WriteFailure::SegmentDropped);
                     // Cleared on this path too: leaving it pointing at a segment
                     // that no longer exists is the same "state not updated on
@@ -773,10 +774,22 @@ impl ShardWriter {
 
     /// Seals the current active segment and returns its sealed path.
     /// Returns `None` if no segment is currently open.
+    ///
+    /// On `Err` the segment is GONE, not still active: it is taken before the
+    /// seal, and `seal` consumes it. Its records stay in the unsealed `.wab`,
+    /// stranded until startup recovery seals it (same cost as the retirement in
+    /// [`fsync_current`](Self::fsync_current)); the failure is counted in
+    /// `weir_wab_seal_failures_total`.
     pub(crate) fn seal_current(&mut self) -> io::Result<Option<PathBuf>> {
         self.active_path = None;
         match self.active.take() {
-            Some(seg) => Ok(Some(seg.seal()?)),
+            Some(seg) => match seg.seal() {
+                Ok(sealed) => Ok(Some(sealed)),
+                Err(e) => {
+                    self.metrics.wab_seal_failures.inc();
+                    Err(e)
+                }
+            },
             None => Ok(None),
         }
     }

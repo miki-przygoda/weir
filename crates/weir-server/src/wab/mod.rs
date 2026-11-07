@@ -837,10 +837,16 @@ fn due_timed_seal(
 /// drain. Shared by both timers so the metric bump, the hand-off and the
 /// failure behaviour cannot drift apart depending on which one fired.
 ///
-/// Returns `true` when no segment is active any more (sealed, or there was
-/// none) — the caller's cue to stop the idle clock until the next write opens a
-/// fresh segment. Returns `false` when the seal failed and the segment is still
-/// active, so the next cycle retries instead of losing the attempt.
+/// Returns `true` when no segment is active any more — the caller's cue to stop
+/// the idle clock until the next write opens a fresh segment. That includes a
+/// FAILED seal: [`ShardWriter::seal_current`] has already taken the segment
+/// (`WabSegment::seal` consumes it), so there is nothing left to retry, and a
+/// retry would not be sound anyway — a failed fsync drops the dirty pages and a
+/// half-written sentinel cannot be appended to. The already-acked records stay
+/// in the unsealed `.wab`, which only startup recovery rescans, so they are
+/// stranded until the daemon restarts; the failure is counted
+/// (`weir_wab_seal_failures_total`) and logged at ERROR so that is visible.
+/// Returns `false` only if a segment is somehow still active afterwards.
 fn seal_before_size_threshold<C: BlockingClock>(
     writer: &mut ShardWriter,
     drain_tx: &Sender<PathBuf>,
@@ -874,13 +880,18 @@ fn seal_before_size_threshold<C: BlockingClock>(
         }
         Ok(None) => true,
         Err(e) => {
-            warn!(
+            error!(
                 shard = shard_id,
                 error = %e,
                 reason = reason.as_str(),
-                "timed seal failed; will retry next cycle (segment stays active)"
+                "timed seal failed; the segment is retired unsealed and is NOT \
+                 retried. Its already-acked records stay in the .wab on disk, \
+                 which nothing at runtime rescans, so they are STRANDED until the \
+                 daemon restarts and crash recovery seals and delivers them. \
+                 Stranded, not lost: clear the storage fault and restart to \
+                 release them (weir_wab_seal_failures_total)"
             );
-            false
+            !writer.has_active_segment()
         }
     }
 }
@@ -2352,6 +2363,56 @@ mod tests {
             ShardState::Starting,
             "only the supervisor writes terminal states"
         );
+    }
+
+    /// A timed seal that fails must not be reported as "segment stays active,
+    /// retry next cycle": `seal_current` has already taken the segment, so there
+    /// is nothing left to retry. The acked records sit in an unsealed `.wab`
+    /// that only startup recovery rescans — stranded until a restart, and the
+    /// failure has to be counted so an operator can see it.
+    #[test]
+    fn a_failed_timed_seal_reports_no_active_segment_and_counts_the_failure() {
+        let dir = tmp_dir("timed_seal_fails");
+        let metrics = Arc::new(crate::metrics::Metrics::new().0);
+        let mut writer = ShardWriter::new_with_store(
+            0,
+            dir.clone(),
+            64 * 1024 * 1024,
+            Arc::clone(&metrics),
+            Arc::new(FsSegmentStore),
+            Compression::None,
+            1,
+        );
+        writer.scan_and_advance_counter().unwrap();
+        writer.write_record(b"acked-before-the-timer").unwrap();
+        let active = segment_path(&dir, 1);
+        assert!(active.exists(), "the record opened seg 1");
+        // Occupy the sealed name: WabSegment::seal refuses to rename over it.
+        fs::write(segment::sealed_path_for(&active), b"occupied").unwrap();
+
+        let (drain_tx, drain_rx) = crossbeam_channel::bounded::<PathBuf>(1);
+        let no_active = seal_before_size_threshold(
+            &mut writer,
+            &drain_tx,
+            0,
+            &metrics,
+            TimedSeal::Idle,
+            &crate::wab::dst::SimClock::new(),
+            &handoff::HandoffState::detached(0, Arc::clone(&metrics)),
+        );
+
+        assert!(
+            no_active,
+            "seal_current took the segment before failing, so none is active"
+        );
+        assert!(!writer.has_active_segment());
+        assert!(drain_rx.try_recv().is_err(), "nothing was handed off");
+        assert!(
+            active.exists(),
+            "the unsealed .wab stays on disk for startup recovery"
+        );
+        assert_eq!(metrics.wab_seal_failures.get(), 1);
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]

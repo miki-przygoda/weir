@@ -672,6 +672,10 @@ pub(crate) struct Metrics {
     /// succeed but the data is generally lost ("fsyncgate"). Check logs for
     /// the shard_id and error string.
     pub wab_fsync_failures: Counter<u64, AtomicU64>,
+    /// Segment seals (rotation, timed or shutdown) that returned an error. The
+    /// segment is retired unsealed, so its already-acked records are stranded
+    /// in the `.wab` until a restart's crash recovery seals and delivers them.
+    pub wab_seal_failures: Counter<u64, AtomicU64>,
 
     // ── Sink / drain ──────────────────────────────────────────────────────────
     pub sink_commit_duration: Histogram,
@@ -1042,6 +1046,13 @@ impl Metrics {
              the kernel buffered the write but couldn't push it to stable storage. \
              Producers whose records were in the failed fsync receive \
              Nack(InternalError). Check logs for the shard_id and error string"
+        );
+        let wab_seal_failures = reg!(
+            Counter::<u64, AtomicU64>::default(),
+            "weir_wab_seal_failures",
+            "Segment seals (rotation, timed or shutdown) that returned an error. \
+             The segment is retired unsealed: its acked records are stranded in \
+             the .wab until a restart's crash recovery seals and delivers them"
         );
         let sink_commit_duration = reg!(
             Histogram::new(LATENCY_BUCKETS.iter().copied()),
@@ -1578,6 +1589,7 @@ impl Metrics {
             wab_flusher_panics,
             drain_panics,
             wab_fsync_failures,
+            wab_seal_failures,
             sink_commit_duration,
             sink_commit_records,
             sink_health,
@@ -2000,6 +2012,7 @@ mod tests {
             "weir_drain_state",
             "weir_dead_letter_blocked_duration_seconds",
             "weir_wab_fsync_failures",
+            "weir_wab_seal_failures",
             "weir_wab_flusher_panics",
             "weir_wab_cap_rejections",
             "weir_wab_unexpected_mode",
