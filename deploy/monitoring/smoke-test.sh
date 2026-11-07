@@ -129,7 +129,17 @@ echo "[invariants] durability + health (healthy fleet; chaos excluded)..."
 # The chaos instance degrades its sink and blocks its drain on purpose, so the
 # health invariants assert the NON-chaos fleet (job!="weir-chaos") is clean.
 [ "$(promq 'sum(weir_sink_health{job!="weir-chaos", state="degraded"})+2*sum(weir_sink_health{job!="weir-chaos", state="down"})')" = "0" ]; check "sink health = Healthy (non-chaos)" $?
-[ "$(promq 'sum(weir_drain_state{job!="weir-chaos", state="retrying_transient"})+2*sum(weir_drain_state{job!="weir-chaos", state="blocked_dead_letter_full"})')" = "0" ]; check "drain state = Draining (non-chaos)" $?
+# Assert the healthy state, not the absence of two bad ones. Summing only
+# retrying_transient and blocked_dead_letter_full passed a drain that had
+# EXITED (state="stopped") and a family that had vanished (promq reads an empty
+# result as 0). Every non-chaos instance must report draining=1: the draining
+# sum must equal the number of instances exporting the family, and the core
+# `weir` instance must be one of them.
+drain_instances=$(promq 'count(weir_drain_state{job!="weir-chaos", state="draining"})')
+drain_draining=$(promq 'sum(weir_drain_state{job!="weir-chaos", state="draining"})')
+[ "$(promq 'sum(weir_drain_state{job="weir", state="draining"})')" = "1" ] \
+  && gt "$drain_instances" "0" && [ "$drain_draining" = "$drain_instances" ]
+check "drain state = Draining (non-chaos, $drain_draining/$drain_instances draining)" $?
 
 # Grafana's HTTP API comes up AFTER the container reports healthy, and the setup
 # wait above only blocks on Prometheus having scraped weir. Nothing waited on

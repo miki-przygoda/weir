@@ -26,6 +26,10 @@ protocol** below.
   target name, so nothing from weir matched. A bare word must now be a level
   name; anything else is logged as a WARN and the daemon logs at `info`. A
   single target is still written `target=level`.
+- The monitoring smoke test's "drain state = Draining" check now fails when a
+  non-chaos instance's drain has stopped or its `weir_drain_state` series is
+  missing: it summed only the `retrying_transient` and
+  `blocked_dead_letter_full` states, so a drain that had exited passed.
 
 ## [4.1.0] - 2026-10-26
 
