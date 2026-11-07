@@ -17,6 +17,10 @@ protocol** below.
 
 ### Fixed
 
+- The ClickHouse sink now redacts its transport errors, so a password
+  passed as a `?password=` query parameter in the sink URL no longer appears
+  in the drain's WARN retry log, the sink failure status or the health
+  probe's error.
 - A failed timed seal (`segment_max_age` or `segment_max_lifetime`) no longer
   logs that the segment "stays active" and will be retried: it was already
   retired, so its acked records were silently stranded in the unsealed `.wab`

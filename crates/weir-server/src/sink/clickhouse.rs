@@ -308,10 +308,13 @@ impl Sink for ClickHouseSink {
                 return Err(sql_common::SqlSinkError::timeout("clickhouse"));
             }
             // connect / DNS / network reset → transient (retry the segment).
+            // reqwest's Display appends the full request URL, query included,
+            // and ClickHouse takes `?password=` query auth that split_credentials
+            // leaves in base_url; the drain re-logs this at WARN on every retry.
             Ok(Err(e)) => {
                 return Err(sql_common::SqlSinkError::transient(
                     "clickhouse",
-                    format!("request: {e}"),
+                    format!("request: {}", sql_common::redact_password(&e.to_string())),
                 ));
             }
             Ok(Ok(r)) => r,
@@ -380,7 +383,11 @@ impl Sink for ClickHouseSink {
         match tokio::time::timeout(self.config.timeout, req.send()).await {
             Ok(Ok(r)) if r.status().is_success() => SinkHealth::Healthy,
             Ok(Ok(r)) => SinkHealth::Down(format!("http {}", r.status())),
-            Ok(Err(e)) => SinkHealth::Down(format!("request: {e}")),
+            // Redact the URL reqwest embeds; see the note on the commit path.
+            Ok(Err(e)) => SinkHealth::Down(format!(
+                "request: {}",
+                sql_common::redact_password(&e.to_string())
+            )),
             Err(_) => SinkHealth::Down("health probe timed out".to_string()),
         }
     }
@@ -838,6 +845,35 @@ mod tests {
         .unwrap_err();
         // A timeout is classified transient (retry the segment).
         assert!(err.is_transient(), "timeout must be transient: {err}");
+    }
+
+    #[tokio::test]
+    async fn transport_error_redacts_query_string_password() {
+        // ClickHouse accepts `?user=...&password=...` query-parameter auth.
+        // split_credentials strips only userinfo, so the query password stays
+        // in base_url, and reqwest's error Display appends the full URL. Port 1
+        // refuses the connection, so both commit and health hit that path.
+        let url = "http://127.0.0.1:1/?user=default&password=s3cr3t-qp";
+        let sink = ClickHouseSink::new(cfg(url, "weir_records", "payload")).unwrap();
+        let err = sink
+            .commit(SinkBatch::from(vec![p(b"a")]))
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            err.is_transient(),
+            "connect refused must be transient: {msg}"
+        );
+        assert!(
+            !msg.contains("s3cr3t-qp"),
+            "commit error leaked password: {msg}"
+        );
+        match sink.health().await {
+            SinkHealth::Down(m) => {
+                assert!(!m.contains("s3cr3t-qp"), "health leaked password: {m}");
+            }
+            other => panic!("expected Down, got {other:?}"),
+        }
     }
 
     #[tokio::test]
