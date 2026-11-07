@@ -233,6 +233,7 @@ sink_retry_base_delay_ms = 100
 # Env: WEIR_SINK_BEARER_TOKEN
 
 # Log level for tracing-subscriber. One of: trace, debug, info, warn, error,
-# or any EnvFilter directive (e.g. "weir_server=debug,info").
+# or any EnvFilter directive (e.g. "weir_server=debug,info"). A bare word must
+# be a level; an invalid value is logged as a WARN and weir logs at info.
 # Env: WEIR_LOG_LEVEL
 log_level = "info"

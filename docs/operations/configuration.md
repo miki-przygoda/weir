@@ -2284,9 +2284,12 @@ SETTINGS non_replicated_deduplication_window = 100;
 
 - **Type**: string
 - **Default**: `"info"`
-- **Valid values**: `trace`, `debug`, `info`, `warn`, `error`, or any
-  `tracing-subscriber::EnvFilter` directive (e.g.
-  `"weir_server=debug,info"` to set per-module levels).
+- **Valid values**: `trace`, `debug`, `info`, `warn`, `error`, `off`, or
+  any `tracing-subscriber::EnvFilter` directive (e.g.
+  `"weir_server=debug,info"` to set per-module levels). A bare word must be
+  a level name: a target is written `target=level`. A value that is not
+  valid (a misspelt level such as `warning`, for instance) is logged as a
+  WARN at startup and weir logs at `info`.
 - **CLI**: `--log-level <level>`
 - **Env**: `WEIR_LOG_LEVEL`
 - **TOML**: `log_level`

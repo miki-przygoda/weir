@@ -21,6 +21,11 @@ protocol** below.
   value printed in the startup error: the message names the variable only, so
   a secret such as `WEIR_SINK_URL`'s credentials or
   `WEIR_SINK_S3_SECRET_ACCESS_KEY` no longer reaches stderr or the journal.
+- A misspelt `log_level` such as `warning` or `information` no longer turns
+  every log line off without a word: `tracing` took a bare unknown word as a
+  target name, so nothing from weir matched. A bare word must now be a level
+  name; anything else is logged as a WARN and the daemon logs at `info`. A
+  single target is still written `target=level`.
 
 ## [4.1.0] - 2026-10-26
 
