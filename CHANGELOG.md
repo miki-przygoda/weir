@@ -29,6 +29,10 @@ protocol** below.
 
 ### Fixed
 
+- The `weir starting` log line and the admin config view no longer print a
+  `sink_url` or `sink_s3_endpoint` whose userinfo has no `@host` after it
+  (`mysql://weir:password`). The `user:password` was taken for `host:port`
+  and printed in full; such a URL now shows as `<unparseable>`.
 - The configuration reference no longer says `max_batch_records` and
   `max_payload_bytes` multiply. `max_payload_bytes` caps a whole `PushBatch`
   body, so a batch whose records each fit but whose body does not gets
