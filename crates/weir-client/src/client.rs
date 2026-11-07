@@ -579,6 +579,15 @@ impl<S: Read + Write> WeirClient<S> {
         }
 
         let body = encode_batch_body(&slices);
+        // The daemon caps the whole frame payload, not just each record, so a
+        // batch of records that each fit can still encode to a body over the
+        // hard cap. Refuse it here for the same reason as the per-record check.
+        if body.len() > MAX_PAYLOAD_HARD_CAP {
+            return Err(ClientError::PayloadTooLarge {
+                len: body.len(),
+                limit: MAX_PAYLOAD_HARD_CAP,
+            });
+        }
         let header = Header::new(MessageType::PushBatch, durability, 0);
         let frame = Envelope::new(header, body).encode();
         let resp = self.send_frame(&frame)?;

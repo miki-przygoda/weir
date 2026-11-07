@@ -933,6 +933,32 @@ mod tests {
     }
 
     #[test]
+    fn push_batch_rejects_body_over_hard_cap_locally() {
+        // Every record is within the per-record cap, but the encoded PushBatch
+        // body is not: the daemon caps the whole frame payload, so it would Nack
+        // PayloadTooLarge and close, poisoning the client. The guard must catch
+        // it before any bytes are sent. The server end is dropped, so a write
+        // that slips past the guard fails as a poisoning I/O error instead.
+        let (client_end, server_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        drop(server_end);
+        let mut c = WeirClient::from_stream(client_end);
+        let record = vec![7u8; 9 * 1024 * 1024];
+        let records = [record.clone(), record];
+        let body_len = weir_core::BATCH_HEADER_LEN + 2 * (4 + 9 * 1024 * 1024);
+        let err = c
+            .push_batch(&records, Durability::Durable)
+            .map(|o| o.all_accepted())
+            .unwrap_err();
+        assert!(
+            matches!(err, ClientError::PayloadTooLarge { len, limit }
+                if len == body_len && limit == MAX_PAYLOAD_HARD_CAP),
+            "expected a local PayloadTooLarge for the batch body, got {err:?}"
+        );
+        assert!(err.is_recoverable(), "a local rejection is recoverable");
+        assert!(!c.is_poisoned(), "a local rejection must not poison");
+    }
+
+    #[test]
     fn push_rejects_empty_payload_locally_without_poisoning() {
         // An empty payload is the WAB end-of-records sentinel; the daemon would
         // Nack+close it. The local guard rejects it before any bytes are sent, so

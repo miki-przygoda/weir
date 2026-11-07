@@ -17,6 +17,11 @@ protocol** below.
 
 ### Fixed
 
+- `WeirClient::push_batch` now rejects a batch whose encoded body exceeds
+  the 16 MiB protocol hard cap locally, as a recoverable
+  `ClientError::PayloadTooLarge`, even when every record fits. It used to
+  send the frame, get `Nack(PayloadTooLarge)` back and poison the
+  connection.
 - `weir-ctl attest verify` no longer reports a `BROKEN_LINK` (exit 1,
   `weir_attest_verify_failures` above 0) when the drain has reclaimed or
   quarantined a segment out of order, as it does while an older segment is
