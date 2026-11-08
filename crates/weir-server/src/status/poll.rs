@@ -1307,6 +1307,11 @@ pub(crate) fn startup_cap_gate(
             Some(bytes)
         }
         None => {
+            // Not the initial 0: the push path judges the flag against this,
+            // and 0 would release it on the first push.
+            board
+                .wab_bytes_now
+                .store(crate::wab::cap::BYTES_UNKNOWN, Ordering::Relaxed);
             if wab_max_bytes > 0 {
                 board.wab_cap_rejecting.store(true, Ordering::Relaxed);
                 metrics.wab_cap_rejecting.set(1.0);
@@ -2448,6 +2453,17 @@ mod tests {
             "fail-closed: nack until a scan succeeds"
         );
         assert!(capped.wab.first_scan_ok_ms().is_none());
+        assert_eq!(
+            capped.wab_bytes_now.load(Ordering::Relaxed),
+            crate::wab::cap::BYTES_UNKNOWN,
+            "unmeasured, not 0: the push path must not release the flag"
+        );
+        let ev = capped.evidence_at(crate::status::unix_ms_now());
+        assert_eq!(
+            ev.wab_cap.map(|c| c.bytes_now),
+            Some(0),
+            "reported as 0, as before"
+        );
         let uncapped = StatusBoard::for_test();
         startup_cap_gate(&missing, 0, &uncapped, &m);
         assert!(!uncapped.wab_cap_rejecting.load(Ordering::Relaxed));

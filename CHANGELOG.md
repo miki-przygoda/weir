@@ -62,10 +62,13 @@ protocol** below.
 ### Fixed
 
 - A daemon whose startup WAB size scan failed with `wab_max_bytes` set now
-  accepts pushes again when the first poll scan that succeeds finds the WAB
-  below the cap. The fail-closed flag went through the cap's hysteresis, so a
-  WAB between low water (90% of the cap) and the cap kept pushes nacked and
-  `/readyz` at 503 `wab_cap_rejecting`, for good when the sink was down.
+  nacks pushes until a scan succeeds, and accepts them again when the first
+  poll scan that succeeds finds the WAB below the cap. The first push
+  released the fail-closed flag, judging the unscanned WAB as 0 bytes, so a
+  WAB already over the cap took writes, without bound while every later scan
+  failed. And once a scan succeeded, the flag went through the cap's
+  hysteresis, so a WAB between low water (90% of the cap) and the cap could
+  keep pushes nacked and `/readyz` at 503 `wab_cap_rejecting`.
 - `deploy/smoke-test.sh` now says it pushes and acks 20 records across
   both durability tiers. It said 30 across three, though `push_simple`
   pushes only `Durable` and `Buffered` since the `Batched` tier was retired.

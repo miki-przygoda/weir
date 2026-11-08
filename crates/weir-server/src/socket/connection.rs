@@ -1994,6 +1994,40 @@ mod tests {
         );
     }
 
+    /// Spec §6 step 9: a failed startup scan leaves pushes nacked until a
+    /// scan succeeds. The push path must not judge the placeholder flag
+    /// against a WAB size nobody has measured: with `wab_bytes_now` still at
+    /// its initial 0 the hysteresis would release it on the first push.
+    #[tokio::test]
+    async fn a_failed_startup_scan_keeps_pushes_nacked_until_a_scan_succeeds() {
+        let missing = crate::testutil::scratch_dir("conn_gate_missing").join("no_such_wab_dir");
+        let board = crate::status::StatusBoard::for_test();
+        let m = Metrics::new().0;
+        assert_eq!(
+            crate::status::poll::startup_cap_gate(&missing, 1_000, &board, &m),
+            None
+        );
+        let cfg = ConnectionConfig {
+            wab_max_bytes: 1_000,
+            wab_bytes_now: Arc::clone(&board.wab_bytes_now),
+            wab_cap_rejecting: Arc::clone(&board.wab_cap_rejecting),
+            ..test_cfg()
+        };
+        let metrics = Arc::new(Metrics::new().0);
+        let mut client = spawn_handler_acking_with(cfg, Arc::clone(&metrics), Some(true)).await;
+        client.write_all(&push_frame(b"hello")).await.unwrap();
+        assert_eq!(
+            read_response(&mut client).await.0,
+            MessageType::Nack,
+            "no scan has succeeded: the push must nack"
+        );
+        assert!(
+            board.wab_cap_rejecting.load(Ordering::Relaxed),
+            "the push must not release the fail-closed flag"
+        );
+        assert_eq!(metrics.wab_cap_rejections.get(), 1);
+    }
+
     #[tokio::test]
     async fn push_under_the_wab_cap_is_accepted() {
         let bytes = Arc::new(AtomicU64::new(100));
