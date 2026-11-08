@@ -1925,3 +1925,64 @@ fn a_manual_docs_run_on_main_publishes_the_site() {
         );
     }
 }
+
+const SINK_SDK_LIB: &str = include_str!("../../weir-sink-sdk/src/lib.rs");
+const INTEGRATING: &str = include_str!("../../../docs/getting-started/integrating.md");
+
+/// A document's prose with rustdoc markers stripped and whitespace collapsed,
+/// so a phrase is found however the lines were wrapped.
+fn prose(src: &str) -> String {
+    src.lines()
+        .map(|l| {
+            let t = l.trim_start();
+            t.strip_prefix("//!")
+                .or_else(|| t.strip_prefix("///"))
+                .unwrap_or(t)
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// `DedupToken` is a hash of a batch's bytes alone, so two distinct batches
+/// with the same bytes (a heartbeat every 30 s, one per timed-seal segment)
+/// share it, and a downstream that dedups on it drops the second while weir
+/// deletes it. The built-in ClickHouse and HTTP NDJSON sinks stopped sending
+/// it for that reason, but the sink-SDK docs and the integration guide went on
+/// telling third-party authors it was fine where a duplicate is cheap.
+#[test]
+fn no_doc_offers_the_content_only_dedup_token_as_a_downstream_key() {
+    let docs = [
+        ("crates/weir-sink-sdk/src/lib.rs", prose(SINK_SDK_LIB)),
+        ("docs/getting-started/integrating.md", prose(INTEGRATING)),
+        ("docs/architecture.md", prose(ARCHITECTURE)),
+    ];
+    let stale = [
+        "Fine for an archive",
+        "keeps deduplicating",
+        "`dedup_token()` is simpler",
+        "should instead read [`SinkBatch::dedup_token`] and pass it along",
+        "pass it downstream if your target can deduplicate on one",
+        "forward to a downstream capable of deduplicating on it",
+        "correctly — the same token",
+    ];
+    let mut problems = Vec::new();
+    for (path, text) in &docs {
+        for phrase in stale {
+            if text.contains(phrase) {
+                problems.push(format!("{path} still says {phrase:?}"));
+            }
+        }
+    }
+    for (path, text) in &docs[..2] {
+        if !text.contains("heartbeat") || !text.contains("segment_created_at") {
+            problems.push(format!(
+                "{path} must name the heartbeat hazard and the coordinate key \
+                 (segment_created_at, first RecordId, count) a sink can build instead"
+            ));
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}

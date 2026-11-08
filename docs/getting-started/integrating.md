@@ -223,10 +223,10 @@ impl Sink for MySink {
     type Error = BasicSinkError;    // ready-made error; or your own SinkError
 
     async fn commit(&self, batch: SinkBatch) -> Result<CommitResult, BasicSinkError> {
-        // `batch.dedup_token()` is a content-derived idempotency handle for this
-        // batch — pass it downstream if your target can deduplicate on one.
-        // If a duplicate is expensive, read "Choosing an idempotency key" below
-        // before you build on it: `batch.record_ids()` is usually the right one.
+        // If your target can deduplicate, read "Choosing an idempotency key"
+        // below first: `batch.record_ids()` is usually the right key. Do not
+        // send `batch.dedup_token()`: distinct batches with the same bytes
+        // share it, and the downstream drops all but the first.
         let mut committed = Vec::new();
         let mut dead_lettered = Vec::new();   // Vec<(Payload, String)>
         for record in batch.into_records() {
@@ -281,6 +281,7 @@ wrong one is a silent bug rather than a visible failure.
 | Scope | the whole batch, one value | one value per record |
 | Derived from | the payload bytes | the record's WAB coordinate + its bytes |
 | Two records with identical bytes | same value | **different** values |
+| Two batches with identical bytes (a heartbeat in each of two segments) | **same** value | different values |
 | Same batch re-sent after a retry | same value | same values |
 | Same records re-split because `sink_max_batch_size` changed | **different** value | same values |
 
@@ -291,9 +292,18 @@ already-partly-delivered segment. A batch-level key is a function of the batch,
 so it moves; a `RecordId` names the record's position in the buffer, so it does
 not.
 
-- **A duplicate is cheap** (an archive, a log, an analytics table you `SELECT
-  DISTINCT` over): `dedup_token()` is simpler, and its precondition — keep
-  `sink_max_batch_size` stable — is easy to hold.
+- **Never send `dedup_token()` as the key.** The two-batches row is why: a
+  producer that pushes the same heartbeat every 30 s fills each timed-seal
+  segment with one byte-identical record, every one of those batches carries
+  the same token, and a downstream that dedups on it keeps the first and
+  drops the rest while weir confirms and deletes them. The built-in
+  ClickHouse and HTTP NDJSON sinks stopped sending it for that reason.
+- **The downstream takes one key per batch** (a ClickHouse block token, an
+  NDJSON `Idempotency-Key`): build it from the batch's place in the buffer, as
+  the built-in sinks do — `batch.segment_created_at()`, the first of
+  `batch.record_ids()`, and `batch.len()`. [Batch keys](../sinks/batch-keys.md)
+  gives the exact preimage. It moves when `sink_max_batch_size` changes, like
+  any batch key, so hold that setting stable.
 - **A duplicate is expensive** (a billing row, a metering event, anything that
   would need a refund): key on `record_ids()`. Write the id as a column with a
   `UNIQUE` constraint, or send it as a per-request `Idempotency-Key`. This is

@@ -39,7 +39,9 @@ protocol** below.
   acked records with no error. After upgrading, a batch that was in flight
   at the upgrade is re-sent once under the new key, so ClickHouse and an
   idempotent HTTP endpoint may see it twice, once. HTTP per-record mode is
-  unchanged.
+  unchanged. The sink-SDK docs and the integration guide no longer offer
+  `DedupToken` as a downstream key where a duplicate is cheap: a custom
+  sink should key on `record_ids()` or build the same coordinate key.
 - An explicit `admin_socket_path` reached through a symlink to `wab_dir`
   (`/data/wab/admin.sock` when `/data` links to `/mnt/x`) is now refused at
   startup as inside `wab_dir`. The check compared the path as written with

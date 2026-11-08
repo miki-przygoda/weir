@@ -58,12 +58,25 @@
 //!   **unchanged when `sink_max_batch_size` changes between two delivery
 //!   attempts**. Use this when a duplicate is expensive.
 //! - [`SinkBatch::dedup_token`] — one [`DedupToken`] for the whole batch,
-//!   derived from its bytes. Simpler, but it names the batch, so it moves when
-//!   the drain re-splits a segment at different boundaries. Fine for an
-//!   archive; not for a billing row.
+//!   derived from its bytes alone. **Do not send it downstream as a dedup
+//!   key.** Two distinct batches with the same bytes share it: a producer that
+//!   pushes the same heartbeat every 30 s fills each timed-seal segment with
+//!   one byte-identical record, every one of those one-record batches carries
+//!   the same token, and a downstream that dedups on it keeps the first and
+//!   drops the rest while weir confirms and deletes them. The built-in
+//!   ClickHouse and HTTP NDJSON sinks stopped sending it for that reason.
 //!
-//! **Do not dedup on a hash of the payload.** It is not a weaker version of the
-//! two above, it is a different thing that loses data: a producer emitting
+//! If the downstream takes one key per batch (a ClickHouse block token, an
+//! NDJSON `Idempotency-Key`), build it from where the batch sits in the
+//! buffer, as the built-in sinks do: [`SinkBatch::segment_created_at`], the
+//! first of [`SinkBatch::record_ids`] and the record count (the daemon's
+//! `docs/sinks/batch-keys.md` gives the exact preimage). Like any batch key it
+//! moves when `sink_max_batch_size` changes between two delivery attempts, so
+//! prefer the per-record ids when a duplicate is expensive.
+//!
+//! **Do not dedup on a hash of the payload**, per record or per batch (the
+//! [`DedupToken`] is the per-batch one). It is not a weaker version of the
+//! keys above, it is a different thing that loses data: a producer emitting
 //! repetitive records — a heartbeat, a fixed-shape metering event — hands the
 //! downstream the same key for genuinely distinct events, and a correct
 //! idempotent endpoint keeps the first and discards the rest. weir acked those
@@ -343,10 +356,21 @@ pub enum SinkHealth {
 ///
 /// # What it guarantees
 ///
-/// A crash-replayed, byte-identical batch produces a byte-identical token, so a
-/// downstream that deduplicates on it (ClickHouse's `insert_deduplication_token`,
-/// an HTTP `Idempotency-Key`, a Postgres `ON CONFLICT` key) collapses the
-/// re-delivery that weir's at-least-once contract permits.
+/// A crash-replayed, byte-identical batch produces a byte-identical token.
+///
+/// # Not a downstream dedup key
+///
+/// The converse holds too, and it is what makes the token unsafe to send to a
+/// downstream that deduplicates on it (ClickHouse's
+/// `insert_deduplication_token`, an HTTP `Idempotency-Key`, a Postgres
+/// `ON CONFLICT` key): two *distinct* batches with the same bytes get the same
+/// token. A producer that pushes the same heartbeat every 30 s fills each
+/// timed-seal segment with one byte-identical record, so each of those batches
+/// carries one token; the downstream keeps the first and silently drops the
+/// rest, and weir, seeing a successful commit, deletes them. The built-in
+/// ClickHouse and HTTP NDJSON sinks stopped sending it for that reason and key
+/// a batch by its place in the buffer instead — see "Which key to dedup on" in
+/// the crate docs.
 ///
 /// # Precondition — keep `sink_max_batch_size` stable
 ///
@@ -365,17 +389,18 @@ pub enum SinkHealth {
 /// would present the same value and a dedup-capable sink would discard all but
 /// the first, turning a duplicate-prevention feature into data loss.
 ///
-/// **If your downstream cannot accept that precondition, do not use this
-/// token.** Use [`SinkBatch::record_ids`] instead: a [`RecordId`] names the
-/// record's position in the buffer rather than the batch it arrived in, so it
-/// is unchanged by a re-split. For an archive the precondition is cheap; for a
-/// billing or metering record a silent double-charge is not.
+/// Use [`SinkBatch::record_ids`] instead: a [`RecordId`] names the record's
+/// position in the buffer rather than the batch it arrived in, so it is
+/// unchanged by a re-split, and distinct for two records with the same bytes.
 ///
 /// # Stability
 ///
-/// The digest is byte-identical to the token weir 1.x's ClickHouse sink computed
-/// internally, so an operator upgrading mid-outage keeps deduplicating. It is
-/// pinned by a known-answer test and must not change without a major version.
+/// The digest is byte-identical to the token weir 1.x's ClickHouse sink
+/// computed internally. It is pinned by a known-answer test and must not change
+/// without a major version. No built-in sink sends it any more: after 4.1.0 the
+/// ClickHouse and HTTP NDJSON sinks key a batch by its WAB coordinate, so an
+/// upgrade re-sends a batch that was in flight at the upgrade once, under the
+/// new key.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct DedupToken([u8; 32]);
 
@@ -438,8 +463,8 @@ impl std::fmt::Debug for DedupToken {
 /// A `DedupToken` must be **stable across a retry**: the same batch, re-sent
 /// after a transient failure, has to present the same value or the retry
 /// deduplicates as new data. It is therefore a pure function of the payload
-/// bytes, and two batches carrying identical bytes are — correctly — the same
-/// token.
+/// bytes, and two batches carrying identical bytes are the same token — which
+/// is also why it is not safe as a downstream dedup key (see [`DedupToken`]).
 ///
 /// A per-record idempotency key must be **unique across records**. Derived from
 /// payload bytes alone, a producer emitting repetitive records (a heartbeat, a
@@ -552,10 +577,11 @@ impl std::fmt::Debug for RecordId {
 /// The token is **batch-scoped, not segment-scoped**. The drain splits each
 /// sealed segment into `sink_max_batch_size` chunks and calls `commit` once per
 /// chunk; a token shared across those chunks would make a dedup-capable sink
-/// discard every chunk after the first. See [`DedupToken`] for the stability
-/// precondition that comes with it.
+/// discard every chunk after the first. It is also derived from the bytes
+/// alone, so two distinct batches with the same bytes share it; see
+/// [`DedupToken`] for why that rules it out as a downstream dedup key.
 ///
-/// That precondition is why the batch also carries a [`RecordId`] per record
+/// That is why the batch also carries a [`RecordId`] per record
 /// ([`SinkBatch::record_ids`]). Those name the records' positions in the
 /// buffer rather than the batch, so they are the key to use when the downstream
 /// must not double-count — see [`RecordId`] for the two-way comparison.
@@ -715,7 +741,9 @@ impl SinkBatch {
         (self.records, self.dedup_token)
     }
 
-    /// The batch's idempotency handle.
+    /// A hash of the batch's bytes. Two distinct batches with the same bytes
+    /// share it, so do not send it to a downstream that deduplicates on it;
+    /// see [`DedupToken`].
     pub fn dedup_token(&self) -> &DedupToken {
         &self.dedup_token
     }
@@ -780,8 +808,9 @@ pub trait Sink: Send + Sync + 'static {
     /// }
     /// ```
     ///
-    /// A sink whose downstream can deduplicate should instead read
-    /// [`SinkBatch::dedup_token`] and pass it along — see [`DedupToken`].
+    /// A sink whose downstream can deduplicate should key on
+    /// [`SinkBatch::record_ids`], not [`SinkBatch::dedup_token`] — see "Which
+    /// key to dedup on" in the crate docs.
     async fn commit(&self, batch: SinkBatch) -> Result<CommitResult, Self::Error>;
 
     /// Maximum number of records per `commit` call. The drain splits larger

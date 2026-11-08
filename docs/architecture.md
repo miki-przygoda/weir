@@ -182,7 +182,7 @@ Crash-safe write-ahead buffer. See [wab_format.md](wab_format.md) for the binary
 - `Sink` trait uses native async fn in trait (AFIT, stable since Rust 1.75). The drain is generic `spawn<S: Sink>` to avoid `dyn Sink` object-safety issues with AFIT.
 - `SinkError::is_transient()` classifies errors: transient errors trigger exponential backoff retry of the whole segment; permanent errors dead-letter the batch.
 - `CommitResult` splits a batch into `committed` and `dead_lettered` records — partial success is a first-class outcome, not an error.
-- `SinkBatch` carries the batch's records alongside a `DedupToken`, a content-derived idempotency handle (`sha256` over length-delimited payloads) that any sink can forward to a downstream capable of deduplicating on it.
+- `SinkBatch` carries the batch's records alongside a `DedupToken`, a content-derived handle (`sha256` over length-delimited payloads). Two distinct batches with the same bytes share it, so no built-in sink sends it downstream: the ClickHouse and HTTP NDJSON sinks key a batch by its WAB coordinate ([batch keys](sinks/batch-keys.md)), and the per-record keys are `RecordId`s.
 - `SinkHealth` (`Healthy / Degraded / Down`) is surfaced via the `weir_sink_health` gauge; queried per-segment by the drain and on a 30 s wall-clock interval so the gauge stays current during idle deployment and `BlockedDeadLetterFull`. Degraded / Down states log the sink-supplied reason at `warn` / `error`.
 
 **Built-in sinks** (`sink_type` config value):
