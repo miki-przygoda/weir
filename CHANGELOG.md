@@ -44,6 +44,10 @@ protocol** below.
 
 ### Fixed
 
+- An unknown `sink_type` (a typo such as `s4`) is now rejected with a
+  message that lists `s3` among the valid sink types. The list named
+  only `noop`, `http`, `mysql`, `postgres` and `clickhouse`, though
+  `--help` and the parser both accept `s3`.
 - A `PushBatch` the daemon refuses whole at admission (the `wab_max_bytes`
   cap rejecting, or the `wab_dir` lost to another instance) now adds its
   record count to `weir_records_nack_total{reason="internal_error"}` and

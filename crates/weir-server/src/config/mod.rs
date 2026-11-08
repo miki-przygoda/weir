@@ -158,7 +158,7 @@ impl SinkType {
                 field: "sink_type",
                 reason: format!(
                     "'{other}' is not a valid sink type; expected 'noop', 'http', \
-                     'mysql', 'postgres', or 'clickhouse'"
+                     'mysql', 'postgres', 'clickhouse', or 's3'"
                 ),
             }),
         }
@@ -2070,6 +2070,20 @@ mod tests {
             assert!(
                 block.contains(&format!("`{sink}`")),
                 "the README's 'Built-in sinks' block does not name `{sink}`:\n{block}"
+            );
+        }
+    }
+
+    /// An unknown `sink_type` (a typo such as `s4`) must list every sink the
+    /// daemon accepts, so the operator can see the one they meant. The list
+    /// once left out `s3`, which `--help` and `SinkType::parse` both accept.
+    #[test]
+    fn unknown_sink_type_error_lists_every_sink() {
+        let err = SinkType::parse("s4").unwrap_err().to_string();
+        for sink in ["noop", "http", "mysql", "postgres", "clickhouse", "s3"] {
+            assert!(
+                err.contains(&format!("'{sink}'")),
+                "the unknown-sink-type error does not name '{sink}': {err}"
             );
         }
     }
