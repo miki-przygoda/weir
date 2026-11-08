@@ -284,21 +284,29 @@ impl HttpSink {
         // A 3xx surfaces here only because redirect-following is disabled (G01).
         // Treat it as a permanent misconfiguration — never committed: the
         // configured sink URL should point straight at the ingest endpoint, not a
-        // redirector. Reported with the Location so the operator can repoint it.
+        // redirector. Reported with the Location's origin so the operator can
+        // repoint it.
         if status.is_redirection() {
-            let raw_location = resp
+            // Only `scheme://host[:port]` of the Location is printed: an
+            // http-to-https upgrade echoes the configured path and query, which
+            // can carry the webhook secret (security-r4-01). A relative Location
+            // is resolved against the request URL first.
+            let location = match resp
                 .headers()
                 .get(reqwest::header::LOCATION)
                 .and_then(|v| v.to_str().ok())
-                .unwrap_or("<no Location header>");
-            // The Location header is downstream-controlled and is interpolated into
-            // the log line and the dead-letter reason, so sanitize + bound it the
-            // same way as the permanent-body excerpt below (S29 log-forging defense).
-            // reqwest already rejects CR/LF in header values, so this is defense in
-            // depth plus capping an otherwise-unbounded header value at 256.
-            let location = crate::sink::sanitize_log_excerpt(
-                &raw_location.chars().take(256).collect::<String>(),
-            );
+            {
+                Some(raw) => resp.url().join(raw).map_or_else(
+                    |_| "<unparseable>".to_string(),
+                    |u| crate::status::config_view::url_origin(u.as_str()),
+                ),
+                None => "<no Location header>".to_string(),
+            };
+            // Downstream-controlled and interpolated into the log line and the
+            // dead-letter reason: sanitize + bound it like the body excerpt below
+            // (S29 log-forging defense), as defense in depth.
+            let location =
+                crate::sink::sanitize_log_excerpt(&location.chars().take(256).collect::<String>());
             return Err(HttpSinkError::PermanentStatus {
                 status,
                 body_excerpt: format!(
@@ -335,15 +343,45 @@ impl HttpSink {
         // characters: the body is downstream-controlled and is interpolated into
         // log lines and the dead-letter reason, so a hostile endpoint could
         // otherwise inject forged log records or terminal escape sequences (S29).
+        // A body can echo the request path back (Express: `Cannot POST <path>`),
+        // so the sink URL's path and query are cut out before the excerpt is
+        // taken (security-r4-01).
         let bytes = crate::sink::read_body_capped(resp, crate::sink::RESPONSE_BODY_CAP).await;
-        let cut = bytes.len().min(256);
+        let body = redact_sink_url_echo(&String::from_utf8_lossy(&bytes), &self.config.url);
         let body_excerpt =
-            crate::sink::sanitize_log_excerpt(&String::from_utf8_lossy(&bytes[..cut]));
+            crate::sink::sanitize_log_excerpt(&body.chars().take(256).collect::<String>());
         Err(HttpSinkError::PermanentStatus {
             status,
             body_excerpt,
         })
     }
+}
+
+/// Cuts the sink URL's path and query out of downstream text that may echo
+/// them back, in both the configured spelling and reqwest's normalized one:
+/// either can carry a webhook token or a presigned signature (security-r4-01).
+fn redact_sink_url_echo(text: &str, sink_url: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Ok(u) = reqwest::Url::parse(sink_url) {
+        parts.push(u.path().to_string());
+        parts.extend(u.query().map(str::to_string));
+    }
+    if let Some(i) = sink_url.find("://") {
+        let rest = &sink_url[i + 3..];
+        if let Some(j) = rest.find(['/', '?', '#']) {
+            let tail = rest[j..].split('#').next().unwrap_or_default();
+            let (path, query) = tail.split_once('?').unwrap_or((tail, ""));
+            parts.push(path.to_string());
+            parts.push(query.to_string());
+        }
+    }
+    parts.retain(|p| p.len() > 1);
+    parts.sort_by_key(|p| std::cmp::Reverse(p.len()));
+    let mut out = text.to_string();
+    for p in &parts {
+        out = out.replace(p.as_str(), "<redacted>");
+    }
+    out
 }
 
 /// Computes the `Idempotency-Key` header value for a payload.
@@ -1164,6 +1202,75 @@ mod tests {
             }
             other => panic!("expected Down for a closed port, got {other:?}"),
         }
+    }
+
+    /// Dead-letters one record against a mock that answers `response`, with
+    /// the sink pointed at `secret_url` on the mock's port, and returns the
+    /// dead-letter reason.
+    async fn reason_for_secret_url(response: String) -> String {
+        let resp: &'static str = Box::leak(response.into_boxed_str());
+        let (url, _counter) = spawn_mock_server(vec![resp]).await;
+        let authority = url
+            .trim_start_matches("http://")
+            .trim_end_matches('/')
+            .to_string();
+        let sink = HttpSink::new(cfg(&secret_url(&authority))).unwrap();
+        let result = sink
+            .commit(SinkBatch::from(vec![p(b"alpha")]))
+            .await
+            .unwrap();
+        assert_eq!(result.dead_lettered.len(), 1);
+        result.dead_lettered[0].1.clone()
+    }
+
+    // security-r4-01: an http-to-https upgrade echoes the configured path
+    // (and query) in its Location; only the target's origin may be printed.
+    #[tokio::test]
+    async fn redirect_reason_prints_only_the_location_origin() {
+        let reason = reason_for_secret_url(format!(
+            "HTTP/1.1 301 Moved Permanently\r\nLocation: https://hooks.example.com\
+             /services/T0/B0/{PATH_SECRET}?X-Amz-Signature={QUERY_SECRET}\r\n\
+             Content-Length: 0\r\n\r\n"
+        ))
+        .await;
+        assert!(
+            !reason.contains(PATH_SECRET) && !reason.contains(QUERY_SECRET),
+            "Location path/query secret leaked into the redirect reason: {reason}"
+        );
+        assert!(reason.contains("301"), "{reason}");
+        assert!(reason.contains("https://hooks.example.com"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn relative_redirect_reason_prints_no_path() {
+        let reason = reason_for_secret_url(format!(
+            "HTTP/1.1 308 Permanent Redirect\r\nLocation: /v2/services/T0/B0/{PATH_SECRET}\r\n\
+             Content-Length: 0\r\n\r\n"
+        ))
+        .await;
+        assert!(!reason.contains(PATH_SECRET), "{reason}");
+        assert!(reason.contains("http://127.0.0.1:"), "{reason}");
+    }
+
+    // sinks-r4-01: Express answers an unknown route with `Cannot POST <path>`,
+    // so a permanent-status body can echo the configured path secret back.
+    #[tokio::test]
+    async fn permanent_body_excerpt_redacts_the_sink_url_path_and_query() {
+        let body = format!(
+            "<pre>Cannot POST /services/T0/B0/{PATH_SECRET}\
+             ?X-Amz-Signature={QUERY_SECRET}&client_secret={QUERY_SECRET}</pre>"
+        );
+        let reason = reason_for_secret_url(format!(
+            "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ))
+        .await;
+        assert!(
+            !reason.contains(PATH_SECRET) && !reason.contains(QUERY_SECRET),
+            "sink URL secret echoed through the body excerpt: {reason}"
+        );
+        assert!(reason.contains("404"), "{reason}");
+        assert!(reason.contains("Cannot POST"), "{reason}");
     }
 
     #[tokio::test]

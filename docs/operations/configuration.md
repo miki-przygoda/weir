@@ -1415,7 +1415,9 @@ view show only `scheme://host[:port]`, and a URL whose userinfo has no `@host`
 after it (`mysql://weir:password`) shows as `<unparseable>`. The HTTP sink also
 prints only `scheme://host[:port]` of `sink_url` in its `sink: http` startup
 line, its transport-error retries, its health `Down` reason and the admin status
-text, so a webhook token in the path or a presigned signature in any query key
+text. A 3xx is reported with only the origin of its `Location`, and the
+configured path and query are cut out of an error body that echoes them, so a
+webhook token in the path or a presigned signature in any query key
 (`X-Amz-Signature`, `client_secret`, ...) is never printed. The SQL sinks
 (MySQL, Postgres, ClickHouse) scrub the URL **userinfo** password
 (`scheme://user:<redacted>@host`) and the values of known **credential query

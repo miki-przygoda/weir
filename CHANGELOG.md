@@ -19,9 +19,12 @@ protocol** below.
 
 - The HTTP sink now prints only the `scheme://host[:port]` of `sink_url`
   in its startup `sink: http` log line, its transport-error retries, its
-  health `Down` reason and the admin status text. A webhook token in the
-  path or a presigned signature in any query key used to be printed in
-  full, because the redactor only knew userinfo and ten query keys.
+  health `Down` reason and the admin status text. A 3xx dead-letter reason
+  names only the origin of its `Location`, and a 4xx/5xx body excerpt has
+  the configured path and query cut out. A webhook token in the path or a
+  presigned signature in any query key used to be printed in full, because
+  the redactor only knew userinfo and ten query keys, and an http-to-https
+  redirect or an echoing error body (`Cannot POST /path`) printed it too.
 - A config file that does not parse now names the line and column (or the
   key) and what was expected, without quoting the offending line or value.
   A TOML syntax error used to print the whole source line to stderr, and a
