@@ -61,6 +61,12 @@ protocol** below.
 
 ### Fixed
 
+- The system test `sigterm_unlinks_the_socket_at_once_and_metrics_stay_up_until_exit`
+  now makes one HealthCheck round-trip on its idle connection before
+  SIGTERM. It sent SIGTERM before the daemon had accepted that connection,
+  so on a loaded machine the kernel reset it from the listen backlog
+  (ECONNRESET) and the test failed, though the lame duck promises EOF only
+  to accepted idle connections.
 - A daemon whose startup WAB size scan failed with `wab_max_bytes` set now
   nacks pushes until a scan succeeds, and accepts them again when the first
   poll scan that succeeds finds the WAB below the cap. The first push

@@ -6138,7 +6138,8 @@ fn assert_all_delivered(sink: &RecordingSink, wanted: &[String], within: Duratio
 /// the process exits. (PR 5 adds the `/readyz` 503 assertion here.)
 #[test]
 fn sigterm_unlinks_the_socket_at_once_and_metrics_stay_up_until_exit() {
-    use std::io::Read;
+    use std::io::{Read, Write};
+    use weir_core::{Envelope, HEADER_LEN, Header, MessageType};
     let hole = RecordingSink::start_hanging();
     let mut srv = weir_server!("lame_duck")
         .extra_config(
@@ -6162,8 +6163,28 @@ fn sigterm_unlinks_the_socket_at_once_and_metrics_stay_up_until_exit() {
         );
         thread::sleep(Duration::from_millis(50));
     }
-    let idle = std::os::unix::net::UnixStream::connect(&srv.socket_path).unwrap();
+    let mut idle = std::os::unix::net::UnixStream::connect(&srv.socket_path).unwrap();
     idle.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    // One HealthCheck round-trip on this same connection proves the daemon has
+    // accepted it before SIGTERM. Decision Q5 (operability-foundations README)
+    // promises EOF only to an accepted idle connection: one still in the
+    // listen backlog when the listener closes is reset by the kernel
+    // (ECONNRESET), which failed this test once on a loaded gate. That race
+    // did not reproduce on demand (150 isolated runs passed), so this is not a
+    // red-first fix: the round-trip removes the window instead of retrying.
+    let frame = Envelope::new(
+        Header::new(MessageType::HealthCheck, Durability::Durable, 0),
+        Vec::new(),
+    )
+    .encode();
+    idle.write_all(&frame).expect("idle: write HealthCheck");
+    let mut resp = [0u8; HEADER_LEN];
+    idle.read_exact(&mut resp).expect("idle: read reply header");
+    let resp = Header::decode(&resp).expect("idle: decode reply header");
+    assert_eq!(resp.message_type(), MessageType::HealthCheckResponse);
+    let mut rest = vec![0u8; resp.payload_len() as usize + 4];
+    idle.read_exact(&mut rest)
+        .expect("idle: read reply body and crc");
 
     let t0 = Instant::now();
     srv.signal(libc::SIGTERM);
