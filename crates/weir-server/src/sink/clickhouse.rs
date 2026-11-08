@@ -158,15 +158,16 @@ impl ClickHouseSink {
         // so an obviously-malformed URL fails at startup instead of only
         // surfacing on the first commit (where it would look like a transient
         // network fault and retry forever). base_url has any userinfo removed,
-        // so neither arm can leak a password; the parse-error arm redacts
-        // config.url defensively in case split_credentials left a secret in.
+        // but split_credentials leaves a `?password=` query parameter in it (a
+        // native-protocol / clickhouse-go DSN carries one), and this error is
+        // printed to stderr at startup, so both arms redact the URL.
         match reqwest::Url::parse(&base_url) {
             Ok(u) if u.scheme() == "http" || u.scheme() == "https" => {}
             Ok(u) => {
                 return Err(ClickHouseSinkBuildError::InvalidUrl(format!(
                     "scheme '{}' is not http or https (in {})",
                     u.scheme(),
-                    base_url
+                    sql_common::redact_password(&base_url)
                 )));
             }
             Err(e) => {
@@ -505,6 +506,26 @@ mod tests {
             "{e:?}"
         );
         assert!(!msg.contains("secret"), "password leaked: {msg}");
+    }
+
+    #[test]
+    fn new_non_http_scheme_error_redacts_query_password() {
+        // A native-protocol / clickhouse-go style DSN carries its password as a
+        // query parameter, which split_credentials leaves in base_url. The
+        // scheme error reaches stderr at startup, so it must be redacted too.
+        let e = ClickHouseSink::new(cfg(
+            "tcp://127.0.0.1:9000?username=default&password=QPSECRET",
+            "t",
+            "payload",
+        ))
+        .unwrap_err();
+        let msg = e.to_string();
+        assert!(
+            matches!(e, ClickHouseSinkBuildError::InvalidUrl(_)),
+            "{e:?}"
+        );
+        assert!(!msg.contains("QPSECRET"), "password leaked: {msg}");
+        assert!(msg.contains("tcp"), "scheme diagnostic lost: {msg}");
     }
 
     #[test]
