@@ -108,7 +108,7 @@ python3 demos/py-wire-client/tests/test_conformance.py     # -> "30/30 vectors p
 python3 demos/py-wire-client/tests/test_tracked.py         # -> "33/33 tracked-extension checks passed"
 python3 demos/py-wire-client/tests/test_batch.py           # -> "56/56 batch-extension checks passed"
 python3 demos/py-wire-client/tests/test_response_cap.py    # -> "1/1 checks passed"
-python3 demos/py-wire-client/tests/test_empty_nack.py      # -> "2/2 checks passed"
+python3 demos/py-wire-client/tests/test_empty_nack.py      # -> "6/6 checks passed"
 
 # Live: start an isolated daemon, then validate against it
 bash demos/py-wire-client/scripts/run_daemon.sh            # writes daemon.pid; socket = weir.sock

@@ -161,14 +161,20 @@ class WeirClient:
             )
         resp = self._request(encode_frame(message_type, durability, payload))
         if resp.message_type == MessageType.NACK:
-            if not resp.payload:
-                # A Nack carries one reason byte. Without it the stream is
-                # desynced, not transiently failing, so drop the connection
-                # rather than report a retryable INTERNAL_ERROR on it.
-                self.close()
-                raise WeirError("protocol desync: Nack frame had an empty payload")
+            self._reject_empty_nack(resp)
             raise NackError(resp.payload[0])
         return resp
+
+    def _reject_empty_nack(self, resp: Frame) -> None:
+        """Close and raise if a Nack lacks its reason byte.
+
+        A Nack carries one reason byte. Without it the stream is desynced, not
+        transiently failing, so drop the connection rather than report a
+        retryable INTERNAL_ERROR (or an unhealthy daemon) on it.
+        """
+        if not resp.payload:
+            self.close()
+            raise WeirError("protocol desync: Nack frame had an empty payload")
 
     def push(
         self, payload: bytes, durability: Durability = Durability.DURABLE
@@ -204,6 +210,21 @@ class WeirClient:
         raise WeirError(f"unexpected response message_type {resp.message_type!r}")
 
     def health_check(self) -> bool:
+        """True on a HealthCheckResponse, False on a Nack with a reason byte.
+
+        Any other reply is a stream desync, as in the Rust client: an empty
+        Nack, or a reply of the wrong kind (an Ack, an AckTracked, an unknown
+        type), closes the connection and raises WeirError, so a later call
+        cannot read a stale frame as its own reply.
+        """
         frame = encode_frame(MessageType.HEALTH_CHECK, Durability.DURABLE, b"")
         resp = self._request(frame)
-        return resp.message_type == MessageType.HEALTH_CHECK_RESPONSE
+        if resp.message_type == MessageType.HEALTH_CHECK_RESPONSE:
+            return True
+        if resp.message_type == MessageType.NACK:
+            self._reject_empty_nack(resp)
+            return False
+        self.close()
+        raise WeirError(
+            f"protocol desync: HealthCheck answered with message_type {resp.message_type!r}"
+        )

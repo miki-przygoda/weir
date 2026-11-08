@@ -108,8 +108,11 @@ protocol** below.
   with an empty payload as a stream desync and close the connection, as
   the Rust client does. Both read the missing reason byte as
   `InternalError`, the one transient reason, so a caller kept using a
-  desynced connection. CI's conformance job now runs both regression
-  tests (`test_empty_nack.py`, `desync_empty_nack.ts`).
+  desynced connection. The Python client's `health_check` does the same,
+  and also for a reply of the wrong kind (an `Ack` to a HealthCheck): it
+  returned `False` and kept the stream open. CI's conformance job now
+  runs both regression tests (`test_empty_nack.py`,
+  `desync_empty_nack.ts`).
 - The TypeScript demo wire client now treats a reply of the wrong kind
   (a `HealthCheckResponse` to a Push, an `Ack` to a HealthCheck, either
   to a PushTracked, an `AckTracked` to a Push or HealthCheck, a reply of
