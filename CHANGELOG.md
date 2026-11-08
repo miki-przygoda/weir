@@ -44,6 +44,9 @@ protocol** below.
   sink should key on `record_ids()` or build the same coordinate key. The
   example config's `sink_send_idempotency_key` comment and the
   `clickhouse-sink` feature comment now say so too.
+  A batch built without segment context still sends its `DedupToken`,
+  whose digest is unchanged from 1.x and is pinned again in both
+  `weir-sink-sdk` and the ClickHouse sink tests.
 - An explicit `admin_socket_path` reached through a symlink to `wab_dir`
   (`/data/wab/admin.sock` when `/data` links to `/mnt/x`) is now refused at
   startup as inside `wab_dir`. The check compared the path as written with

@@ -1084,7 +1084,8 @@ mod tests {
     /// `[b"alpha", b"beta", b"gamma"]`. Changing this constant means breaking
     /// compatibility with every deployment that deduplicates on the token.
     /// Don't. See also the second, deliberately independent copy in
-    /// `weir-server`'s clickhouse sink tests.
+    /// `weir-server`'s clickhouse sink tests,
+    /// `fallback_dedup_token_is_unchanged_from_weir_1_x`.
     const KNOWN_ANSWER_1_X: &str =
         "5bc1fe58cc34db881c67b2acd898651311f6dfc576285c906c8f97e049b15342";
 

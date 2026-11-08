@@ -765,6 +765,25 @@ mod tests {
         );
     }
 
+    /// The fallback token (a batch built without segment context) is still
+    /// the batch's DedupToken, and DedupToken must stay the digest weir 1.x
+    /// sent: sink authors and older ClickHouse tables deduplicate on it.
+    ///
+    /// Deliberately a second, independent copy of the digest that
+    /// weir-sink-sdk's `dedup_token_matches_the_weir_1_x_digest` also pins.
+    /// Re-blessing one without the other makes the pair disagree and the
+    /// build go red, which is the alarm you want on a compatibility constant.
+    #[test]
+    fn fallback_dedup_token_is_unchanged_from_weir_1_x() {
+        let batch = SinkBatch::from(vec![p(b"alpha"), p(b"beta"), p(b"gamma")]);
+        assert_eq!(
+            super::super::batch_key::batch_key_hex(&batch),
+            "5bc1fe58cc34db881c67b2acd898651311f6dfc576285c906c8f97e049b15342",
+            "the DedupToken digest changed: every deployment that deduplicates \
+             on it stops recognising replays across the upgrade"
+        );
+    }
+
     /// A one-record heartbeat batch as the drain builds it from `segment`,
     /// whose header says it was created at `created_at`.
     fn heartbeat_batch(segment: &str, created_at: i64) -> SinkBatch {
