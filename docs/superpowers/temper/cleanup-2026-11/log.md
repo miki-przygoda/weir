@@ -142,3 +142,9 @@
   - wire-socket-and-client-r3-03 (`PayloadTooLarge` reports a count as bytes) stays an owner item: a public error type.
 - Fix round 5: 14 items, ids renamed `minor-*` where reviewers' ids collided across runs; each carries the owner's answer.
 - The PR is back to `stabilising` until the second sweep and a new full gate.
+
+## 2026-11-08 ~20:30: fix round 5
+
+- wf_ff7e12fb-c62: 13 fixed, no regressions, none reverted, no flaky reruns. dedup-coordinate-key (6679c8f), minor-dst-seed (49c5619), minor-admin-socket-lexical (ade96c5), minor-bench-mount-opts (ea95ffd), minor-chaos-setup-label (df9c0eb), minor-demo-empty-nack (cfa1d91), minor-docs-dispatch (7c1dd2d), minor-feature-gated-flags (bbcbf61), minor-nack-counters (31c0489), minor-sink-type-s3 (4b72b22), minor-smoke-record-count (ac61c29), minor-startup-scan-reject (2ad211a), minor-ts-demo-health (4b99f49). Shas verified.
+- sigterm-system-flake: blocked, not reproduced in 150 isolated runs (jq-01M6Y7HWW24SZ0V32S3009NYYC). The agent's reading: the test sends SIGTERM before the daemon accepts the idle connection, and closing a Unix listener resets a not-yet-accepted connection (ECONNRESET), while decision Q5 promises EOF only for *accepted* idle connections. **Head decision:** don't loosen the assertion; remove the race instead (one round-trip on the idle connection before SIGTERM, so it is accepted, then keep asserting EOF). Goes into the next fix round as `sigterm-test-accept-race`.
+- Second sweep launched over the branch's changes (`git diff main...epic/cleanup-2026-11`, 67 files), in two batches of three lenses (` r4`).
