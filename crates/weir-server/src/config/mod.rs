@@ -780,6 +780,18 @@ pub(crate) fn admin_path_problem(
     None
 }
 
+/// Whether `p`, with its parent directory resolved through symlinks, is under
+/// the canonical `wab_dir`. A parent that does not exist (yet) cannot be
+/// resolved and is left to the lexical rule in [`admin_path_problem`].
+fn admin_path_resolves_under(p: &Path, wab_dir: &Path) -> bool {
+    let (Some(parent), Some(name)) = (p.parent(), p.file_name()) else {
+        return false;
+    };
+    std::fs::canonicalize(parent)
+        .map(|parent| parent.join(name).starts_with(wab_dir))
+        .unwrap_or(false)
+}
+
 impl Config {
     /// Loads config from all three layers (CLI > env > file > defaults) and
     /// validates.
@@ -884,6 +896,14 @@ impl Config {
                 return Err(ConfigError::InvalidValue {
                     field: "admin_socket_path",
                     reason: problem.message(p),
+                });
+            }
+            // `wab_dir` is canonical, so a path spelled through a symlink to
+            // it passes the lexical rule: resolve the parent and check again.
+            if admin_path_resolves_under(p, &wab_dir) {
+                return Err(ConfigError::InvalidValue {
+                    field: "admin_socket_path",
+                    reason: AdminPathProblem::UnderWabDir.message(p),
                 });
             }
         }
@@ -3309,6 +3329,49 @@ mod tests {
             assert!(err.contains(needle), "{}: {err}", p.display());
         }
         fs::remove_dir_all(dir).ok();
+    }
+
+    /// An admin path spelled through a symlinked `wab_dir` still lands in the
+    /// WAB: the under-wab_dir rule resolves the path's parent before comparing
+    /// it with the canonical `wab_dir`.
+    #[cfg(unix)]
+    #[test]
+    fn an_admin_path_through_a_symlinked_wab_dir_is_rejected() {
+        let base = tmp_dir("adm_sym");
+        let real = base.join("real");
+        fs::create_dir_all(real.join("wab")).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        for wab_dir in [link.join("wab"), real.join("wab")] {
+            let err = Config::from_layers(
+                PartialConfig {
+                    admin_socket_path: Some(link.join("wab").join("admin.sock")),
+                    ..PartialConfig::empty()
+                },
+                PartialConfig::empty(),
+                PartialConfig {
+                    wab_dir: Some(wab_dir.clone()),
+                    ..PartialConfig::empty()
+                },
+            )
+            .expect_err(&format!("wab_dir {}: must be rejected", wab_dir.display()))
+            .to_string();
+            assert!(err.contains("inside wab_dir"), "{err}");
+        }
+        // A sibling of the WAB through the same symlink is still accepted.
+        Config::from_layers(
+            PartialConfig {
+                admin_socket_path: Some(link.join("wab.admin.sock")),
+                ..PartialConfig::empty()
+            },
+            PartialConfig::empty(),
+            PartialConfig {
+                wab_dir: Some(link.join("wab")),
+                ..PartialConfig::empty()
+            },
+        )
+        .expect("a sibling of wab_dir is outside the WAB");
+        fs::remove_dir_all(base).ok();
     }
 
     /// A derived default that breaks a static rule disables admin; it never

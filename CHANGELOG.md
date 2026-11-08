@@ -37,6 +37,10 @@ protocol** below.
   at the upgrade is re-sent once under the new key, so ClickHouse and an
   idempotent HTTP endpoint may see it twice, once. HTTP per-record mode is
   unchanged.
+- An explicit `admin_socket_path` reached through a symlink to `wab_dir`
+  (`/data/wab/admin.sock` when `/data` links to `/mnt/x`) is now refused at
+  startup as inside `wab_dir`. The check compared the path as written with
+  the canonical `wab_dir`, so the admin socket could be bound inside the WAB.
 
 ### Fixed
 
