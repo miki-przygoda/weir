@@ -195,7 +195,7 @@ sink_max_batch_size = 100
 # re-POST records that may have already been accepted.
 #
 # The key is NOT a hash of the payload alone. In per_record mode it is the
-# record's RecordId — sha256(segment name, index, payload) — so two distinct
+# record's RecordId — sha256(segment instance, index, payload) — so two distinct
 # records carrying identical bytes get distinct keys. Hashing only the payload
 # is what weir did before 2.0.3, and it made a correct endpoint drop every
 # repeat of a fixed-shape event. In ndjson mode the key is the batch's

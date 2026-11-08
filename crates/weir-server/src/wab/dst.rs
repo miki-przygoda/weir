@@ -678,6 +678,10 @@ impl SegmentHandle for SimSegmentHandle {
         ledger.mark_durable(pending.into_inner());
         Ok(sealed)
     }
+
+    fn created_at(&self) -> i64 {
+        self.inner.created_at()
+    }
 }
 
 // ── Scenarios + spec ────────────────────────────────────────────────────────

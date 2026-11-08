@@ -25,8 +25,9 @@ the SHA-256, in lowercase hex, of the ASCII string
   hex digits.
 - `first_record_id_hex` is the batch's first
   [`RecordId`](https://docs.rs/weir-sink-sdk/latest/weir_sink_sdk/struct.RecordId.html)
-  as 64 lowercase hex digits. A `RecordId` mixes in the segment's file name and
-  the record's index within the segment.
+  as 64 lowercase hex digits. A `RecordId` mixes in the segment's shard
+  directory and file name, the same `created_at`, and the record's index
+  within the segment.
 - `count` is the number of records in the batch, in decimal, with no padding.
 
 That string is exactly the [S3 sink's](s3.md#what-an-object-looks-like) object name for the

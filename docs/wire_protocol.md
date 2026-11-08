@@ -204,8 +204,12 @@ one coordinate — a trailing byte means the two ends disagree about the layout,
 and quietly using the prefix is how that disagreement becomes a wrong address.
 
 `record_id` is `SHA-256` over
-`segment_len ++ segment ++ index ++ payload_len ++ payload`, every length a
-little-endian `u64`. It is byte-identical to the per-record idempotency key the
+`identity_len ++ identity ++ index ++ payload_len ++ payload`, every length a
+little-endian `u64`, where `identity` is `segment`, then `@`, then the segment
+header's creation time in unix nanoseconds as 16 lowercase hex digits (e.g.
+`shard_00/seg_00000001.wab.sealed@18d2c17997b60400`). The creation time is not
+in the coordinate; it is what tells a segment apart from a later one that
+reuses its file name. It is byte-identical to the per-record idempotency key the
 daemon's drain hands a sink (the HTTP sink's `Idempotency-Key: sha256:<hex>`),
 which is what lets a producer correlate what it sent with what the downstream
 received. The length framing is what stops `("ab", 1)` and `("a", 0xb…)` from

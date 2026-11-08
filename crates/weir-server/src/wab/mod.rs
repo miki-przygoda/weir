@@ -1275,6 +1275,7 @@ fn flush_batch<C: BlockingClock>(
                     Box::new(RecordSlot {
                         segment,
                         index: writer.last_record_index(),
+                        created_at: writer.last_segment_created_at(),
                     })
                 })
             } else {

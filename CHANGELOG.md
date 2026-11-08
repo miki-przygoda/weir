@@ -41,6 +41,20 @@ protocol** below.
   (`/data/wab/admin.sock` when `/data` links to `/mnt/x`) is now refused at
   startup as inside `wab_dir`. The check compared the path as written with
   the canonical `wab_dir`, so the admin socket could be bound inside the WAB.
+- Every `RecordId` now names the segment instance, `shard_NN/<file>@<the
+  segment header's created_at as 16 hex digits>`, not just its file name.
+  Segment names restart at `seg_00000001` once a shard drains empty and the
+  daemon restarts, or a pod is redeployed without its volume, so a
+  byte-identical record such as a heartbeat got the id of one already
+  delivered: a Postgres/MySQL `id_column` table dropped it, an idempotent
+  HTTP endpoint replayed its cached 2xx in per-record mode, and weir deleted
+  an acked record with no error. Every `RecordId` value changes once at the
+  upgrade, so per-record HTTP `Idempotency-Key`s, `id_column` values, S3
+  object names and the ClickHouse/NDJSON batch keys (which include the first
+  `RecordId`) differ for records delivered after it. A record in flight at
+  the upgrade is re-sent once under its new id, so an `id_column` table may
+  hold it twice, once. A tracked push's coordinate keeps its `segment`
+  string; its `record_id` follows the new form.
 
 ### Fixed
 

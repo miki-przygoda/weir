@@ -450,9 +450,13 @@ impl std::fmt::Debug for DedupToken {
 ///
 /// `RecordId` mixes the record's WAB coordinate — the segment it was read from
 /// and its index within that segment — into the digest, so identical bytes at
-/// different coordinates are different ids. The coordinate is stable across a
-/// re-read of the same segment, so a retried delivery still presents the same
-/// id and per-record retry dedup keeps working.
+/// different coordinates are different ids. The daemon names the segment
+/// *instance*: its shard directory and file name plus the creation time in its
+/// header, so a later segment that reuses a file name (segment counters restart
+/// once a shard drains empty and the daemon restarts) does not reuse its ids.
+/// The coordinate is stable across a re-read of the same segment, so a retried
+/// delivery still presents the same id and per-record retry dedup keeps
+/// working.
 ///
 /// # It survives a changed `sink_max_batch_size`
 ///
@@ -486,9 +490,14 @@ pub struct RecordId([u8; 32]);
 impl RecordId {
     /// Derives the id from a record's WAB coordinate and bytes.
     ///
-    /// `segment` is the segment's file name and `index` the record's ordinal
-    /// within it — together the record's address in the buffer, which is what
-    /// makes this unique where a content hash is not.
+    /// `segment` names the segment and `index` is the record's ordinal within
+    /// it — together the record's address in the buffer, which is what makes
+    /// this unique where a content hash is not. The daemon passes
+    /// `<shard-dir>/<file-name>@<created_at>`, e.g.
+    /// `shard_00/seg_00000001.wab.sealed@18d2c17997b60400`, with `created_at`
+    /// the segment header's creation time in unix nanoseconds as 16 lowercase
+    /// hex digits; any string that is stable for one segment and unique across
+    /// segments works.
     pub fn for_record(segment: &str, index: u64, payload: &Payload) -> Self {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();

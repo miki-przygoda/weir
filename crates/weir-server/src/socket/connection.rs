@@ -26,6 +26,7 @@ use crate::{
     },
     models::{AckOutcome, WorkUnit},
     queue::QueueSender,
+    wab::segment::identity_at,
 };
 
 /// How long `handle_connection` waits for the queue to accept a work unit before
@@ -661,7 +662,14 @@ where
             let coordinate = outcome
                 .coordinate
                 .map(|slot| {
-                    let record_id = RecordId::for_record(&slot.segment, slot.index, &payload);
+                    // The id names the segment INSTANCE (address plus header
+                    // `created_at`), exactly as the drain derives it; the
+                    // coordinate carries the address alone.
+                    let record_id = RecordId::for_record(
+                        &identity_at(&slot.segment, slot.created_at),
+                        slot.index,
+                        &payload,
+                    );
                     RecordCoordinate::new(slot.segment, slot.index, *record_id.as_bytes())
                 })
                 .transpose();
@@ -1188,6 +1196,10 @@ mod tests {
         client
     }
 
+    /// The header `created_at` every slot from [`spawn_handler_with_slot`]
+    /// reports: `0x18d2c17997b60400`.
+    const SLOT_CREATED_AT: i64 = 1_788_704_730_000_000_000;
+
     /// Spawns a handler whose flusher acks durable and reports `slot` as the
     /// record's address — the shape of a real `PushTracked` round trip without
     /// standing up a WAB.
@@ -1206,6 +1218,7 @@ mod tests {
                     Box::new(crate::models::RecordSlot {
                         segment: segment.to_string(),
                         index,
+                        created_at: SLOT_CREATED_AT,
                     })
                 });
                 let _ = unit.ack_tx.send(AckOutcome::durable(coordinate));
@@ -1245,12 +1258,13 @@ mod tests {
         assert_eq!(
             coordinate.record_id(),
             RecordId::for_record(
-                "shard_00/seg_00000001.wab.sealed",
+                "shard_00/seg_00000001.wab.sealed@18d2c17997b60400",
                 7,
                 &weir_core::Payload::copy_from_slice(payload),
             )
             .as_bytes(),
-            "the coordinate's record_id must be the id the drain would derive"
+            "the coordinate's record_id must be the id the drain would derive: \
+             the segment address plus the header's created_at"
         );
     }
 

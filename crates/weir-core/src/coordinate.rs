@@ -54,9 +54,13 @@ pub const MAX_TRACKED_ACK_PAYLOAD_LEN: usize = COORDINATE_FIXED_LEN + MAX_SEGMEN
 ///   not a filesystem path: it names the segment the drain will read the record
 ///   from, which is a **predicted** name at ack time (the segment is still open).
 /// - `index` — the record's **1-based** ordinal within that segment.
-/// - `record_id` — `sha256(segment ++ index ++ payload)` with length framing.
-///   Byte-identical to the `Idempotency-Key` the HTTP sink sends for this
-///   record, and to the id the S3 sink names objects with.
+/// - `record_id` — `sha256(identity ++ index ++ payload)` with length framing,
+///   where `identity` is `segment` plus `@` and the segment header's creation
+///   time as 16 lowercase hex digits (`shard_00/seg_00000001.wab.sealed@18d2…`).
+///   The creation time is not carried here: it is what tells this segment
+///   apart from a later one that reuses its name. Byte-identical to the
+///   `Idempotency-Key` the HTTP sink sends for this record, and to the id the
+///   S3 sink names objects with.
 ///
 /// # What it is not
 ///

@@ -208,12 +208,14 @@ impl PartitionTemplate {
 /// repetitive records.
 /// # Why `created_at` is in the *name* and not only the partition
 ///
-/// A `RecordId` is `sha256(segment_name ++ index ++ payload)`, and segment names
-/// restart at `seg_00000001` in every fresh WAB directory. So two daemon runs on
-/// **different WAB directories** — a pod redeployed without a PVC, a wiped WAB,
-/// a fresh container — produce identical `RecordId`s for their first batches. If
-/// both write to the same bucket and prefix within one partition hour, the
-/// second silently overwrites the first.
+/// Segment names restart at `seg_00000001` in every fresh WAB directory. Until
+/// the daemon mixed the segment header's `created_at` into each `RecordId` as
+/// well, two daemon runs on **different WAB directories** — a pod redeployed
+/// without a PVC, a wiped WAB, a fresh container — produced identical
+/// `RecordId`s for their first batches, and if both wrote to the same bucket
+/// and prefix within one partition hour, the second silently overwrote the
+/// first. The name still carries `created_at` on its own, so it does not
+/// depend on how the caller derived the `RecordId`.
 ///
 /// The segment header's `created_at` distinguishes segment *instances* where the
 /// name cannot, and it is read from disk, so it stays invariant under replay.

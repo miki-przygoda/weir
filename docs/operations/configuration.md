@@ -1567,7 +1567,8 @@ drain to retry the whole segment. The endpoint needs to dedupe to
 avoid double-writes. In per-record mode (`sink_http_batch = "none"`,
 the default) the key is the record's `RecordId`
 (`weir_sink_sdk::RecordId`), derived from the record's WAB coordinate
-(segment file name + index within it) *and* its payload — a retried
+(the segment instance — shard directory, file name and the creation time in
+its header — plus the index within it) *and* its payload — a retried
 record always presents the same key, but two distinct records never
 collide just because their payload bytes match. In `ndjson` mode the
 key is the batch key — a sha256 of the batch's WAB coordinate (segment
@@ -1887,29 +1888,18 @@ requeue` re-pushes records into a *new* segment, so they arrive as new ids and
 are inserted again. Both requeue commands say so before asking for
 confirmation.
 
-> **Feed each table from one weir instance with a persistent `wab_dir`.** A
-> `RecordId` is unique only within one `wab_dir`'s history. The segment part of
-> it is the file's path relative to `wab_dir` (`shard_03/seg_00000042.wab.sealed`),
-> and every `wab_dir` numbers its segments from 1 in each shard. Nothing in the
-> id says *which* `wab_dir`. So two weir instances writing to the same table,
-> or one instance whose `wab_dir` was wiped, recreated or restored from an older
-> backup (or had its `.confirmed` tombstones deleted), will reuse coordinates
-> another record already had. A record whose bytes match the earlier record at
-> the same coordinate then gets an **identical** `RecordId`, although it is a
-> different record. That is exactly the fixed-shape case the id exists for: a
-> heartbeat, a "one unit consumed" event. `ignore` (the default) and `plain`
-> with this column both treat a present id as *already delivered*, so the
-> second record is **silently dropped**: acked by weir, delivered, and never
-> stored, with no dead-letter and no error.
->
-> Run one weir instance per table, on a `wab_dir` that survives restarts and
-> redeploys (a persistent volume, not an `emptyDir` or a container's writable
-> layer). If several instances must feed one destination, give each its own
-> table and combine them downstream (a view or a `UNION ALL`); weir writes
-> only the payload and id columns, so it cannot tell one table which instance
-> a row came from. A future major release may mix a per-`wab_dir` instance
-> nonce into the id; the issue is parked in the repository's
-> `docs/explorations/parked-future-directions.md`.
+> **The segment part names the segment instance, not only its file.** It is
+> the file's path relative to `wab_dir` plus `@` and the creation time in the
+> segment's header, in unix nanoseconds as 16 hex digits
+> (`shard_03/seg_00000042.wab.sealed@18d2c17997b60400`). Segment numbers
+> restart from 1 in each shard of a fresh `wab_dir`, after a restart on one
+> that has drained empty, and on a pod redeployed without its volume. The
+> creation time keeps a reused file name from reusing the ids of records
+> already delivered, so a heartbeat or a "one unit consumed" event at the same
+> index of a reused name gets a new id and is stored, where `ignore` (the default) and
+> `plain` would otherwise treat it as *already delivered* and drop it. A replay
+> of the same segment reads the same header, so its records keep their ids and
+> the replay still deduplicates.
 
 Rejected at startup: an id column equal to `sink_mysql_column` (the generated
 statement would name one column twice, which MySQL rejects permanently — the
@@ -1934,9 +1924,9 @@ How to phrase the INSERT statement.
   `UNIQUE` constraint on [`sink_mysql_id_column`](#sink_mysql_id_column) so
   crash-recovery retries are idempotent without consumer-side dedup. A `UNIQUE`
   on the payload instead discards distinct records that share bytes. The id
-  is unique only within one `wab_dir`: feed the table from a single weir
-  instance with a persistent `wab_dir`, or a second instance's records can be
-  dropped as duplicates (see [`sink_mysql_id_column`](#sink_mysql_id_column)).
+  names the segment instance a record was read from, so a segment name reused
+  after a restart does not reuse its ids (see
+  [`sink_mysql_id_column`](#sink_mysql_id_column)).
 - `"plain"` → `INSERT INTO ...`. Duplicates surface as `ER_DUP_ENTRY`
   (code 1062) and are resolved row by row rather than retried; see
   [Plain insert mode and duplicate keys](#plain-insert-mode-and-duplicate-keys-mysql-and-postgres).
@@ -2073,29 +2063,18 @@ requeue` re-pushes records into a *new* segment, so they arrive as new ids and
 are inserted again. Both requeue commands say so before asking for
 confirmation.
 
-> **Feed each table from one weir instance with a persistent `wab_dir`.** A
-> `RecordId` is unique only within one `wab_dir`'s history. The segment part of
-> it is the file's path relative to `wab_dir` (`shard_03/seg_00000042.wab.sealed`),
-> and every `wab_dir` numbers its segments from 1 in each shard. Nothing in the
-> id says *which* `wab_dir`. So two weir instances writing to the same table,
-> or one instance whose `wab_dir` was wiped, recreated or restored from an older
-> backup (or had its `.confirmed` tombstones deleted), will reuse coordinates
-> another record already had. A record whose bytes match the earlier record at
-> the same coordinate then gets an **identical** `RecordId`, although it is a
-> different record. That is exactly the fixed-shape case the id exists for: a
-> heartbeat, a "one unit consumed" event. `on_conflict_do_nothing` (the default) and `plain`
-> with this column both treat a present id as *already delivered*, so the
-> second record is **silently dropped**: acked by weir, delivered, and never
-> stored, with no dead-letter and no error.
->
-> Run one weir instance per table, on a `wab_dir` that survives restarts and
-> redeploys (a persistent volume, not an `emptyDir` or a container's writable
-> layer). If several instances must feed one destination, give each its own
-> table and combine them downstream (a view or a `UNION ALL`); weir writes
-> only the payload and id columns, so it cannot tell one table which instance
-> a row came from. A future major release may mix a per-`wab_dir` instance
-> nonce into the id; the issue is parked in the repository's
-> `docs/explorations/parked-future-directions.md`.
+> **The segment part names the segment instance, not only its file.** It is
+> the file's path relative to `wab_dir` plus `@` and the creation time in the
+> segment's header, in unix nanoseconds as 16 hex digits
+> (`shard_03/seg_00000042.wab.sealed@18d2c17997b60400`). Segment numbers
+> restart from 1 in each shard of a fresh `wab_dir`, after a restart on one
+> that has drained empty, and on a pod redeployed without its volume. The
+> creation time keeps a reused file name from reusing the ids of records
+> already delivered, so a heartbeat or a "one unit consumed" event at the same
+> index of a reused name gets a new id and is stored, where `on_conflict_do_nothing` (the default) and
+> `plain` would otherwise treat it as *already delivered* and drop it. A replay
+> of the same segment reads the same header, so its records keep their ids and
+> the replay still deduplicates.
 
 With this set each row takes **two** bind parameters instead of one. Postgres's
 wire protocol caps a statement at 65 535 parameters and `sink_max_batch_size` is
@@ -2126,10 +2105,10 @@ it unset every statement weir generates is byte-identical to previous releases.
 
 Plain mode without `sink_postgres_id_column` draws a startup WARN.
 
-Either mode with an id column assumes **one weir instance with a persistent
-`wab_dir` feeds the table**: a `RecordId` is unique only within one `wab_dir`,
-so a second instance, or a reset `wab_dir`, can produce the id of a record
-already stored, and both modes then drop the new record as a duplicate (see
+Either mode with an id column treats a present id as a record already stored.
+The id names the segment instance a record was read from, header creation time
+included, so a segment name reused after a restart or a reset `wab_dir` does
+not reuse the ids of records already stored (see
 [`sink_postgres_id_column`](#sink_postgres_id_column)).
 
 #### Error classification

@@ -1,5 +1,5 @@
 //! A sealed or active segment's identity, `shard_NN/seg_NNNNNNNN`, as the
-//! drain's `segment_identity` names it (weir-server `wab/segment.rs`) minus the
+//! drain's `segment_address` names it (weir-server `wab/segment.rs`) minus the
 //! extension. A structured type, so a public document can carry a segment
 //! without carrying a free-form path.
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
