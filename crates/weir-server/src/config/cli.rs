@@ -386,9 +386,11 @@ pub(super) fn parse_from(
 const FEATURE_GATED_FLAGS: &[(&str, &str)] = &[
     ("--sink-mysql-table", "mysql-sink"),
     ("--sink-mysql-column", "mysql-sink"),
+    ("--sink-mysql-id-column", "mysql-sink"),
     ("--sink-mysql-insert-mode", "mysql-sink"),
     ("--sink-postgres-table", "postgres-sink"),
     ("--sink-postgres-column", "postgres-sink"),
+    ("--sink-postgres-id-column", "postgres-sink"),
     ("--sink-postgres-insert-mode", "postgres-sink"),
     ("--sink-clickhouse-database", "clickhouse-sink"),
     ("--sink-clickhouse-table", "clickhouse-sink"),
@@ -523,6 +525,40 @@ mod tests {
         assert!(msg.contains("clickhouse-sink"), "{msg}");
         assert!(msg.contains("--sink-clickhouse-table"), "{msg}");
         assert!(!msg.contains("unknown arguments"), "{msg}");
+    }
+
+    /// `--sink-mysql-id-column` is gated on mysql-sink like the other MySQL
+    /// flags, so on a build without it the error must name the feature too.
+    #[cfg(not(feature = "mysql-sink"))]
+    #[test]
+    fn mysql_id_column_without_its_feature_names_the_feature() {
+        let err = parse_from(args(&["--sink-mysql-id-column", "id"]))
+            .map(|_| ())
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("mysql-sink"), "{msg}");
+        assert!(msg.contains("--sink-mysql-id-column"), "{msg}");
+        assert!(!msg.contains("unknown arguments"), "{msg}");
+    }
+
+    /// Drift guard, on every build: each MySQL/Postgres/ClickHouse flag that
+    /// --help lists is in FEATURE_GATED_FLAGS, so a new gated flag cannot
+    /// fall back to the generic "unknown arguments" error.
+    #[test]
+    fn every_gated_flag_in_help_is_in_the_table() {
+        for prefix in ["--sink-mysql-", "--sink-postgres-", "--sink-clickhouse-"] {
+            for line in HELP.lines() {
+                let Some(flag) = line.split_whitespace().next() else {
+                    continue;
+                };
+                if flag.starts_with(prefix) {
+                    assert!(
+                        FEATURE_GATED_FLAGS.iter().any(|(f, _)| *f == flag),
+                        "{flag} is listed in --help but missing from FEATURE_GATED_FLAGS"
+                    );
+                }
+            }
+        }
     }
 
     /// A truly unknown flag still produces the generic error.

@@ -44,6 +44,11 @@ protocol** below.
 
 ### Fixed
 
+- `--sink-mysql-id-column` and `--sink-postgres-id-column` on a build
+  without the matching sink feature are now rejected with a message naming
+  the feature to rebuild with, as `--help` says. They got the generic
+  "unknown arguments" error, because the feature-gated flag table did not
+  list them.
 - A manual run of the "Publish docs" workflow on `main` now deploys the
   site, as its `workflow_dispatch` comment says. The Pages upload step and
   the deploy job ran only on a push, so a manual run built the book and
