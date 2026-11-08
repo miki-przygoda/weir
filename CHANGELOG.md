@@ -146,6 +146,9 @@ protocol** below.
   directory the weir user cannot read, such as a root-owned `lost+found` when
   `wab_dir` is a mount root, no longer makes every `seal` exit 1 with no shard
   chained, nor every `verify` exit 2 with `weir_attest_verify_failures` above 0.
+  `weir-ctl segments` (with or without `--files`) and the offline
+  `weir-ctl status` scan use the same rule, so such a directory no longer
+  shows as a phantom empty shard row.
 - The MySQL sink now strands, rather than dead-letters, a batch that fails
   with server error `1040` (`ER_CON_COUNT_ERROR`, too many connections),
   `1203` (`ER_TOO_MANY_USER_CONNECTIONS`) or `1053` (`ER_SERVER_SHUTDOWN`), as
