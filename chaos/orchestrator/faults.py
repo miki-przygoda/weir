@@ -129,6 +129,29 @@ def oracle_fault(kind, cut):
     return "power_loss" if cut == "power_loss" else "kill_random"
 
 
+def describe(sched):
+    """One line naming the fault class a schedule runs, for run-soak.sh's
+    banner and SETUP.md: the same cut_mode and oracle_fault the episodes use,
+    so a run's provenance cannot claim a different fault from its verdicts."""
+    kind = (sched.get("faults") or {}).get("kind", "kill_random")
+    cut = cut_mode(sched)
+    how = "dm-flakey power cut" if cut == "power_loss" else "random `kill -9`"
+    if kind in TRIGGER_KINDS:
+        how = f"lifecycle trigger `{kind}`, then a {how.replace('random ', '')}"
+    return f"{how}, judged as fault={oracle_fault(kind, cut)}"
+
+
+def setup_paragraph(sched):
+    """SETUP.md's "What this run is" body, derived from the schedule."""
+    head = f"**{describe(sched)}.**"
+    if cut_mode(sched) == "power_loss":
+        return (f"{head} Every episode ends in a power cut through dm-flakey "
+                f"(`drop_writes`): every write after the cut is dropped, as "
+                f"on a real power loss.")
+    return (f"{head} No episode cuts power, so a green result here says "
+            f"nothing about power loss, torn writes, or the durability tiers.")
+
+
 #: XORed into the schedule seed so the plan has its OWN random stream:
 #: run.kill_delays draws from Random(seed), and sharing it would reshuffle
 #: every historical steady-state sequence the moment a trigger draws.

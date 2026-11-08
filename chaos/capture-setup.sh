@@ -27,6 +27,15 @@ import run
 print(run.run_id_from_seed($SEED))
 ")
 RUN_DIR="$CHAOS_DIR/runs/$RUN_ID"
+# What the run injects comes from the schedule through faults.describe, the
+# same cut_mode/oracle_fault the episodes use: a fixed kill-only label here once
+# filed every power-cut run as having cut no power.
+WHAT=$(python3 -c "
+import sys, tomllib; sys.path.insert(0, 'orchestrator')
+import faults
+print(faults.setup_paragraph(tomllib.load(open('$SCHEDULE', 'rb'))))
+")
+DM_TARGET=$(python3 -c "import tomllib; print(tomllib.load(open('$SCHEDULE','rb')).get('storage', {}).get('dm_target') or 'none')")
 
 # run.py creates the directory; wait for it rather than racing it.
 for _ in $(seq 1 120); do
@@ -54,11 +63,7 @@ OUT=$(mktemp)
   echo
   echo "## What this run is"
   echo
-  echo "**Phase 1 — random \`kill -9\` only.** It is NOT Phase 2: dm-flakey"
-  echo "injection is unimplemented (\`dm_stack.py\` builds loop -> ext4 -> mount"
-  echo "and nothing else, and the episode loop injects \`kill_random\`"
-  echo "unconditionally). A green result here says nothing about power loss,"
-  echo "torn writes, or the durability tiers."
+  echo "$WHAT"
   echo
   echo "## Code under test"
   echo
@@ -82,7 +87,7 @@ OUT=$(mktemp)
   echo "| cpu | $(lscpu | awk -F: '/Model name/{gsub(/^ +/,"",$2); print $2; exit}') |"
   echo "| cores visible / total | $(nproc) / $(lscpu | awk -F: '/^CPU\(s\)/{gsub(/ /,"",$2); print $2; exit}') |"
   echo "| memory | $(free -g | awk '/^Mem:/{print $2" GiB"}') |"
-  echo "| filesystem under test | ext4 on loop device (see storage below) |"
+  echo "| filesystem under test | ext4 on a loop device, dm layer: \`$DM_TARGET\` (see the schedule below) |"
   echo "| host free space | $(df -h "$CHAOS_DIR" | awk 'NR==2{print $4}') |"
   echo
   echo "**Boot cmdline** — this box is deliberately tuned for measurement, which"
@@ -97,8 +102,8 @@ OUT=$(mktemp)
   echo "sees 4 cores and warns that \`shard_count=4\` is over-provisioned."
   echo
   echo "**Device-mapper modules loaded:** $(lsmod | grep -cE '^dm_(flakey|delay)') of 2"
-  echo "(\`dm-flakey\`, \`dm-delay\` — unused by Phase 1, loaded so the box is ready"
-  echo "for Phase 2; not reboot-persistent)."
+  echo "(\`dm-flakey\`, \`dm-delay\` — a schedule with \`dm_target = \"flakey\"\`"
+  echo "needs dm-flakey; not reboot-persistent)."
   echo
   echo "## Stop mechanism"
   echo

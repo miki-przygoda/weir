@@ -44,6 +44,12 @@ protocol** below.
 
 ### Fixed
 
+- The chaos harness's `run-soak.sh` banner and the `SETUP.md` that
+  `capture-setup.sh` writes into each run directory now state the fault
+  the schedule runs, from the orchestrator's own `faults.describe`. Both
+  said "Phase 1, `kill -9` only, no dm-flakey" for every schedule, so a
+  `power_loss` or lifecycle-trigger run archived a record claiming it
+  had cut no power.
 - `deploy/run_bare_metal_bench.sh` now reports the mount options of the
   filesystem that holds the WAB test directory. It looked the device name up
   in `/proc/mounts` and took the first match, so on a tmpfs `/tmp` the header
