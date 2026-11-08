@@ -44,6 +44,9 @@ protocol** below.
 
 ### Fixed
 
+- `deploy/smoke-test.sh` now says it pushes and acks 20 records across
+  both durability tiers. It said 30 across three, though `push_simple`
+  pushes only `Durable` and `Buffered` since the `Batched` tier was retired.
 - An unknown `sink_type` (a typo such as `s4`) is now rejected with a
   message that lists `s3` among the valid sink types. The list named
   only `noop`, `http`, `mysql`, `postgres` and `clickhouse`, though

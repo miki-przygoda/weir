@@ -2,7 +2,7 @@
 # deploy/smoke-test.sh — end-to-end smoke test for weir-server.
 #
 # Builds the binary, starts the daemon with a temp config, exercises the full
-# pipeline (push across all three durability tiers, health check, metrics),
+# pipeline (push across both durability tiers, health check, metrics),
 # then shuts down cleanly and verifies WAB segments were written to disk.
 #
 # Exit code: 0 = all checks passed, non-zero = something failed.
@@ -106,12 +106,12 @@ cargo run -q -p weir-client --example health_check -- \
 info "Health check: OK"
 
 # ── Push records across all durability tiers ──────────────────────────────────
-info "Pushing 10 records per durability tier (30 total)..."
+info "Pushing 10 records per durability tier (20 total)..."
 cargo run -q -p weir-client --example push_simple -- \
     --socket "$SOCKET_PATH" \
     --count 10 \
     || fail "push_simple example failed"
-info "All 30 records acked."
+info "All 20 records acked."
 
 # ── Metrics endpoint ──────────────────────────────────────────────────────────
 info "Checking metrics endpoint (http://127.0.0.1:$METRICS_PORT/metrics)..."
