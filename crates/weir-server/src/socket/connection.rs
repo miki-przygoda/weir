@@ -426,14 +426,25 @@ where
                     if refusal == AdmissionRefusal::WabCap {
                         metrics.wab_cap_rejections.inc();
                     }
+                    // The nack counters are per RECORD (see the `inc_by`
+                    // below), so a refused batch counts every record it
+                    // carried. The count comes from the bounded decoder, never
+                    // the peer-declared header field alone; a body that does
+                    // not decode still counts as one refused push.
+                    let refused = weir_core::decode_batch_body(
+                        payload.as_ref(),
+                        config.max_batch_records,
+                        config.max_payload_bytes,
+                    )
+                    .map_or(1, |records| records.len() as u64);
                     metrics
                         .records_nack
                         .get_or_create(&NackLabel {
                             tier: tv,
                             reason: MetricNack::internal_error,
                         })
-                        .inc();
-                    count_internal_nack(&metrics, refusal.cause(), 1);
+                        .inc_by(refused);
+                    count_internal_nack(&metrics, refusal.cause(), refused);
                     continue;
                 }
 
@@ -1860,7 +1871,9 @@ mod tests {
                 })
                 .get()
         };
-        assert_eq!(nacked(TierValue::durable), 3);
+        // Per record: the durable and tracked pushes, plus both records of
+        // the refused batch.
+        assert_eq!(nacked(TierValue::durable), 4);
         assert_eq!(nacked(TierValue::buffered), 1);
         assert_eq!(
             metrics
@@ -2446,6 +2459,47 @@ mod tests {
         c.write_all(&push_tracked_frame(b"x")).await.unwrap();
         assert_eq!(read_response(&mut c).await.0, MessageType::Nack);
         assert_eq!(internal(&m, NackInternalCause::coordinate), 1);
+    }
+
+    /// A batch refused whole at admission counts every record it carried,
+    /// not one per frame: `weir_records_nack_total` and
+    /// `weir_records_nack_internal_total` are per-record counters, the same
+    /// unit the batch success path uses for `records_accepted`.
+    #[tokio::test]
+    async fn a_batch_refused_at_admission_counts_each_record() {
+        let cap = ConnectionConfig {
+            wab_max_bytes: 1_000,
+            wab_bytes_now: Arc::new(AtomicU64::new(5_000)),
+            wab_cap_rejecting: Arc::new(AtomicBool::new(false)),
+            ..test_cfg()
+        };
+        let lost = ConnectionConfig {
+            wab_ownership_lost: Arc::new(AtomicBool::new(true)),
+            ..test_cfg()
+        };
+        for (cfg, cause) in [
+            (cap, NackInternalCause::wab_cap),
+            (lost, NackInternalCause::ownership_lost),
+        ] {
+            let m = Arc::new(Metrics::new().0);
+            let mut c = spawn_handler_acking_with(cfg, Arc::clone(&m), Some(true)).await;
+            let frame = Envelope::new(
+                Header::new(MessageType::PushBatch, Durability::Durable, 0),
+                weir_core::encode_batch_body(&[b"b1", b"b2", b"b3"]),
+            )
+            .encode();
+            c.write_all(&frame).await.unwrap();
+            assert_eq!(read_response(&mut c).await.0, MessageType::Nack);
+            assert_eq!(internal(&m, cause), 3, "{cause:?}");
+            let nacked = m
+                .records_nack
+                .get_or_create(&NackLabel {
+                    tier: durability_to_tier(Durability::Durable),
+                    reason: MetricNack::internal_error,
+                })
+                .get();
+            assert_eq!(nacked, 3, "{cause:?}");
+        }
     }
 
     #[tokio::test]

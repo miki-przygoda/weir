@@ -44,6 +44,12 @@ protocol** below.
 
 ### Fixed
 
+- A `PushBatch` the daemon refuses whole at admission (the `wab_max_bytes`
+  cap rejecting, or the `wab_dir` lost to another instance) now adds its
+  record count to `weir_records_nack_total{reason="internal_error"}` and
+  `weir_records_nack_internal_total{cause}`. It added 1 per frame, while both
+  are per-record counters, so rate panels undercounted refused records by up
+  to the batch size.
 - `--sink-mysql-id-column` and `--sink-postgres-id-column` on a build
   without the matching sink feature are now rejected with a message naming
   the feature to rebuild with, as `--help` says. They got the generic
