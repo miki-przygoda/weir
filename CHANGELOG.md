@@ -140,6 +140,11 @@ protocol** below.
   a shorter prefix of the bytes on disk matches the record's CRC, the segment
   is now copied to `quarantine/` and counted, as the CRC-mismatch,
   oversized-length and zero-length branches already did.
+- The DST repro line, `WEIR_DST_SEED=0x… cargo test -p weir-server
+  --features dst dst::`, now replays the failing seed: the random-seed sweep
+  reads `WEIR_DST_SEED` and runs only that seed. Nothing read the variable,
+  so the command reran the default 16-seed sweep and passed green while the
+  invariant violation was still there.
 
 ## [4.1.0] - 2026-10-26
 

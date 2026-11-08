@@ -16,7 +16,8 @@
 //! [`Fault`]/[`Scenario`]/[`SimSpec`] are `serde` enums, so a failing seed
 //! serialises straight into `tests/dst_seeds/*.json` as a pinned regression.
 //! Invariants are checked in-harness ([`assert_invariant`]); a violation panics
-//! with the invariant name, the seed, and a one-line `WEIR_DST_SEED=…` repro.
+//! with the invariant name, the seed, and a one-line `WEIR_DST_SEED=…` repro;
+//! `sweep_random_seeds` reads `WEIR_DST_SEED` and runs only that seed.
 //!
 //! The whole module compiles only under `cargo test` or `--features dst`
 //! ([`super`] gates it), so release binaries carry zero sim code. The
@@ -2491,19 +2492,54 @@ mod tests {
         );
     }
 
+    /// The seeds `sweep_random_seeds` runs. `WEIR_DST_SEED` (the value the
+    /// repro line prints, hex `0x…` or decimal) runs that one seed: every
+    /// sweep scenario's faults and record counts derive from the seed, so it
+    /// alone rebuilds the failing runs. Otherwise `WEIR_DST_SWEEP` seeds
+    /// (default 16) from a fixed `SplitMix64` stream. A malformed seed panics
+    /// rather than silently falling back to the green default sweep.
+    fn sweep_seeds(seed: Option<&str>, sweep: Option<&str>) -> Vec<u64> {
+        if let Some(raw) = seed {
+            let raw = raw.trim().replace('_', "");
+            let parsed = match raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+                Some(hex) => u64::from_str_radix(hex, 16),
+                None => raw.parse(),
+            };
+            let seed =
+                parsed.unwrap_or_else(|e| panic!("WEIR_DST_SEED={raw:?} is not a u64 seed: {e}"));
+            return vec![seed];
+        }
+        let n: u64 = sweep.and_then(|s| s.parse().ok()).unwrap_or(16);
+        let mut rng = SplitMix64::new(0xA11C_E5EE_D000);
+        (0..n).map(|_| rng.next_u64()).collect()
+    }
+
+    /// The repro line `assert_invariant` prints, `WEIR_DST_SEED=<seed>`, must
+    /// make the sweep run exactly that seed, so the printed command replays
+    /// the failure instead of rerunning the default sweep green.
+    #[test]
+    fn printed_repro_seed_replays_in_sweep() {
+        // A seed past the default 16, as the CI sweep of 300 can reach.
+        let mut rng = SplitMix64::new(0xA11C_E5EE_D000);
+        let seed = (0..200).map(|_| rng.next_u64()).last().unwrap();
+        let printed = format!("{seed:#018x}");
+        assert_eq!(sweep_seeds(Some(&printed), None), vec![seed]);
+        assert_eq!(sweep_seeds(Some(&printed), Some("300")), vec![seed]);
+        assert_eq!(sweep_seeds(Some(&seed.to_string()), None), vec![seed]);
+        assert_eq!(sweep_seeds(None, Some("3")).len(), 3);
+    }
+
     /// Random-seed sweep across the five fault scenarios. Every run checks its
     /// invariants in-harness, so any seed that breaks one fails here with a
     /// pin-able repro. The count is `WEIR_DST_SWEEP` (small by default so PR
     /// runs stay fast; the CI `dst` job cranks it up).
     #[test]
     fn sweep_random_seeds() {
-        let n: u64 = std::env::var("WEIR_DST_SWEEP")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(16);
-        let mut rng = SplitMix64::new(0xA11C_E5EE_D000);
-        for _ in 0..n {
-            let seed = rng.next_u64();
+        let seeds = sweep_seeds(
+            std::env::var("WEIR_DST_SEED").ok().as_deref(),
+            std::env::var("WEIR_DST_SWEEP").ok().as_deref(),
+        );
+        for seed in seeds {
             let records = 1 + (seed % 8) as usize;
             // Alternate the segment codec on a seed bit rather than running every
             // scenario twice: each scenario still meets compression across the
