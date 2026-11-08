@@ -26,6 +26,7 @@
 # Sinks
 
 - [S3 / object storage](sinks/s3.md)
+- [Batch keys (ClickHouse, HTTP NDJSON)](sinks/batch-keys.md)
 
 # Protocol
 

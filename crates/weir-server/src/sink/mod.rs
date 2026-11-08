@@ -14,8 +14,11 @@
 //! - [`postgres::PostgresSink`] — feature `postgres-sink`; Postgres counterpart,
 //!   `ON CONFLICT DO NOTHING` for idempotency.
 //! - [`clickhouse::ClickHouseSink`] — feature `clickhouse-sink`; HTTP
-//!   `INSERT … FORMAT RowBinary` with a sha256 `insert_deduplication_token`.
+//!   `INSERT … FORMAT RowBinary` with a sha256 `insert_deduplication_token`
+//!   derived from the batch's WAB coordinate (see `batch_key`).
 
+#[cfg(any(feature = "clickhouse-sink", feature = "http-sink"))]
+mod batch_key;
 #[cfg(feature = "clickhouse-sink")]
 pub mod clickhouse;
 #[cfg(feature = "http-sink")]

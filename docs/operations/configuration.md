@@ -1371,7 +1371,7 @@ without it" error rather than an unknown-value one:
 | `"http"` | POSTs each record to `sink_url`; up to `sink_http_concurrency` POSTs in flight per batch | endpoints that already accept POST bodies |
 | `"mysql"` | writes a whole batch with one multi-row `INSERT` | the IOPS-compression downstream: N records → 1 statement |
 | `"postgres"` | Postgres counterpart to `"mysql"`; multi-row INSERT with `ON CONFLICT DO NOTHING` | same IOPS-compression story when the downstream is Postgres |
-| `"clickhouse"` | one HTTP `INSERT … FORMAT RowBinary` per batch with a sha256 `insert_deduplication_token` (**requires the `clickhouse-sink` build feature**) | bulk inserts into ClickHouse with replay-safe dedup (see the ClickHouse sink section below) |
+| `"clickhouse"` | one HTTP `INSERT … FORMAT RowBinary` per batch with a sha256 `insert_deduplication_token` (the batch key) (**requires the `clickhouse-sink` build feature**) | bulk inserts into ClickHouse with replay-safe dedup (see the ClickHouse sink section below) |
 | `"s3"` | writes each batch as one object to S3-compatible storage — AWS S3, MinIO, Cloudflare R2, Backblaze B2, Ceph (**requires the `s3-sink` build feature**) | durable archive that Athena/DuckDB/Spark read directly. The object key is replay-stable, so the downstream needs **no** dedup support at all ([full guide](../sinks/s3.md)) |
 
 #### `sink_type`
@@ -1520,10 +1520,11 @@ deployments.
 > **double-counting** on replay. Pick a value and freeze it for the life of the
 > deployment. This applies to:
 >
-> - **ClickHouse** — `insert_deduplication_token`. ClickHouse deduplicates per
->   *block*, so there is no per-record alternative here.
+> - **ClickHouse** — `insert_deduplication_token`, the batch key. ClickHouse
+>   deduplicates per *block*, so there is no per-record alternative here.
 > - **HTTP in `ndjson` batch mode** — one POST carries the whole batch, so the
->   `Idempotency-Key` is the batch's `DedupToken`, not a per-record key.
+>   `Idempotency-Key` is the batch key (its first record and record count), not
+>   a per-record key. See [batch keys](../sinks/batch-keys.md).
 > - **S3** — one object per batch, so the object key names the batch. See
 >   [the S3 sink guide](../sinks/s3.md#why-that-precondition-is-specific-to-this-sink).
 > - **Postgres / MySQL with no `sink_*_id_column`** — the only thing written is
@@ -1569,8 +1570,11 @@ the default) the key is the record's `RecordId`
 (segment file name + index within it) *and* its payload — a retried
 record always presents the same key, but two distinct records never
 collide just because their payload bytes match. In `ndjson` mode the
-key is the batch's `DedupToken` — a pure hash of the batch's payload
-bytes (see [`sink_http_batch`](#sink_http_batch)).
+key is the batch key — a sha256 of the batch's WAB coordinate (segment
+`created_at`, first `RecordId`, record count), so two segments carrying
+byte-identical records get different keys (see
+[`sink_http_batch`](#sink_http_batch) and
+[batch keys](../sinks/batch-keys.md)).
 
 **Format**: `sha256:` prefix + 64-char lowercase hex digest. The
 prefix lets endpoints distinguish weir's scheme from other key sources
@@ -1678,8 +1682,20 @@ newlines, use per-record mode (`sink_http_batch = "none"`), where each record is
 its own POST body and newlines are fine.
 
 **Idempotency in NDJSON mode**: a single `Idempotency-Key: sha256:<hex>`
-is sent for the whole batch — the **batch dedup token**, the same
-primitive the ClickHouse sink passes as `insert_deduplication_token`.
+is sent for the whole batch — the **batch key**, the same value the
+ClickHouse sink passes as `insert_deduplication_token`: a sha256 of the
+segment's `created_at`, the batch's first `RecordId` and its record
+count. A replay of the same batch presents the same key, and two
+segments carrying byte-identical records (a heartbeat every 30 s)
+present different keys. The exact preimage is in
+[batch keys](../sinks/batch-keys.md).
+
+> **Changed after 4.1.0.** Through 4.1.0 this key was the batch's
+> `DedupToken`, a pure hash of the payload bytes, so two distinct
+> batches with identical bytes shared a key and the endpoint dropped the
+> second while weir deleted it. After upgrading, a batch that was in
+> flight at the upgrade is re-sent once under the new key, so the
+> endpoint may see it twice, once.
 
 > **Changed in 2.0.** This key was previously a hash of the joined NDJSON
 > request body. It is now derived from the length-delimited record
@@ -1688,7 +1704,7 @@ primitive the ClickHouse sink passes as `insert_deduplication_token`.
 > batch in flight across the upgrade can be delivered twice. Per-record
 > mode is unaffected — it still sends a per-record key.
 
-Because the key is content-derived, it inherits the same batch-stability
+Because the key names the batch, it inherits the same batch-stability
 caveat as ClickHouse's dedup token — see the note under
 [`sink_max_batch_size`](#sink_max_batch_size): changing
 `sink_max_batch_size` across a restart re-splits a replayed segment into
@@ -2269,13 +2285,22 @@ sent as HTTP basic auth, redacted in logs).
 
 The drain is at-least-once per segment, so a crash mid-commit replays the
 batch. ClickHouse has no `ON CONFLICT`; instead the sink sends a
-deterministic `insert_deduplication_token = sha256(batch)` on each insert,
-so a replayed byte-identical batch is deduplicated by ClickHouse **provided
+deterministic `insert_deduplication_token` on each insert: the batch key, a
+sha256 of the segment's `created_at`, the batch's first `RecordId` and its
+record count (exact preimage in [batch keys](../sinks/batch-keys.md)). A
+replayed batch is deduplicated by ClickHouse **provided
 the target table uses a dedup-capable engine** — a `Replicated*MergeTree`
 (where `insert_deduplicate` is on by default) or a `MergeTree` with
 `non_replicated_deduplication_window` set. Mind the dedup window (default
 last ~100 blocks). If the engine isn't dedup-capable, the token is harmless
 and dedup falls back to your table design.
+
+Two batches carrying byte-identical records from different segments (a
+heartbeat every 30 s) get different tokens, so ClickHouse inserts both.
+Through 4.1.0 the token was the batch's `DedupToken`, a pure hash of the
+bytes, and ClickHouse dropped the second as a duplicate block. After
+upgrading, a batch that was in flight at the upgrade is re-sent once under
+the new token, so it may be inserted twice, once.
 
 Reference schema:
 

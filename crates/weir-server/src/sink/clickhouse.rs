@@ -1,4 +1,4 @@
-//! ClickHouse sink — HTTP `INSERT … FORMAT RowBinary` with a content-derived
+//! ClickHouse sink — HTTP `INSERT … FORMAT RowBinary` with a coordinate-derived
 //! `insert_deduplication_token`. Reuses `sql_common` (identifier validation,
 //! password redaction, `SqlSinkError`). Structurally mirrors `postgres.rs`.
 //!
@@ -13,9 +13,11 @@
 //!
 //! The drain may re-call `commit()` with a byte-identical batch after a crash
 //! (at-least-once per segment). This sink derives an `insert_deduplication_token`
-//! from `sha256(batch)`, so a `Replicated*MergeTree` engine (or a `MergeTree`
-//! with `non_replicated_deduplication_window` set) deduplicates the re-inserted
-//! block. ClickHouse has no `ON CONFLICT`; dedup is the token + the engine's
+//! from the batch's WAB coordinate (segment `created_at`, first `RecordId`,
+//! record count; see `batch_key`), so a `Replicated*MergeTree` engine (or a
+//! `MergeTree` with `non_replicated_deduplication_window` set) deduplicates the
+//! re-inserted block, while two segments carrying byte-identical records get
+//! distinct tokens. ClickHouse has no `ON CONFLICT`; dedup is the token + the engine's
 //! choice — weir stays un-opinionated about the table model.
 //!
 //! # Target column type (F36)
@@ -279,16 +281,16 @@ impl Sink for ClickHouseSink {
     type Error = sql_common::SqlSinkError;
 
     async fn commit(&self, batch: SinkBatch) -> Result<CommitResult, sql_common::SqlSinkError> {
-        let (batch, dedup_token) = batch.into_parts();
+        // The batch's WAB coordinate, not a hash of its bytes: two segments
+        // that each hold the same heartbeat must not share a token, or
+        // ClickHouse drops the second block with a 200 (sinks-r3-01). A replay
+        // of the same batch presents the same token. See `batch_key`.
+        let token = super::batch_key::batch_key_hex(&batch);
+        let batch = batch.into_records();
         if batch.is_empty() {
             return Ok(CommitResult::new(Vec::new(), Vec::new()));
         }
         let body = encode_rowbinary(&batch);
-        // The drain derived this from exactly the records below. It is
-        // byte-identical to the digest weir 1.x computed here privately, so a
-        // deployment upgrading mid-outage keeps deduplicating — pinned by
-        // `dedup_token_is_unchanged_from_weir_1_x`.
-        let token = dedup_token.to_hex();
 
         let mut req = self
             .client
@@ -709,8 +711,8 @@ mod tests {
         assert_eq!(reqs.len(), 1, "expected exactly one POST");
         // The INSERT query and the dedup token must be on the wire.
         assert!(reqs[0].contains("query="), "no query param: {}", reqs[0]);
-        // Assert the VALUE, not just the presence: this task's whole claim is
-        // that the token on the wire is unchanged, so something must check it.
+        // Assert the VALUE, not just the presence. A batch built without
+        // segment context (`SinkBatch::from`) falls back to its DedupToken.
         let expected = weir_sink_sdk::DedupToken::for_payloads([p(b"a"), p(b"b")].iter()).to_hex();
         assert!(
             reqs[0].contains(&format!("insert_deduplication_token={expected}")),
@@ -719,23 +721,75 @@ mod tests {
         );
     }
 
-    /// The upgrade-safety claim: the token this sink sends at 2.0 is the same
-    /// string 1.x sent for the same batch. An operator who upgrades while a
-    /// segment is mid-retry must keep deduplicating.
-    ///
-    /// Deliberately a second, independent copy of the digest that
-    /// weir-sink-sdk's `dedup_token_matches_the_weir_1_x_digest` also pins.
-    /// Editing one without the other makes the pair disagree and the build go
-    /// red — which is the alarm you want on a compatibility constant.
+    /// Pins the token this sink sends for a drained batch: the shared
+    /// coordinate key, not the batch's DedupToken. Changing the derivation
+    /// changes what every ClickHouse table deduplicates on, so a batch in flight
+    /// at the upgrade is inserted twice: a CHANGELOG entry, not a quiet edit.
+    /// The preimage is `{created_at:016x}-{first_record_id_hex}-{count}`.
     #[test]
-    fn dedup_token_is_unchanged_from_weir_1_x() {
-        let batch = [p(b"alpha"), p(b"beta"), p(b"gamma")];
+    fn dedup_token_is_the_batch_coordinate_key() {
+        let records = vec![p(b"alpha"), p(b"beta"), p(b"gamma")];
+        let token = weir_sink_sdk::DedupToken::for_payloads(records.iter());
+        let ids = vec![weir_sink_sdk::RecordId::from_bytes([0x11; 32]); 3];
+        let batch = SinkBatch::with_segment_context(records, token, ids, 1_788_704_730_000_000_000);
+        let key = super::super::batch_key::batch_key_hex(&batch);
         assert_eq!(
-            weir_sink_sdk::DedupToken::for_payloads(batch.iter()).to_hex(),
-            "5bc1fe58cc34db881c67b2acd898651311f6dfc576285c906c8f97e049b15342",
-            "insert_deduplication_token changed — every ClickHouse deployment \
-             that deduplicates on it stops recognising replays across the upgrade"
+            key, "f9f2be833231eb8c64a5eeafe1c97eceffa5b02da9f473bd617aa5de6639397d",
+            "insert_deduplication_token derivation changed"
         );
+        assert_ne!(
+            key,
+            token.to_hex(),
+            "must not be the content-only DedupToken"
+        );
+    }
+
+    /// A one-record heartbeat batch as the drain builds it from `segment`,
+    /// whose header says it was created at `created_at`.
+    fn heartbeat_batch(segment: &str, created_at: i64) -> SinkBatch {
+        let records = vec![p(br#"{"status":"ok"}"#)];
+        let ids = vec![weir_sink_sdk::RecordId::for_record(segment, 0, &records[0])];
+        let token = weir_sink_sdk::DedupToken::for_payloads(records.iter());
+        SinkBatch::with_segment_context(records, token, ids, created_at)
+    }
+
+    /// The `insert_deduplication_token` value from a captured request line.
+    fn token_on_the_wire(req: &str) -> String {
+        let start = req
+            .find("insert_deduplication_token=")
+            .unwrap_or_else(|| panic!("no insert_deduplication_token: {req}"))
+            + "insert_deduplication_token=".len();
+        req[start..]
+            .chars()
+            .take_while(|c| c.is_ascii_hexdigit())
+            .collect()
+    }
+
+    /// sinks-r3-01: two distinct segments that each hold one byte-identical
+    /// heartbeat used to share a token (a pure hash of the bytes), so
+    /// ClickHouse dropped the second block with HTTP 200 and the drain deleted
+    /// acked records. The token must differ between segments and stay the
+    /// same on a replay of the same batch.
+    #[tokio::test]
+    async fn byte_identical_batches_from_different_segments_get_different_tokens() {
+        let (url, captured) = spawn_ch_mock("HTTP/1.1 200 OK", "", Duration::ZERO).await;
+        let sink = ClickHouseSink::new(cfg(&url, "weir_records", "payload")).unwrap();
+        let first = heartbeat_batch("seg-000001.wab", 1_788_704_730_000_000_000);
+        let second = heartbeat_batch("seg-000002.wab", 1_788_704_760_000_000_000);
+        sink.commit(first.clone()).await.unwrap();
+        sink.commit(second).await.unwrap();
+        sink.commit(first).await.unwrap(); // the drain replaying the first batch
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 3, "expected three POSTs");
+        let tokens: Vec<String> = reqs.iter().map(|r| token_on_the_wire(r)).collect();
+        assert_eq!(tokens[0].len(), 64, "token is 64 hex chars: {}", tokens[0]);
+        assert_ne!(
+            tokens[0], tokens[1],
+            "distinct segments with identical bytes must not share a token"
+        );
+        assert_eq!(tokens[0], tokens[2], "a replay must present the same token");
     }
 
     #[tokio::test]

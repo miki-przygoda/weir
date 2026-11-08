@@ -88,6 +88,10 @@ parts that need more than a table.
   Cloudflare R2, Backblaze B2, Ceph). The object key scheme and why it is shaped
   that way, minimum IAM policy, object sizing, failure handling, provider notes,
   and how to point Athena or DuckDB at the bucket.
+- [**sinks/batch-keys.md**](sinks/batch-keys.md) — the per-batch key the
+  ClickHouse sink sends as `insert_deduplication_token` and the HTTP sink's
+  NDJSON mode sends as `Idempotency-Key`: its exact preimage and why it names
+  the batch's place in the buffer rather than its bytes.
 
 ---
 

@@ -48,7 +48,9 @@
 //!   Tradeoff is N round-trips per batch (mitigated by `concurrency`).
 //! - **`Ndjson`**: the whole commit batch goes in ONE POST as
 //!   newline-delimited bodies (`application/x-ndjson`), with a single
-//!   per-batch `Idempotency-Key`. One round-trip per batch instead of N —
+//!   per-batch `Idempotency-Key` derived from the batch's WAB coordinate (see
+//!   `batch_key`), so two segments holding byte-identical records get
+//!   distinct keys. One round-trip per batch instead of N —
 //!   the framing log/trace ingesters (Loki, ES `_bulk`) expect. The
 //!   endpoint returns one status, so the result is all-or-nothing: a 2xx
 //!   commits the batch, a permanent 4xx dead-letters the whole batch, and
@@ -65,7 +67,7 @@ use tracing::{debug, warn};
 use weir_core::Payload;
 
 use super::{CommitResult, Sink, SinkBatch, SinkError, SinkHealth};
-use weir_sink_sdk::{DedupToken, RecordId};
+use weir_sink_sdk::RecordId;
 
 /// How the HTTP sink frames a commit batch into HTTP requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -101,7 +103,10 @@ pub struct HttpSinkConfig {
     /// Send `Idempotency-Key: sha256:<hex>` with each request so the endpoint
     /// can deduplicate retries that follow the drain's at-least-once contract.
     /// The value is the record's [`RecordId`] in per-record mode and the
-    /// batch's [`DedupToken`] in NDJSON mode.
+    /// batch key in NDJSON mode: a sha256 of the batch's WAB coordinate
+    /// (segment `created_at`, first `RecordId`, record count; see `batch_key`),
+    /// or its [`DedupToken`](weir_sink_sdk::DedupToken) for a batch built
+    /// without segment context.
     /// Default: true. Set false only if your endpoint can't tolerate the
     /// extra header (e.g. strict CORS, header allow-lists).
     pub send_idempotency_key: bool,
@@ -216,20 +221,20 @@ impl HttpSink {
     }
 
     /// Single POST of a whole batch as newline-delimited (NDJSON) bodies, with
-    /// one per-batch Idempotency-Key — the batch's dedup token. The endpoint
-    /// returns one status for the whole batch, so the result is all-or-nothing.
-    async fn post_batch(&self, body: Vec<u8>, token: &DedupToken) -> Result<(), HttpSinkError> {
+    /// one per-batch Idempotency-Key — the batch key (`sha256:<hex>`, see
+    /// `batch_key`). The endpoint returns one status for the whole batch, so
+    /// the result is all-or-nothing.
+    async fn post_batch(&self, body: Vec<u8>, key: &str) -> Result<(), HttpSinkError> {
         let mut req = self
             .base_request()
             .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson");
         if self.config.send_idempotency_key {
-            // The batch's dedup token, not a hash of this body. The two differ
-            // when the batch contained newline-bearing records: those are
-            // dead-lettered rather than framed, so the body is a subset. That is
-            // fine and slightly stronger — the token is stable for a given batch
-            // regardless of how the framing logic partitions it, so a replayed
-            // batch still presents the same key.
-            req = req.header("Idempotency-Key", token.to_prefixed_hex());
+            // The batch key, not a hash of this body. The body can be a subset
+            // of the batch when newline-bearing records were dead-lettered
+            // rather than framed; the key is stable for a given batch however
+            // the framing partitions it, so a replayed batch still presents
+            // the same key.
+            req = req.header("Idempotency-Key", key);
         }
         self.send_and_classify(req.body(body)).await
     }
@@ -467,8 +472,11 @@ impl Sink for HttpSink {
                 self.commit_per_record(records, record_ids).await
             }
             HttpBatchMode::Ndjson => {
-                let (records, token) = batch.into_parts();
-                self.commit_ndjson(records, &token).await
+                // The batch's WAB coordinate, not a hash of its bytes: two
+                // segments that each hold the same heartbeat must not share a
+                // key (sinks-r3-02). See `batch_key`.
+                let key = format!("sha256:{}", super::batch_key::batch_key_hex(&batch));
+                self.commit_ndjson(batch.into_records(), &key).await
             }
         }
     }
@@ -561,7 +569,7 @@ impl HttpSink {
     async fn commit_ndjson(
         &self,
         batch: Vec<Payload>,
-        token: &DedupToken,
+        key: &str,
     ) -> Result<CommitResult, HttpSinkError> {
         if batch.is_empty() {
             return Ok(CommitResult::new(vec![], vec![]));
@@ -600,7 +608,7 @@ impl HttpSink {
             body.push(b'\n');
         }
 
-        match self.post_batch(body, token).await {
+        match self.post_batch(body, key).await {
             Ok(()) => Ok(CommitResult::new(framable, dead_lettered)),
             Err(HttpSinkError::PermanentStatus {
                 status,
@@ -669,6 +677,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use weir_sink_sdk::DedupToken;
 
     /// Test helper: build a `Payload` from a static byte string literal.
     fn p(s: &'static [u8]) -> Payload {
@@ -1629,6 +1638,59 @@ mod tests {
             "still sending the 1.x body-derived key: {}",
             key_lines[0]
         );
+    }
+
+    /// A one-record heartbeat batch as the drain builds it from `segment`,
+    /// whose header says it was created at `created_at`.
+    fn heartbeat_batch(segment: &str, created_at: i64) -> SinkBatch {
+        let records = vec![p(br#"{"status":"ok"}"#)];
+        let ids = vec![RecordId::for_record(segment, 0, &records[0])];
+        let token = DedupToken::for_payloads(records.iter());
+        SinkBatch::with_segment_context(records, token, ids, created_at)
+    }
+
+    /// sinks-r3-02: in NDJSON mode two distinct segments that each hold one
+    /// byte-identical heartbeat used to send the same `Idempotency-Key` (a pure
+    /// hash of the bytes), so an idempotent endpoint replayed its cached 2xx
+    /// for the second and the drain deleted acked records. The key must differ
+    /// between segments and stay the same on a replay of the same batch.
+    #[tokio::test]
+    async fn ndjson_byte_identical_batches_from_different_segments_get_different_keys() {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let url = spawn_header_capture_server(Arc::clone(&captured)).await;
+        let sink = HttpSink::new(ndjson_cfg(&url)).unwrap();
+        let first = heartbeat_batch("seg-000001.wab", 1_788_704_730_000_000_000);
+        let second = heartbeat_batch("seg-000002.wab", 1_788_704_760_000_000_000);
+        sink.commit(first.clone()).await.unwrap();
+        sink.commit(second).await.unwrap();
+        sink.commit(first).await.unwrap(); // the drain replaying the first batch
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let headers = captured.lock().unwrap();
+        assert_eq!(headers.len(), 3, "NDJSON mode sends one request per batch");
+        let keys: Vec<String> = headers
+            .iter()
+            .map(|h| {
+                h.lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("idempotency-key:"))
+                    .unwrap_or_else(|| panic!("no Idempotency-Key in:\n{h}"))
+                    .split_once(':')
+                    .unwrap()
+                    .1
+                    .trim()
+                    .to_string()
+            })
+            .collect();
+        assert!(
+            keys[0].starts_with("sha256:") && keys[0].len() == "sha256:".len() + 64,
+            "key shape is sha256:<64 hex>: {}",
+            keys[0]
+        );
+        assert_ne!(
+            keys[0], keys[1],
+            "distinct segments with identical bytes must not share a key"
+        );
+        assert_eq!(keys[0], keys[2], "a replay must present the same key");
     }
 
     #[test]

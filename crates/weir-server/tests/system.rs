@@ -5048,8 +5048,9 @@ fn postgres_sink_end_to_end() {
 /// ```
 ///
 /// The sink sends a deterministic sha256 `insert_deduplication_token` per batch,
-/// so a crash-replayed byte-identical batch is deduplicated by ClickHouse — that
-/// property is unit-tested at the token level (`dedup_token_*`); here we verify
+/// derived from the batch's WAB coordinate, so a crash-replayed batch is
+/// deduplicated by ClickHouse — that property is unit-tested at the key level
+/// (`sink::batch_key`); here we verify
 /// the end-to-end RowBinary insert path and the IOPS-compression ratio.
 #[test]
 #[ignore = "requires WEIR_TEST_CLICKHOUSE_URL pointing at a running ClickHouse with a weir_records table (see docstring)"]

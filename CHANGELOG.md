@@ -26,6 +26,17 @@ protocol** below.
   key) and what was expected, without quoting the offending line or value.
   A TOML syntax error used to print the whole source line to stderr, and a
   wrongly typed value was quoted, so a credential on that line was logged.
+- The ClickHouse sink's `insert_deduplication_token` and the HTTP sink's
+  NDJSON-mode `Idempotency-Key` are now a sha256 of the batch's place in
+  the buffer (segment `created_at`, first `RecordId`, record count; see
+  `docs/sinks/batch-keys.md`) instead of the batch's `DedupToken`. Two
+  segments that each held a byte-identical record, such as a heartbeat
+  every 30 s, shared a key, so ClickHouse dropped the second block with a
+  200 and an idempotent endpoint replayed its cached 2xx, and weir deleted
+  acked records with no error. After upgrading, a batch that was in flight
+  at the upgrade is re-sent once under the new key, so ClickHouse and an
+  idempotent HTTP endpoint may see it twice, once. HTTP per-record mode is
+  unchanged.
 
 ### Fixed
 
