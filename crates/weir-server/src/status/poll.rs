@@ -53,20 +53,17 @@ pub(crate) fn compute_wab_bytes_on_disk(wab_dir: &Path) -> Option<u64> {
             return None;
         };
         let shard_path = entry.path();
-        if !shard_path.is_dir() {
-            continue;
-        }
-        // Skip the daemon's reserved subdirs — they aren't shards. dead_letter/
-        // (dl_*.wab.sealed) has its own weir_dead_letter_bytes_on_disk gauge, and
-        // quarantine/ holds forensic copies (both `.wab` and `.wab.sealed`,
-        // depending on whether crash recovery or the drain preserved them; see
-        // docs/wab_format.md); counting either here would double-count
-        // live-segment bytes (G15, mirrors recovery's skip).
-        let dir_name = shard_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
-        if dir_name == "dead_letter" || dir_name == "quarantine" {
+        // Only `shard_<N>` directories are shards, the same rule as recovery,
+        // replay and the lag scan. That skips the daemon's reserved subdirs:
+        // dead_letter/ (dl_*.wab.sealed) has its own
+        // weir_dead_letter_bytes_on_disk gauge, and quarantine/ holds forensic
+        // copies (both `.wab` and `.wab.sealed`, depending on whether crash
+        // recovery or the drain preserved them; see docs/wab_format.md);
+        // counting either here would double-count live-segment bytes (G15). It
+        // also skips anything foreign, such as a root-owned `lost+found` when
+        // `wab_dir` is a mount root: reading that as a shard failed every scan,
+        // and with `wab_max_bytes` set the cap then refused every push for good.
+        if crate::wab::segment::shard_id_from_path(&shard_path).is_none() || !shard_path.is_dir() {
             continue;
         }
         let Ok(shard_dir) = std::fs::read_dir(&shard_path) else {
@@ -1350,6 +1347,37 @@ mod wab_bytes_tests {
             Some(100),
             "only live shard segments count; dead_letter + quarantine are skipped"
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A directory under `wab_dir` that is not `shard_<N>` (here `lost+found`
+    /// at a mount root, root-owned and unreadable) is not a shard, as recovery,
+    /// replay and the lag scan already rule. Reading it as one failed every
+    /// scan, so with `wab_max_bytes` set the cap never cleared and the daemon
+    /// refused every push for good.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_foreign_directory_is_not_a_shard() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::testutil::scratch_dir("wab_bytes_foreign");
+        let shard = root.join("shard_00");
+        crate::testutil::mkdir_p(&shard);
+        std::fs::write(shard.join("seg_00000001.wab.sealed"), vec![0u8; 100]).unwrap();
+        let foreign = root.join("lost+found");
+        crate::testutil::mkdir_p(&foreign);
+        std::fs::write(foreign.join("seg_00000009.wab.sealed"), vec![0u8; 999]).unwrap();
+        std::fs::set_permissions(&foreign, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&foreign).is_ok() {
+            std::fs::set_permissions(&foreign, std::fs::Permissions::from_mode(0o700)).unwrap();
+            eprintln!("skipping: a mode-000 directory is still readable (root?)");
+            std::fs::remove_dir_all(&root).ok();
+            return;
+        }
+        let got = compute_wab_bytes_on_disk(&root);
+        std::fs::set_permissions(&foreign, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(got, Some(100), "only shard_<N> directories are shards");
+        // Readable, it still does not count: its bytes are not the WAB's.
+        assert_eq!(compute_wab_bytes_on_disk(&root), Some(100));
         std::fs::remove_dir_all(&root).ok();
     }
 
