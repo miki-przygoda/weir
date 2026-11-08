@@ -76,6 +76,11 @@ protocol** below.
   the Rust client does. Both read the missing reason byte as
   `InternalError`, the one transient reason, so a caller kept using a
   desynced connection.
+- The TypeScript demo wire client now treats a reply of the wrong kind
+  (a `HealthCheckResponse` to a Push, an `Ack` to a HealthCheck, either
+  to a PushTracked) as a stream desync and closes the connection, as the
+  Rust client does. It resolved a Push answered with a
+  `HealthCheckResponse` as acked, a false ack.
 - The chaos harness's `run-soak.sh` banner and the `SETUP.md` that
   `capture-setup.sh` writes into each run directory now state the fault
   the schedule runs, from the orchestrator's own `faults.describe`. Both
