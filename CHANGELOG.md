@@ -41,7 +41,9 @@ protocol** below.
   idempotent HTTP endpoint may see it twice, once. HTTP per-record mode is
   unchanged. The sink-SDK docs and the integration guide no longer offer
   `DedupToken` as a downstream key where a duplicate is cheap: a custom
-  sink should key on `record_ids()` or build the same coordinate key.
+  sink should key on `record_ids()` or build the same coordinate key. The
+  example config's `sink_send_idempotency_key` comment and the
+  `clickhouse-sink` feature comment now say so too.
 - An explicit `admin_socket_path` reached through a symlink to `wab_dir`
   (`/data/wab/admin.sock` when `/data` links to `/mnt/x`) is now refused at
   startup as inside `wab_dir`. The check compared the path as written with

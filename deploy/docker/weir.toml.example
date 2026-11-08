@@ -198,8 +198,10 @@ sink_max_batch_size = 100
 # record's RecordId — sha256(segment instance, index, payload) — so two distinct
 # records carrying identical bytes get distinct keys. Hashing only the payload
 # is what weir did before 2.0.3, and it made a correct endpoint drop every
-# repeat of a fixed-shape event. In ndjson mode the key is the batch's
-# DedupToken instead; see sink_max_batch_size in docs/operations/configuration.md.
+# repeat of a fixed-shape event. In ndjson mode the key is the batch key
+# instead: a sha256 of the batch's place in the buffer (segment created_at,
+# first RecordId, record count), so two segments carrying byte-identical
+# records get different keys; see docs/sinks/batch-keys.md.
 # Set false only if your endpoint can't tolerate the extra header.
 # Env: WEIR_SINK_SEND_IDEMPOTENCY_KEY
 sink_send_idempotency_key = true

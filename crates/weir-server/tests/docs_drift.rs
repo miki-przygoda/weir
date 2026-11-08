@@ -1986,3 +1986,43 @@ fn no_doc_offers_the_content_only_dedup_token_as_a_downstream_key() {
     }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
+
+/// The shipped example config and the server crate's feature comments are
+/// read by operators who never open `docs/sinks/batch-keys.md`. After the
+/// ClickHouse and HTTP NDJSON sinks moved to the coordinate batch key, the
+/// example still called the NDJSON `Idempotency-Key` "the batch's DedupToken"
+/// and the `clickhouse-sink` feature still promised a "content-derived" token.
+#[test]
+fn shipped_config_comments_name_the_coordinate_batch_key() {
+    const SERVER_MANIFEST: &str = include_str!("../Cargo.toml");
+    let hash_prose = |src: &str| {
+        src.lines()
+            .map(|l| l.trim_start().trim_start_matches('#'))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let example = hash_prose(CONFIG_EXAMPLE);
+    let manifest = hash_prose(SERVER_MANIFEST);
+    let mut problems = Vec::new();
+    for (path, text) in [
+        ("deploy/docker/weir.toml.example", &example),
+        ("crates/weir-server/Cargo.toml", &manifest),
+    ] {
+        for phrase in ["batch's DedupToken", "content-derived dedup token"] {
+            if text.contains(phrase) {
+                problems.push(format!("{path} still says {phrase:?}"));
+            }
+        }
+    }
+    if !example.contains("segment created_at, first RecordId, record count") {
+        problems.push(
+            "deploy/docker/weir.toml.example must say the NDJSON key is a sha256 of the \
+             batch coordinate (segment created_at, first RecordId, record count)"
+                .to_owned(),
+        );
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}

@@ -6,7 +6,7 @@ http-sink = ["dep:reqwest", "dep:sha2", "dep:futures-util"]
 mysql-sink = ["dep:mysql_async", "_sql-sink"]
 # PostgreSQL sink: writes batches via multi-row INSERT.
 postgres-sink = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:tokio-postgres-rustls", "dep:webpki-roots", "dep:rustls", "_sql-sink"]
-# ClickHouse sink: HTTP RowBinary batch inserts with a content-derived dedup token.
+# ClickHouse sink: HTTP RowBinary batch inserts deduplicated on the batch's WAB coordinate.
 clickhouse-sink = ["dep:reqwest", "dep:sha2", "_sql-sink"]
 # S3-API object-storage sink (AWS S3, MinIO, Cloudflare R2, Backblaze B2, Ceph).
 # Opt-in like clickhouse-sink: a new target should not grow the default binary's
