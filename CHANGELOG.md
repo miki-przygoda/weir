@@ -44,6 +44,10 @@ protocol** below.
 
 ### Fixed
 
+- `deploy/run_bare_metal_bench.sh` now reports the mount options of the
+  filesystem that holds the WAB test directory. It looked the device name up
+  in `/proc/mounts` and took the first match, so on a tmpfs `/tmp` the header
+  printed `/run`'s options.
 - The test that `weir_drain_state` and `weir_sink_health` exist on the first
   scrape now matches each whole sample line. It matched bare words such as
   `draining`, which the `weir_drain_state` HELP text contains, so it passed
