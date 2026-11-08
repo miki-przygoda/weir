@@ -44,6 +44,10 @@ protocol** below.
 
 ### Fixed
 
+- A manual run of the "Publish docs" workflow on `main` now deploys the
+  site, as its `workflow_dispatch` comment says. The Pages upload step and
+  the deploy job ran only on a push, so a manual run built the book and
+  published nothing.
 - The TypeScript and Python demo wire clients now treat a Nack frame
   with an empty payload as a stream desync and close the connection, as
   the Rust client does. Both read the missing reason byte as

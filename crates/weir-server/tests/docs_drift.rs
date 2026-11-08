@@ -1890,3 +1890,38 @@ fn every_transient_postgres_sqlstate_is_documented() {
     }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
+
+const DOCS_YML: &str = include_str!("../../../.github/workflows/docs.yml");
+
+/// docs.yml documents its `workflow_dispatch` trigger as the way to deploy the
+/// site on demand, so the steps that publish (the Pages upload and the deploy
+/// job) must run on a manual run of main, not only on a push. Gating them on
+/// `push` alone made a manual run build the book and publish nothing.
+#[test]
+fn a_manual_docs_run_on_main_publishes_the_site() {
+    assert!(
+        DOCS_YML.lines().any(|l| l.trim() == "workflow_dispatch:"),
+        "docs.yml no longer has a workflow_dispatch trigger"
+    );
+    let gates: Vec<&str> = DOCS_YML
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("if:") && l.contains("github.event_name"))
+        .collect();
+    assert_eq!(
+        gates.len(),
+        2,
+        "expected the upload-pages-artifact step and the deploy job to be the \
+         two event-gated publish steps in docs.yml, found {gates:?}"
+    );
+    for gate in gates {
+        assert!(
+            gate.contains("'workflow_dispatch'") && gate.contains("'push'"),
+            "a docs.yml publish gate skips manual runs:\n  {gate}"
+        );
+        assert!(
+            gate.contains("github.ref == 'refs/heads/main'"),
+            "a docs.yml publish gate no longer limits publishing to main:\n  {gate}"
+        );
+    }
+}
