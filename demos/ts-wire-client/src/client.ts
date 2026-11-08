@@ -220,9 +220,11 @@ export class WeirClient {
         if (pending.kind !== "tracked") {
           // An AckTracked for a request that never asked to be tracked is a
           // desync: the queue and the wire disagree about what is in flight.
-          return this.fail(
-            new WireError("response: AckTracked for an untracked request (desync)", true),
-          );
+          // Reject the request it answered: it is off the queue now, so
+          // neither onClose nor its timeout would ever settle it.
+          const err = new WireError("response: AckTracked for an untracked request (desync)", true);
+          pending.reject(err);
+          return this.fail(err);
         }
         try {
           pending.resolve(decodeCoordinate(payload));
@@ -250,10 +252,14 @@ export class WeirClient {
         pending.reject(new NackError(reason, daemonVersion, closes));
         return;
       }
-      default:
-        return this.fail(
-          new WireError(`response: unexpected message_type 0x${messageType.toString(16)}`, true),
+      default: {
+        const err = new WireError(
+          `response: unexpected message_type 0x${messageType.toString(16)} (desync)`,
+          true,
         );
+        pending.reject(err);
+        return this.fail(err);
+      }
     }
   }
 

@@ -107,9 +107,12 @@ protocol** below.
   tests (`test_empty_nack.py`, `desync_empty_nack.ts`).
 - The TypeScript demo wire client now treats a reply of the wrong kind
   (a `HealthCheckResponse` to a Push, an `Ack` to a HealthCheck, either
-  to a PushTracked) as a stream desync and closes the connection, as the
-  Rust client does. It resolved a Push answered with a
-  `HealthCheckResponse` as acked, a false ack. CI's conformance job now
+  to a PushTracked, an `AckTracked` to a Push or HealthCheck, a reply of
+  an unknown type) as a stream desync, rejects the request it answered and
+  closes the connection, as the Rust client does. It resolved a Push
+  answered with a `HealthCheckResponse` as acked, a false ack, and left a
+  request answered with an untracked `AckTracked` or an unknown type
+  pending forever, past its timeout. CI's conformance job now
   runs its regression test (`desync_crossed_reply.ts`).
 - The chaos harness's `run-soak.sh` banner and the `SETUP.md` that
   `capture-setup.sh` writes into each run directory now state the fault
