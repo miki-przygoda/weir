@@ -562,6 +562,13 @@ impl WabPoll {
             &self.wab_bytes_now,
         ) {
             if let Some(st) = &self.status {
+                // Before the first successful scan the flag can only hold the
+                // fail-closed placeholder `startup_cap_gate` sets when its scan
+                // fails, not a cap crossing: judge this size afresh rather than
+                // through the hysteresis, which would keep refusing below the cap.
+                if st.board.wab.first_scan_ok_ms().is_none() {
+                    st.board.wab_cap_rejecting.store(false, Ordering::Relaxed);
+                }
                 st.board.wab.note_scan_ok(unix_ms_now());
                 // Spec §5.5: the refresh that clears the flag without traffic.
                 let rejecting = crate::wab::cap::evaluate(
@@ -2431,6 +2438,42 @@ mod tests {
         );
         assert!(board.wab.last_scan_ok_ms().is_some());
         assert_eq!(m.wab_cap_rejecting.get(), 0.0);
+    }
+
+    /// The flag a failed startup scan sets is a placeholder, not a cap
+    /// crossing: the first scan that succeeds judges the size afresh, so a
+    /// WAB between low water and the cap is accepted, not held by hysteresis
+    /// the daemon never entered. A WAB at the cap still rejects, and from
+    /// then on the hysteresis applies as usual.
+    #[tokio::test]
+    async fn the_first_poll_scan_after_a_failed_startup_scan_judges_the_size_afresh() {
+        let missing = crate::testutil::scratch_dir("poll_gate_placeholder").join("no_such_wab_dir");
+        let board = StatusBoard::for_test();
+        let m = Arc::new(Metrics::new().0);
+        assert_eq!(startup_cap_gate(&missing, 1_000, &board, &m), None);
+        assert!(board.wab_cap_rejecting.load(Ordering::Relaxed));
+        let mut poll = poll_for(&board, &m, 1_000, missing.clone());
+        poll.tick(Instant::now(), || async { Ok(Some(950)) }).await;
+        assert!(
+            !board.wab_cap_rejecting.load(Ordering::Relaxed),
+            "below the cap on the first successful scan: released"
+        );
+        assert_eq!(m.wab_cap_rejecting.get(), 0.0);
+
+        let over = StatusBoard::for_test();
+        startup_cap_gate(&missing, 1_000, &over, &m);
+        let mut poll = poll_for(&over, &m, 1_000, missing.clone());
+        poll.tick(Instant::now(), || async { Ok(Some(1_000)) })
+            .await;
+        assert!(
+            over.wab_cap_rejecting.load(Ordering::Relaxed),
+            "at the cap: still rejecting"
+        );
+        poll.tick(Instant::now(), || async { Ok(Some(950)) }).await;
+        assert!(
+            over.wab_cap_rejecting.load(Ordering::Relaxed),
+            "a real crossing keeps the hysteresis"
+        );
     }
 
     #[tokio::test]
