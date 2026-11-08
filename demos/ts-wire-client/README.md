@@ -108,6 +108,7 @@ node src/conformance.ts                 # -> conformance: 30/30 passed
 #   (or via npm: npm run conformance)
 node src/conformance_tracked.ts         # -> tracked conformance: 35/35 checks passed
 node src/conformance_batch.ts           # -> 56/56 batch-extension checks passed
+node src/desync_empty_nack.ts           # -> empty-Nack desync: 2/2 checks passed
 
 # Live: start a daemon with a unique socket/wab/metrics port
 mkdir -p "$PWD/wab"                     # weir-server does not create wab_dir

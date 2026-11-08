@@ -226,7 +226,15 @@ export class WeirClient {
         return;
       }
       case MessageType.Nack: {
-        const reason = payload.length > 0 ? payload.readUInt8(0) : NackReason.InternalError;
+        if (payload.length === 0) {
+          // A Nack carries one reason byte. Without it the stream is desynced,
+          // not transiently failing: reading the gap as InternalError would
+          // keep the connection open. The Rust client poisons here too.
+          const err = new WireError("response: Nack with empty payload (desync)", true);
+          pending.reject(err);
+          return this.fail(err);
+        }
+        const reason = payload.readUInt8(0);
         const daemonVersion =
           reason === NackReason.VersionMismatch && payload.length > 1
             ? payload.readUInt8(1)

@@ -161,8 +161,13 @@ class WeirClient:
             )
         resp = self._request(encode_frame(message_type, durability, payload))
         if resp.message_type == MessageType.NACK:
-            reason = resp.payload[0] if resp.payload else NackReason.INTERNAL_ERROR
-            raise NackError(reason)
+            if not resp.payload:
+                # A Nack carries one reason byte. Without it the stream is
+                # desynced, not transiently failing, so drop the connection
+                # rather than report a retryable INTERNAL_ERROR on it.
+                self.close()
+                raise WeirError("protocol desync: Nack frame had an empty payload")
+            raise NackError(resp.payload[0])
         return resp
 
     def push(
