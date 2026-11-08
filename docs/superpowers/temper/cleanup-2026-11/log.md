@@ -131,3 +131,14 @@
 - Full gate jq-01M6VZK1V1EHDBCQM1HA5E8GXN at 5afbe2e: `GATE full rc=0 (0 failed)`; pre- and post-checks found no leftover weir-test containers or `test_default` network. Log: /srv/bulk/Projects/weir/logs/gate/gate-1660eb12/full-20261107T214546Z/.
 - Fetch-back clean (`ahead: []`); pushed `epic/cleanup-2026-11` (may_push: yes) and opened https://github.com/miki-przygoda/weir/pull/77 against `main`, with the gate and macOS results added to the PR body. Not merged: merging is the owner's.
 - This log commit (and epics.md → ready) follows the gated tip; it touches only `docs/superpowers/temper/`.
+
+## 2026-11-08: owner review of the open items; fix round 5
+
+- PR #77's remote CI is all green (every CI job, including sink integration, monitoring, Windows, load, bench, drain, and the macOS release builds with TLS).
+- **Owner decisions (8 Nov):**
+  - In PR #77: a second sweep over the branch's changes; fix the minor items (verify the unverified ones first); chase the SIGTERM system-test flake; **fold the dedup-key fix in** (sinks-r3-01 + sinks-r3-02 as one change, `dedup-coordinate-key`: S3-style coordinate key, DedupToken fallback, `Changed` note about a one-time re-send after upgrade).
+  - Attest: a new epic, `attest-disposal-log` (a hash-chained daemon record of disposed segments). The `.attest` sidecar cleanup (weir-ctl-and-attest-r3-04) moves there.
+  - D10: hard error in 4.2.0 (new epic `d10-missing-config-error`).
+  - wire-socket-and-client-r3-03 (`PayloadTooLarge` reports a count as bytes) stays an owner item: a public error type.
+- Fix round 5: 14 items, ids renamed `minor-*` where reviewers' ids collided across runs; each carries the owner's answer.
+- The PR is back to `stabilising` until the second sweep and a new full gate.
