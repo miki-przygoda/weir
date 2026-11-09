@@ -160,3 +160,9 @@
 - wf_7f975832-eb3 returned `handover`: all 13 fixed (recordid-segment-instance 49c4188, security-r4-01 8260180, security-r4-02 59ec753, durability-and-ack-semantics-r4-01 00a42a5, failure-paths-and-lifecycle-r4-01 0081664, sigterm-test-accept-race 6648740, test-strength-and-docs-r4-01 ef15321, -r4-02 ade1ff0, wire-client-and-weir-ctl-r4-01 062b888, failure-paths-and-lifecycle-r4-02 4d9833a, test-strength-and-docs-r4-03 d47fe27, -r4-04 cc0f619, -r4-05 d9881b0); shas verified; quick gate on the tip green.
 - Regression proved on fix:recordid-segment-instance: weir-attest still chains over the bare `<shard>/<segment>`, so the ids delivered to sinks no longer match the attest chain input, and five docs still promise a head can be recomputed from the downstream's rows (probe passes on d06d110, fails on d9881b0).
 - **Owner decision (9 Nov):** keep attest's chain input unchanged (existing sidecars keep verifying); correct the docs now; "chain over the delivered id" (with a versioned sidecar) joins the attest-disposal-log epic. Fix round 7: `attest-docs-recordid-identity`.
+
+## 2026-11-09: fix round 7 stable; stage 4 done
+
+- Round 7 was blocked twice by the environment (beast rebooted mid-fix; then /srv/fast at 98% with 9.7G free, under the weir gate's 25G floor). The owner cleared space (313G free) and the run resumed.
+- wf_fe8dbc26-750 returned `stable`: attest-docs-recordid-identity (07e29ab): the attest docs now say the chain is built over the segment's file-name identity, not the delivered RecordId, and point to the attest-disposal-log epic; a docs_drift guard pins it. No regressions.
+- Stage 4 ends: second sweep done, every finding fixed or decided. Stage 5 (publish) relaunched: docs and PR body rewritten for everything since 7 Nov, full gate, macOS tests.

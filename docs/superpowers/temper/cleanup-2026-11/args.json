@@ -17,6 +17,7 @@
     "full": "ssh beast 'cd <worktree> && JOBQ_SUBMITTER=temper-cleanup ~/.local/bin/jobq submit --profile rust --project weir --cores 4 --mem 8G --timeout 5h --cwd \"$(pwd -P)\" --name <label>-full -- bash .temper/gate-full.sh', then `~/.local/bin/jobq wait <id>` until it ends (see the build rule)"
   },
   "done": [
+    "fix:attest-docs-recordid-identity",
     "fix:config-reload-and-startup-02",
     "fix:config-reload-and-startup-04",
     "fix:dedup-coordinate-key",
@@ -103,7 +104,7 @@
       "kind": "fix"
     }
   ],
-  "attempt": 7,
+  "attempt": 3,
   "answers": {
     "attest-docs-recordid-identity": "Owner, 9 Nov: do NOT change weir-attest's chain input, verify logic, vectors or sidecar format: existing .attest sidecars must keep verifying across the upgrade. Correct the docs only: in each of the five places (and any other you find with `git grep -n 'downstream'` in crates/weir-attest and docs/ that makes the same claim), say that the chain is built from RecordId::for_record over the segment's file-name identity `<shard>/<segment>` and the record index, which is not the id weir delivers to sinks since the RecordId change (which adds `@<created_at hex>`), so a head cannot be recomputed from the downstream's id_column values or Idempotency-Keys; point to the planned attest-disposal-log epic (docs/superpowers/temper/epics.md) for chaining over the delivered id. Amend the RecordId CHANGELOG `Changed` entry with one sentence on this, rather than adding a new entry. A docs_drift guard that pins the old wording is fixed by fixing the doc, never by weakening the guard. The failing-test step: if a docs_drift-style test can pin the corrected claim cheaply, add it; otherwise show the grep before and after in your note."
   }
