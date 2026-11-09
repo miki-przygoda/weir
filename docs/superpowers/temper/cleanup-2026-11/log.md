@@ -166,3 +166,11 @@
 - Round 7 was blocked twice by the environment (beast rebooted mid-fix; then /srv/fast at 98% with 9.7G free, under the weir gate's 25G floor). The owner cleared space (313G free) and the run resumed.
 - wf_fe8dbc26-750 returned `stable`: attest-docs-recordid-identity (07e29ab): the attest docs now say the chain is built over the segment's file-name identity, not the delivered RecordId, and point to the attest-disposal-log epic; a docs_drift guard pins it. No regressions.
 - Stage 4 ends: second sweep done, every finding fixed or decided. Stage 5 (publish) relaunched: docs and PR body rewritten for everything since 7 Nov, full gate, macOS tests.
+
+## 2026-11-09: publish (attempt 3); PR #77 updated
+
+- Docs f4f4e1c and evidence fd2338e committed. The gate agent stopped before the full gate: the owner had removed miki_przygoda's docker group (9 Nov 10:05 UTC, deliberate). **Owner decision:** run Docker as `claude-head` (`security find-generic-password -a claude-head -s beast-sudo -w | ssh beast-root 'sudo -S -p "" docker …'`), docker only, nothing else as root, with a jobq placeholder booking for its capacity.
+- Full gate at fd2338e, in two halves: native (jq-01M7009AK331ADXE54M979HCY4) all native steps rc=0; Docker half: act conformance, harnesses, sink-integration, monitoring, docker-smoke and the three cross release builds rc=0; docs build rc=1 on a real bug (a book link to the non-book epics.md, fixed in fc034de by the head); Windows lost its ssh connection.
+- At fc034de: quick gate (jq-01M70ARA1TWRTE622WSBXZV2NA) rc=0; docs build rc=0; Windows rc=0 (detached container). Native macOS tests: 20 executables, 0 failing (weir-server bin 991 passed).
+- Pushed epic/cleanup-2026-11 (fc034de) and replaced PR #77's title and body (51 kept fixes: 53 fix trailers less the 2 owner-reverted attest fixes). Not merged.
+- beast: 148 throwaway worktrees removed; 18 dirty ones saved as patches in ~/work/weir/cleanup-2026-11/stale-probes/.
