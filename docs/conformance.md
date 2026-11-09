@@ -150,9 +150,16 @@ or names one of these rejection tags:
 The `record_id_hex` in these vectors is generated with Python's `hashlib`
 SHA-256 and verified against the Rust `sha2` crate, so a passing vector means two
 independent SHA-256 implementations agree — the same cross-check the CRC vectors
-give for `crc32fast`. It is the value the drain hands a sink as its per-record
-idempotency key, so a client that reproduces it can correlate its pushes with
-what the downstream received.
+give for `crc32fast`. It is hashed over the bare `segment` string, the form the
+daemon used before the `RecordId` change; the daemon now hashes the segment's
+identity, `segment` then `@` then the segment header's creation time as 16 hex
+digits (see [`wire_protocol.md`](wire_protocol.md)), and the coordinate does
+not carry that creation time. A decoder treats `record_id` as 32 opaque bytes,
+so these vectors still pin the layout, but a vector's `record_id_hex` is not an
+id the drain hands a sink, and a client cannot reproduce a live coordinate's
+`record_id` from its `segment`, `index` and payload: it correlates its pushes
+with what the downstream received by keeping the `record_id` the daemon
+returned.
 
 Regenerate with:
 

@@ -64,7 +64,11 @@ protocol** below.
   `RecordId`) differ for records delivered after it. A record in flight at
   the upgrade is re-sent once under its new id, so an `id_column` table may
   hold it twice, once. A tracked push's coordinate keeps its `segment`
-  string; its `record_id` follows the new form.
+  string; its `record_id` follows the new form. `weir-attest` still chains
+  over the bare `<shard>/<segment>` so existing `.attest` sidecars keep
+  verifying, which means an attest head can no longer be recomputed from a
+  downstream's `id_column` values or `Idempotency-Key`s, and the docs that
+  said it could now say so.
 
 ### Fixed
 

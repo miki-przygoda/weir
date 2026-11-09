@@ -283,8 +283,13 @@ tool the operator must schedule and anchor themselves — it is listed on its
 own so it is never mistaken for one of the guarantees above.
 
 `weir-attest` hash-chains every **sealed** WAB segment (`weir-ctl attest
-seal|verify|head`) over each record's already-frozen `RecordId`, linked to
-the previous segment's chain head. Catches: offline tampering (a segment
+seal|verify|head`) over each record's `RecordId::for_record` on the
+segment's file-name identity `<shard>/<segment>` and the record index, linked
+to the previous segment's chain head. That is not the id weir delivers to
+sinks (which adds `@<created_at hex>`), so a head cannot be recomputed from a
+downstream's `id_column` values or `Idempotency-Key`s; chaining over the
+delivered id is planned in the attest-disposal-log epic
+(`docs/superpowers/temper/epics.md`). Catches: offline tampering (a segment
 copied to backup, archive, or another host and edited there), a different UID
 on the same host, an edit made on a shared or network filesystem where
 `weir-wab`'s own guarantees are already documented not to hold, and silent

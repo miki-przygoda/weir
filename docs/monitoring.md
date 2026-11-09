@@ -611,11 +611,22 @@ weir-ctl attest head   --wab-dir /var/lib/weir/wab               # print the new
 ```
 
 `seal` writes a `<segment>.wab.sealed.attest` sidecar per sealed segment,
-chaining each record's already-frozen `RecordId` into a running SHA-256 and
+chaining each record's `RecordId::for_record` over the segment's file-name
+identity `<shard>/<segment>` and the record index into a running SHA-256 and
 linking the segment's start hash to the previous segment's head. `verify`
 re-reads every byte and recomputes the chain from nothing — seconds on a
 256 MiB segment, so it is an audit operation, not a health check, and must
 never be wired into a readiness probe.
+
+That chain input is **not** the id weir delivers to sinks: since the
+`RecordId` change, a delivered id also carries `@<created_at hex>`, so a head
+cannot be recomputed from a downstream's `id_column` values or
+`Idempotency-Key`s, only from the sealed segments themselves. Chaining over
+the delivered id needs a versioned sidecar and is planned in the
+attest-disposal-log epic
+([`docs/superpowers/temper/epics.md`](superpowers/temper/epics.md)); until
+then the input is unchanged, so existing `.attest` sidecars keep verifying
+across the upgrade.
 
 **Records in an active, unsealed segment are not chained at all** — only
 `seal` puts anything into the chain, and it only ever sees sealed segments.

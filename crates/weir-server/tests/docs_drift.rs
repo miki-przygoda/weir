@@ -2026,3 +2026,71 @@ fn shipped_config_comments_name_the_coordinate_batch_key() {
     }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
+
+/// `weir-attest` chains `RecordId::for_record` over the segment's file-name
+/// identity `shard_NN/<file>` and the record index. Since every `RecordId`
+/// the drain delivers gained `@<created_at hex>`, that is no longer the id a
+/// sink receives, so a chain head cannot be recomputed from a downstream's
+/// `id_column` values or `Idempotency-Key`s. The attest docs went on saying it
+/// could, and that the chain input is the id the drain hands a sink.
+#[test]
+fn attest_docs_do_not_promise_a_head_recomputable_from_delivered_ids() {
+    const ATTEST_CHAIN: &str = include_str!("../../weir-attest/src/chain.rs");
+    const ATTEST_VERIFY: &str = include_str!("../../weir-attest/src/verify.rs");
+    const ATTEST_MANIFEST: &str = include_str!("../../weir-attest/Cargo.toml");
+    const ATTEST_README: &str = include_str!("../../weir-attest/README.md");
+    const CONFORMANCE: &str = include_str!("../../../docs/conformance.md");
+    let text = |src: &str| {
+        src.lines()
+            .map(|l| {
+                let t = l.trim_start();
+                t.strip_prefix("//!")
+                    .or_else(|| t.strip_prefix("///"))
+                    .or_else(|| t.strip_prefix("//"))
+                    .or_else(|| t.strip_prefix('#'))
+                    .unwrap_or(t)
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let docs = [
+        ("crates/weir-attest/src/chain.rs", text(ATTEST_CHAIN)),
+        ("crates/weir-attest/Cargo.toml", text(ATTEST_MANIFEST)),
+        ("docs/architecture.md", text(ARCHITECTURE)),
+        ("docs/monitoring.md", text(MONITORING)),
+        ("docs/security/threat-model.md", text(THREAT_MODEL)),
+        ("crates/weir-attest/README.md", text(ATTEST_README)),
+        ("crates/weir-attest/src/verify.rs", text(ATTEST_VERIFY)),
+        ("docs/conformance.md", text(CONFORMANCE)),
+    ];
+    let stale = [
+        "recomputed from the downstream's rows",
+        "verifiable against the downstream's own rows",
+        "already-frozen `RecordId`",
+        "what a sink could recompute",
+        "that is exactly why it is the right input here",
+        "so a client that reproduces it can correlate",
+    ];
+    let mut problems = Vec::new();
+    for (path, text) in &docs {
+        for phrase in stale {
+            if text.contains(phrase) {
+                problems.push(format!("{path} still says {phrase:?}"));
+            }
+        }
+    }
+    // The five places that made the claim must now state the limit and point
+    // at the epic that would restore it.
+    for (path, text) in &docs[..5] {
+        if !text.contains("cannot be recomputed") || !text.contains("attest-disposal-log") {
+            problems.push(format!(
+                "{path} must say a head cannot be recomputed from the ids weir \
+                 delivers to sinks, and point to the attest-disposal-log epic"
+            ));
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
