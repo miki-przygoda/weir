@@ -699,6 +699,8 @@ line accepts again before the next push arrives, and `weir_wab_cap_rejecting`
 was (fail-closed). A restart over the cap rejects from the first push: a
 synchronous size scan runs after recovery, before the producer socket binds,
 and if that scan fails with a cap set, pushes nack until a scan succeeds.
+That first successful scan judges the WAB against the cap itself, not the
+resume line, so a WAB below the cap accepts at once.
 
 **This is a soft high-water mark, not a hard limit.** The value it is checked
 against is refreshed every 5 seconds, so the WAB can overshoot by up to 5
@@ -1873,9 +1875,10 @@ Column that receives each record's **`RecordId`** as 64 lower-hex characters —
 the per-record idempotency key. `CHAR(64)` is the right type. Put the `UNIQUE`
 constraint here.
 
-A `RecordId` is the record's WAB coordinate — the segment it was written to plus
-its absolute index *within that segment* — hashed with its bytes. That gives it
-the two properties a dedup key needs and a content hash cannot have together:
+A `RecordId` is the record's WAB coordinate — the segment it was written to
+(its shard, file name and header creation time) plus its absolute index
+*within that segment* — hashed with its bytes. That gives it the two
+properties a dedup key needs and a content hash cannot have together:
 
 - **Unique across records with identical bytes.** A payload hash collides on a
   repeated heartbeat or a repeated metering event, and `INSERT IGNORE` then
@@ -2048,9 +2051,10 @@ Column that receives each record's **`RecordId`** as 64 lower-hex characters —
 the per-record idempotency key. `CHAR(64)` is the right type. Put the `UNIQUE`
 constraint here.
 
-A `RecordId` is the record's WAB coordinate — the segment it was written to plus
-its absolute index *within that segment* — hashed with its bytes. That gives it
-the two properties a dedup key needs and a content hash cannot have together:
+A `RecordId` is the record's WAB coordinate — the segment it was written to
+(its shard, file name and header creation time) plus its absolute index
+*within that segment* — hashed with its bytes. That gives it the two
+properties a dedup key needs and a content hash cannot have together:
 
 - **Unique across records with identical bytes.** A payload hash collides on a
   repeated heartbeat or a repeated metering event, and `ON CONFLICT DO NOTHING`

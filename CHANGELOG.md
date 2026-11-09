@@ -25,10 +25,14 @@ protocol** below.
   presigned signature in any query key used to be printed in full, because
   the redactor only knew userinfo and ten query keys, and an http-to-https
   redirect or an echoing error body (`Cannot POST /path`) printed it too.
+  On upgrade: nothing to migrate, but a log search or alert that matched
+  the full URL in these lines no longer matches.
 - A config file that does not parse now names the line and column (or the
   key) and what was expected, without quoting the offending line or value.
   A TOML syntax error used to print the whole source line to stderr, and a
   wrongly typed value was quoted, so a credential on that line was logged.
+  On upgrade: a config that parses is unaffected; only the wording of the
+  error for one that does not changes.
 - The ClickHouse sink's `insert_deduplication_token` and the HTTP sink's
   NDJSON-mode `Idempotency-Key` are now a sha256 of the batch's place in
   the buffer (segment `created_at`, first `RecordId`, record count; see
@@ -51,6 +55,8 @@ protocol** below.
   (`/data/wab/admin.sock` when `/data` links to `/mnt/x`) is now refused at
   startup as inside `wab_dir`. The check compared the path as written with
   the canonical `wab_dir`, so the admin socket could be bound inside the WAB.
+  On upgrade: a deployment whose `admin_socket_path` resolves into `wab_dir`
+  this way fails to start until the path is moved outside `wab_dir`.
 - Every `RecordId` now names the segment instance, `shard_NN/<file>@<the
   segment header's created_at as 16 hex digits>`, not just its file name.
   Segment names restart at `seg_00000001` once a shard drains empty and the
@@ -112,20 +118,23 @@ protocol** below.
   with an empty payload as a stream desync and close the connection, as
   the Rust client does. Both read the missing reason byte as
   `InternalError`, the one transient reason, so a caller kept using a
-  desynced connection. The Python client's `health_check` does the same,
-  and also for a reply of the wrong kind (an `Ack` to a HealthCheck): it
-  returned `False` and kept the stream open. CI's conformance job now
-  runs both regression tests (`test_empty_nack.py`,
+  desynced connection. The Python client's `health_check` does the same:
+  it returned `False` on an empty Nack and kept the stream open. CI's
+  conformance job now runs both regression tests (`test_empty_nack.py`,
   `desync_empty_nack.ts`).
-- The TypeScript demo wire client now treats a reply of the wrong kind
-  (a `HealthCheckResponse` to a Push, an `Ack` to a HealthCheck, either
-  to a PushTracked, an `AckTracked` to a Push or HealthCheck, a reply of
-  an unknown type) as a stream desync, rejects the request it answered and
-  closes the connection, as the Rust client does. It resolved a Push
-  answered with a `HealthCheckResponse` as acked, a false ack, and left a
-  request answered with an untracked `AckTracked` or an unknown type
-  pending forever, past its timeout. CI's conformance job now
-  runs its regression test (`desync_crossed_reply.ts`).
+- The TypeScript demo wire client and the Python client's `health_check`
+  now treat a reply of the wrong kind as a stream desync, as the Rust
+  client does. The TypeScript client (a `HealthCheckResponse` to a Push,
+  an `Ack` to a HealthCheck, either to a PushTracked, an `AckTracked` to a
+  Push or HealthCheck, a reply of an unknown type) rejects the request it
+  answered and closes the connection. It resolved a Push answered with a
+  `HealthCheckResponse` as acked, a false ack, and left a request answered
+  with an untracked `AckTracked` or an unknown type pending forever, past
+  its timeout. The Python `health_check` (an `Ack`, an `AckTracked` or an
+  unknown type) closes the connection and raises `WeirError`; it returned
+  `False` and kept the stream open. CI's conformance job now runs the
+  regression tests (`desync_crossed_reply.ts`, and `test_empty_nack.py`
+  for the Python case).
 - The chaos harness's `run-soak.sh` banner and the `SETUP.md` that
   `capture-setup.sh` writes into each run directory now state the fault
   the schedule runs, from the orchestrator's own `faults.describe`. Both
