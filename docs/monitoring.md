@@ -624,7 +624,7 @@ cannot be recomputed from a downstream's `id_column` values or
 `Idempotency-Key`s, only from the sealed segments themselves. Chaining over
 the delivered id needs a versioned sidecar and is planned in the
 attest-disposal-log epic
-([`docs/superpowers/temper/epics.md`](superpowers/temper/epics.md)); until
+(`docs/superpowers/temper/epics.md`); until
 then the input is unchanged, so existing `.attest` sidecars keep verifying
 across the upgrade.
 
