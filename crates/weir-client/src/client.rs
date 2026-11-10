@@ -111,8 +111,11 @@ pub enum ClientError {
     },
     /// The daemon sent a Nack with an unrecognised reason byte.
     UnknownNack(u8),
-    /// The payload exceeds the protocol hard cap and was rejected locally,
-    /// before any bytes were sent. The daemon would always reject a payload this
+    /// The payload exceeds the protocol hard cap in **bytes** and was rejected
+    /// locally, before any bytes were sent: a single record over the cap, or a
+    /// whole [`push_batch`](WeirClient::push_batch) body over it. A batch with
+    /// too many *records* is [`TooManyRecords`][Self::TooManyRecords] instead.
+    /// The daemon would always reject a payload this
     /// large (and a large frame can race the daemon's Nack-and-close, surfacing as
     /// a bare broken-pipe), so the client rejects it up front with no round-trip.
     /// A deployment's configured `max_payload_bytes` may be lower than this cap; a
@@ -122,6 +125,15 @@ pub enum ClientError {
         /// The rejected payload's length in bytes.
         len: usize,
         /// The protocol hard cap ([`weir_core::MAX_PAYLOAD_HARD_CAP`]).
+        limit: usize,
+    },
+    /// A [`push_batch`](WeirClient::push_batch) carried more records than the
+    /// protocol's batch hard cap and was rejected locally, before any bytes were
+    /// sent. The connection stays usable; split the batch and retry.
+    TooManyRecords {
+        /// The number of records in the rejected batch.
+        count: usize,
+        /// The batch record hard cap ([`weir_core::MAX_BATCH_RECORDS_HARD_CAP`]).
         limit: usize,
     },
     /// The daemon's response violated the wire protocol.
@@ -160,6 +172,7 @@ impl ClientError {
     /// | Variant | Recoverable? | Why |
     /// |---|---|---|
     /// | [`PayloadTooLarge`][Self::PayloadTooLarge] | yes | local pre-send rejection; no bytes sent, connection untouched |
+    /// | [`TooManyRecords`][Self::TooManyRecords] | yes | local pre-send rejection; no bytes sent, connection untouched |
     /// | [`EmptyPayload`][Self::EmptyPayload] | yes | local pre-send rejection; no bytes sent, connection untouched |
     /// | [`NoDefaultDurability`][Self::NoDefaultDurability] | yes | local misconfiguration; returned before any I/O |
     /// | [`Nack`][Self::Nack]`(`[`InternalError`][NackReason::InternalError]`)` | yes | transient daemon condition; the daemon keeps the connection open |
@@ -182,7 +195,10 @@ impl ClientError {
     pub fn is_recoverable(&self) -> bool {
         match self {
             // Local, pre-I/O rejections: the connection was never touched.
-            Self::PayloadTooLarge { .. } | Self::NoDefaultDurability | Self::EmptyPayload => true,
+            Self::PayloadTooLarge { .. }
+            | Self::TooManyRecords { .. }
+            | Self::NoDefaultDurability
+            | Self::EmptyPayload => true,
             // The only Nack the daemon keeps the connection open for (transient);
             // every other Nack reason closes it (see `WeirClient::note_nack`).
             Self::Nack(NackReason::InternalError) => true,
@@ -218,6 +234,10 @@ impl std::fmt::Display for ClientError {
             Self::PayloadTooLarge { len, limit } => write!(
                 f,
                 "payload too large: {len} bytes exceeds the {limit}-byte protocol hard cap"
+            ),
+            Self::TooManyRecords { count, limit } => write!(
+                f,
+                "too many records: {count} exceeds the {limit}-record batch hard cap"
             ),
             Self::Protocol(msg) => write!(f, "protocol error: {msg}"),
             Self::NoDefaultDurability => {
@@ -546,7 +566,9 @@ impl<S: Read + Write> WeirClient<S> {
     /// method refuses a body over the 16 MiB hard cap locally, as a recoverable
     /// [`ClientError::PayloadTooLarge`] that leaves the connection usable. A
     /// daemon whose `max_payload_bytes` is lower answers `Nack(PayloadTooLarge)`
-    /// and closes the connection.
+    /// and closes the connection. A batch of more than
+    /// [`weir_core::MAX_BATCH_RECORDS_HARD_CAP`] records is refused locally as a
+    /// recoverable [`ClientError::TooManyRecords`].
     ///
     /// A daemon predating `PushBatch` answers `Nack(UnknownMessage)` and closes;
     /// that surfaces as a poisoning [`ClientError`], so reconnect and use
@@ -567,8 +589,8 @@ impl<S: Read + Write> WeirClient<S> {
             return Err(ClientError::EmptyPayload);
         }
         if records.len() > MAX_BATCH_RECORDS_HARD_CAP {
-            return Err(ClientError::PayloadTooLarge {
-                len: records.len(),
+            return Err(ClientError::TooManyRecords {
+                count: records.len(),
                 limit: MAX_BATCH_RECORDS_HARD_CAP,
             });
         }
