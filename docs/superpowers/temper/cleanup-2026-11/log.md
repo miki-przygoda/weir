@@ -1,0 +1,176 @@
+# cleanup-2026-11: log
+
+## 2026-11-05: launch
+
+- Base `main` 5e32265. Epic branch `epic/cleanup-2026-11`.
+- No build stage: a stabilisation pass, so the run starts at stage 4 (`temper:stabilise`), then stage 5.
+- Build host beast; every gate runs as a jobq job (`~/agents/CLAUDE.md`, 31 Oct): agents submit with `jobq submit` and wait with `jobq wait`.
+- Overnight: `overnight_fix_default` critical+important; severe items and owner items go to the morning report (`severe_contact: report`).
+
+## 2026-11-05 03:04: sweep stopped at the 5-hour limit, resumed
+
+- Run wf_43ec56e9-e92 (part sweep): 8 of 20 agents finished; 12 reviewers/verifiers died on the usage limit. Their 5 orphaned jobq jobs (still queued) were cancelled by the head, then the run was resumed with the same args (`done` [] — the sweep commits nothing).
+- Smoke: the quick gate on `main` 5e32265 passed inside a jobq job (`GATE quick rc=0`), so the base is green.
+
+## 2026-11-05 07:00: morning report
+
+**Stage:** 4a (sweep) still running; no fix has been made yet, so the branch has no code changes. Usage at 07:00: 5-hour 74%, weekly 72% (stop at 90%).
+
+**Why it's slow:** the first sweep run lost 12 of 20 agents at the 5-hour limit (01:15–03:00). On resume, six lenses (durability and ack semantics, wab and recovery, drain and dead letters, wire socket and client, failure paths and lifecycle, weir-ctl and attest) returned blocked: their dead reviewers had left uncommitted probe edits in their throwaway worktrees (temper known issue, failure-paths-and-lifecycle-03), so the new reviewers refused to reuse them. Nothing was deleted; those six lenses are re-running under new labels (`<lens> r2`, run wf_2e021447-3b2). beast's jobq was also near its memory budget with Cairn and semblance work, so verifiers queue.
+
+**Verified so far (reproduced on beast), before the remaining verifiers report:**
+- important: `deploy/smoke-test.sh` metric check is flaky under `pipefail` (`echo | grep -q` SIGPIPE; 510/1000 false "missing").
+- important: `deploy/smoke-test.sh` never reads the daemon's exit status on SIGTERM, so a failing shutdown passes.
+- important / critical: several config/startup findings (config-reload-and-startup-01..07) and a status/admin URL-redaction finding are mid-verification; the critical ones are secret-leak class (sink URL secrets in logs, a TOML parse error echoing the offending line, `url_origin` passing a password through). One critical candidate was refuted.
+- minor: docs.yml `workflow_dispatch` never deploys; chaos SETUP.md mislabels power-loss runs as kill -9 only.
+
+**Severe items:** none verified.
+**Owner items:** none yet.
+**Flaky reruns:** none.
+
+**Decision (head):** the run continues past 07:00 because the owner asked for the cleanup to be done in this session and weekly usage is under the 90% stop; fixes start when both sweeps have returned, critical+important only, one at a time with a regression check per fix.
+
+## 2026-11-05 08:05: sweep closed, fixes launched (4b)
+
+- Both sweep runs hit the 5-hour limit again (wf_43ec56e9-e92 finished 21/28 agents; the r2 rerun wf_2e021447-3b2 lost all 6). The head cancelled the runs' 5 orphaned queued jobq jobs by id. Much of the delay was jobq: the run's jobs sat for hours "reserved for" a 10G semblance job.
+- **Decision (head):** weekly usage 76% against a 90% stop, and each sweep round has cost ~15% of the week, so the sweep is closed as it stands and the verified fixes go first. `sweeps: 1` for this run (no second sweep), to leave budget for stage 5.
+- **Selected (verified, critical+important, kind fix):** config-reload-and-startup-02 (critical: non-UTF-8 WEIR_* env value printed verbatim, secrets included), config-reload-and-startup-04, deploy-ci-and-chaos-harness-01, -02, -03, and -06. -06 is the `deploy/smoke-test.sh` pipefail finding that the first deploy reviewer reported and its verifier reproduced (important); the resumed reviewer of that lens did not report it again, so the head carried it over under a new id.
+- **Unreviewed lenses (open, for a later run):** failure paths and lifecycle, durability and ack semantics, wab and recovery, drain and dead letters, wire socket and client, sinks, weir-ctl and attest. Their throwaway worktrees (and the r2 ones) hold dead agents' probe edits; left in place for the owner/cleanup.
+- **Unverified, not fixed overnight (to the owner):** critical: security-01 (HTTP sink URL path/query secrets logged in plain text at startup and on every transient retry), config-reload-and-startup-01 (TOML parse error echoes the offending line, credentials included), status-metrics-and-admin-01 (`url_origin` passes a password through when no `@host` follows); important: config-reload-and-startup-03 (no preflight check that the producer socket's parent can be bound), test-strength-and-docs-02 (`clean_disconnect_does_not_panic` cannot fail).
+- **Minor (open items):** deploy-ci-and-chaos-harness-04 (bench header reports /run's mount options for tmpfs /tmp), -05 (smoke test says 30 records, pushes 20), the first sweep's docs.yml workflow_dispatch and chaos SETUP.md mislabelling; config-reload-and-startup-05/06/07, test-strength-and-docs-01 (unverified minors).
+
+## 2026-11-05 ~12:00: paused by the owner; 2026-11-07 14:00: resumed
+
+- Paused at the owner's request: the fix run wf_689c50be-017 was stopped and its running quick gate (cfg04-quick) cancelled. fix:config-reload-and-startup-02 had landed (4ac45c4); the config-reload-and-startup-04 fix was mid-way, its edits uncommitted in the epic worktree on beast (left in place).
+- Resumed 7 Nov with beast's jobq idle and a fresh usage budget: done = [fix:config-reload-and-startup-02], attempt 1, same selection.
+
+## 2026-11-07 14:30: review batch 1 (r3) returned
+
+- Run wf_1b8a2c07-b7f, lenses durability and ack semantics r3, wab and recovery r3, drain and dead letters r3: all 8 agents finished; 5 findings verified, 0 refuted, none blocked. Drain and dead letters r3 reported nothing that survived.
+  - critical wab-and-recovery-r3-01: recovery treats a short payload read (a corrupted length within the cap) as a torn tail and truncates without a quarantine copy, destroying acked records after it.
+  - important durability-and-ack-semantics-r3-01: wab_dir is never fsynced after creating shard_NN, so the first Durable acks on a fresh wab_dir aren't crash-durable.
+  - important durability-and-ack-semantics-r3-02: quarantine/ is created without a wab_dir fsync before the original is durably truncated.
+  - important wab-and-recovery-r3-02: an unreadable foreign subdirectory of wab_dir (lost+found on a mount root) aborts startup.
+  - important wab-and-recovery-r3-03: a failed timed seal drops the active segment instead of keeping it, stranding acked records until restart.
+- Selected for a second fix run (critical+important), after the first fix run returns: the epic worktree takes one fix run at a time.
+- Review batch 2 launched (wf_0cdc0916-764): wire socket and client r3, failure paths and lifecycle r3, sinks r3, weir-ctl and attest r3.
+
+## 2026-11-07 ~15:40: fix round 1 stable
+
+- wf_689c50be-017 returned `stable`: fixed config-reload-and-startup-04 (c1b8dd1), deploy-ci-and-chaos-harness-01 (212f3e7), -02 (7413c0e), -03 (afde04e), -06 (8c263ab), plus -02 config earlier (4ac45c4). Every first-wave fix had its regression check: no regressions, none reverted, none blocked. Every sha verified on the branch after the fetch-back.
+- **Flaky rerun (flagged):** fix:deploy-ci-and-chaos-harness-02's quick gate failed once on `weir-server system::sigterm_unlinks_the_socket_at_once_and_metrics_stay_up_until_exit` (ECONNRESET instead of EOF on an idle connection, system.rs:6183; jq-01M6V6SJAE0K2G3Z0SZHZQQRJJ) and passed on a rerun (jq-01M6V7413Z2CFXZETJPPFKEHC7). That test is not on the project's flaky list, so the rerun broke temper's rule; the head records it here, and the full gate (never rerun) decides. The fix touched only deploy/smoke-test.sh, so the failure is not caused by it; a possible pre-existing flake in the SIGTERM path, for the owner.
+- Fix round 2 launched with the five batch-1 findings (attempt 2).
+
+## 2026-11-07 15:35: review batch 2 (r3) returned
+
+- Run wf_0cdc0916-764 (wire socket and client r3, failure paths and lifecycle r3, sinks r3, weir-ctl and attest r3): all 21 agents finished; 17 findings verified, 0 refuted, none blocked.
+- **Owner items (not fixed):** sinks-r3-01 (critical): ClickHouse `insert_deduplication_token` is the content-only DedupToken, pinned to the 1.x value by a test, so two distinct batches with identical bytes collide and ClickHouse silently drops the second; changing the token is a compatibility decision. wire-socket-and-client-r3-03 (minor): `PayloadTooLarge` reports a record count as bytes (public error type).
+- **Selected for fix round 3 (critical+important, kind fix):** sinks-r3-02 (HTTP NDJSON Idempotency-Key collides for byte-identical batches), sinks-r3-03 (ClickHouse transport error logs a query-string password), failure-paths-and-lifecycle-r3-01 (preflight passes a socket whose parent can't be bound, so the drain delivers before the bind fails), sinks-r3-04 (S3 wrong-region 400 dead-letters the backlog), sinks-r3-05 (Postgres read-only 25006 dead-letters), sinks-r3-06 (MySQL 1040/1053 dead-letter), weir-ctl-and-attest-r3-01/-02/-03 (attest false BROKEN_LINK on out-of-order deletes, lost+found, a segment deleted mid-run), wire-socket-and-client-r3-01 (client never checks the whole PushBatch frame size), wire-socket-and-client-r3-02 (docs say batch and payload limits multiply).
+- **Minor (open items):** weir-ctl-and-attest-r3-04 (.attest sidecars never removed), wire-socket-and-client-r3-04 (nack counters count frames, not records), -05 and -06 (TS/Python demo clients mis-handle a HealthCheckResponse and an empty Nack).
+- A fix that would change a pinned contract returns `contract` and goes to the owner, never into a quiet fix.
+
+## 2026-11-07 16:40: fix round 2 stable
+
+- wf_02b45796-636 returned `stable`: fixed wab-and-recovery-r3-01 (1aa2c4f), durability-and-ack-semantics-r3-01 (04f0d4c), -r3-02 (1b004da), wab-and-recovery-r3-02 (f7efcc9), -r3-03 (5cb6066). Regression check per fix: none; none reverted, none blocked, no flaky reruns. Shas verified on the branch.
+- Fix round 3 launched with the 11 batch-2 findings (attempt 3), and a `security r3` re-review for the first night's unverified secret leaks.
+
+## 2026-11-07 ~17:00: security re-review (r3) returned
+
+- Run wf_85b3fbd2-dc9 (security r3, status metrics and admin r3): all 10 agents finished; 8 findings verified, 0 refuted. The two lenses found the same four defects, so the head deduplicated them to four:
+  - critical security-r3-01 (= status-metrics-and-admin-r3-01): HTTP sink URL secrets in the path or in query keys outside the 10-key denylist (`?code=`, `X-Amz-Signature`, `X-Amz-Security-Token`, `client_secret`) reach the startup INFO line, every transport-error retry and the admin /status sink-failure text.
+  - critical security-r3-02 (= status-metrics-and-admin-r3-03): a TOML syntax error prints the offending line, so a credential on it reaches stderr.
+  - critical status-metrics-and-admin-r3-02 (= security-r3-03, rated minor by its other verifier; the head keeps critical, per the severity notes: a secret in a log and /status): `url_origin` echoes `user:password` when no `@host` follows.
+  - important security-r3-04 (= status-metrics-and-admin-r3-04): `drain_state_and_sink_health_pre_initialised` cannot fail, since the HELP text always contains "draining".
+- These confirm the first night's unverified security-01, config-reload-and-startup-01, status-metrics-and-admin-01 and the metrics-test finding. Selected for fix round 4, after round 3 (same epic worktree).
+
+## 2026-11-07 ~18:45: fix round 3 handover, owner decisions
+
+- wf_2eaee17b-c89 returned `handover`. Fixed: sinks-r3-03 (126e8a3), failure-paths-and-lifecycle-r3-01 (e358b82), sinks-r3-04 (ed290f8), sinks-r3-05 (05b1d00), sinks-r3-06 (ade74f3), weir-ctl-and-attest-r3-01 (72bae97), -r3-02 (f1a1e0d), -r3-03 (fe31ac1), wire-socket-and-client-r3-01 (87a6332), -r3-02 (4228ac2). Contract: sinks-r3-02. No flaky reruns. Shas verified after the fetch-back.
+- Regressions the per-fix checks proved:
+  - fix:sinks-r3-05: docs regression (minor): `configuration.md`'s Postgres classification table and the `postgres.rs` module doc still say 25006 dead-letters. Goes into fix round 4 as `postgres-docs-25006`.
+  - fix:weir-ctl-and-attest-r3-01 (72bae97): weakens tamper detection: any file named `seg_N.wab.confirmed` (even empty) or a junk-named `quarantine/` entry excuses a gap, so `rm` + `touch` hides a deleted segment (verify exit 0, was 1). A security decision.
+  - fix:weir-ctl-and-attest-r3-03 (fe31ac1): under a drain race after the cached disposed set, an honest exit 2 becomes a false BROKEN_LINK (exit 1).
+- **Owner decisions (7 Nov, asked in session):**
+  - Attest: **revert both** 72bae97 and fe31ac1 (head: e8a93fb, 523afa5; the CHANGELOG conflict resolved by dropping only 72bae97's bullet). The original false-positive (out-of-order drain deletes read as BROKEN_LINK) and the deleted-mid-run NotFound go back to the open owner items for a proper design. f1a1e0d (lost+found) stays.
+  - Dedup keys: **owner items for now.** sinks-r3-02 (HTTP NDJSON batch Idempotency-Key, content-only) and sinks-r3-01 (ClickHouse insert_deduplication_token, pinned to 1.x) stay unchanged in this PR and are written up with their evidence; a coordinate-based key (like S3's) is a separate change with a `Changed` note.
+- Fix round 4 launched: security-r3-01, security-r3-02, status-metrics-and-admin-r3-02, security-r3-04, postgres-docs-25006 (attempt 4).
+
+## 2026-11-07 ~20:00: fix round 4 stable, stage 4 done
+
+- wf_ebee96d0-462 returned `stable`: security-r3-01 (9c7b33e), security-r3-02 (4179b12), status-metrics-and-admin-r3-02 (972b42f), postgres-docs-25006 (ef52f0b), security-r3-04 (e15903d). No regressions, none reverted or blocked, no flaky reruns. Shas verified.
+- Stage 4 ends here (`sweeps: 1` per round; every area of the repo was reviewed once across the r1/r3 batches). Stage 5 (publish) launched.
+
+## Open items (for the PR body)
+
+**Owner decisions needed**
+- sinks-r3-01 (critical): ClickHouse `insert_deduplication_token` is the content-only DedupToken, pinned to its 1.x value by `dedup_token_is_unchanged_from_weir_1_x`: two distinct batches with identical bytes (e.g. heartbeats) collide inside the dedup window and ClickHouse silently drops the second with HTTP 200. Owner: left for a separate change (7 Nov).
+- sinks-r3-02 (critical, returned `contract`): HTTP NDJSON batch mode sends the content-only DedupToken as `Idempotency-Key`, so an idempotent endpoint drops a later byte-identical batch. Owner: left for a separate change with a coordinate-based key like the S3 sink's (7 Nov).
+- weir-ctl-and-attest-r3-01 and -r3-03 (important): `attest verify` reports BROKEN_LINK when the drain reclaims a segment out of order, and errors (exit 2) on a segment the drain deletes mid-run. The fixes (72bae97, fe31ac1) were reverted at the owner's call (7 Nov) because they let `rm` + an empty `touch seg_N.wab.confirmed` hide a deleted segment; needs a design that can't be forged by a file name.
+- D10: an explicit missing `--config` still only WARNs (deferred decision, unchanged).
+- Possible pre-existing flake: `weir-server system::sigterm_unlinks_the_socket_at_once_and_metrics_stay_up_until_exit` failed once (ECONNRESET instead of EOF, system.rs:6183) in a quick gate on 7 Nov; the full gate decides.
+
+**Minor (not fixed)**
+- deploy-ci-and-chaos-harness-04: `run_bare_metal_bench.sh` reports /run's mount options for a tmpfs /tmp. -05: `deploy/smoke-test.sh` says it pushes 30 records across three tiers; it pushes 20 across two.
+- docs.yml's `workflow_dispatch` builds the book but never deploys it; chaos `SETUP.md` / `run-soak.sh` label power-loss schedules as "kill -9 only".
+- config-reload-and-startup-05/06/07 (unverified): admin socket under-wab_dir check is lexical; the invalid sink type error omits `s3`; `FEATURE_GATED_FLAGS` lacks the mysql/postgres `id_column` flags. test-strength-and-docs-01 (WEIR_DST_SEED printed in the repro line but never read) unverified.
+- weir-ctl-and-attest-r3-04: `.attest` sidecars are never removed after their segment drains. wire-socket-and-client-r3-03 (owner, public error type): `PayloadTooLarge` reports a record count as bytes. -r3-04: nack counters count frames, not records. -r3-05/-06: the TS/Python demo clients mis-handle a HealthCheckResponse and an empty Nack.
+- Leftover throwaway worktrees under beast's `~/work/weir/cleanup-2026-11/tmp/`, some holding dead agents' probe edits (usage-limit deaths, 5 Nov): for `/temper:cleanup` or by hand.
+
+## 2026-11-07 ~21:00: publish attempt 0: gate_failed (environment), relaunched
+
+- wf_2a30b1ff-18d: docs (96fca04) and evidence (5afbe2e) committed; the full gate (jq-01M6VSAM4P01NWSE7JS9T7880Q, tip 5afbe2e) ended `GATE full rc=1 (1 failed)`. Every step passed except `act-ci-sink-integration`, which never reached a test: docker could not bind `127.0.0.1:55432` for `weir-test-postgres` ("address already in use"). The other sink containers of that run (mysql, clickhouse, minio, compose project `test` from slot a's act-src) were left running; the head removed them and their network (weir's own, from this gate) and checked the four ports were free. Log: /srv/bulk/Projects/weir/logs/gate/gate-1660eb12/full-20261107T195618Z/.
+- Not a code failure; relaunched publish (attempt 1) so the gate runs live again on the same tip.
+- Native macOS tests (head, Mac, `mac-tests.sh` with the cross-build as a jobq job) at 5afbe2e: 20 test executables, 0 failing (weir-server bin: 971 passed, 8 ignored; weir-ctl bin: 162 passed). The darwin TLS smoke of the gate-built binaries was not run.
+
+## 2026-11-07 ~21:30: publish attempt 1: gate_failed again (environment, head's cleanup miss)
+
+- Full gate jq-01M6VVY8YW8TANE4HBGEH1HF89 at 5afbe2e: 27 of 28 steps passed; `act-ci-sink-integration` failed before any test with "network ac8ce520... not found". Cause: the head's cleanup after attempt 0 removed the running weir-test containers and `test_default` but missed the *stopped* `weir-test-postgres` and `weir-test-minio-init` (`docker ps` without `-a`), which compose reused against the deleted network. The gate agent removed all five afterwards. Not pushed. Next: confirm `docker ps -a` shows no weir-test-*, then relaunch publish (attempt 2).
+
+## 2026-11-07 ~22:20: publish attempt 2: ready, PR opened
+
+- Full gate jq-01M6VZK1V1EHDBCQM1HA5E8GXN at 5afbe2e: `GATE full rc=0 (0 failed)`; pre- and post-checks found no leftover weir-test containers or `test_default` network. Log: /srv/bulk/Projects/weir/logs/gate/gate-1660eb12/full-20261107T214546Z/.
+- Fetch-back clean (`ahead: []`); pushed `epic/cleanup-2026-11` (may_push: yes) and opened https://github.com/miki-przygoda/weir/pull/77 against `main`, with the gate and macOS results added to the PR body. Not merged: merging is the owner's.
+- This log commit (and epics.md → ready) follows the gated tip; it touches only `docs/superpowers/temper/`.
+
+## 2026-11-08: owner review of the open items; fix round 5
+
+- PR #77's remote CI is all green (every CI job, including sink integration, monitoring, Windows, load, bench, drain, and the macOS release builds with TLS).
+- **Owner decisions (8 Nov):**
+  - In PR #77: a second sweep over the branch's changes; fix the minor items (verify the unverified ones first); chase the SIGTERM system-test flake; **fold the dedup-key fix in** (sinks-r3-01 + sinks-r3-02 as one change, `dedup-coordinate-key`: S3-style coordinate key, DedupToken fallback, `Changed` note about a one-time re-send after upgrade).
+  - Attest: a new epic, `attest-disposal-log` (a hash-chained daemon record of disposed segments). The `.attest` sidecar cleanup (weir-ctl-and-attest-r3-04) moves there.
+  - D10: hard error in 4.2.0 (new epic `d10-missing-config-error`).
+  - wire-socket-and-client-r3-03 (`PayloadTooLarge` reports a count as bytes) stays an owner item: a public error type.
+- Fix round 5: 14 items, ids renamed `minor-*` where reviewers' ids collided across runs; each carries the owner's answer.
+- The PR is back to `stabilising` until the second sweep and a new full gate.
+
+## 2026-11-08 ~20:30: fix round 5
+
+- wf_ff7e12fb-c62: 13 fixed, no regressions, none reverted, no flaky reruns. dedup-coordinate-key (6679c8f), minor-dst-seed (49c5619), minor-admin-socket-lexical (ade96c5), minor-bench-mount-opts (ea95ffd), minor-chaos-setup-label (df9c0eb), minor-demo-empty-nack (cfa1d91), minor-docs-dispatch (7c1dd2d), minor-feature-gated-flags (bbcbf61), minor-nack-counters (31c0489), minor-sink-type-s3 (4b72b22), minor-smoke-record-count (ac61c29), minor-startup-scan-reject (2ad211a), minor-ts-demo-health (4b99f49). Shas verified.
+- sigterm-system-flake: blocked, not reproduced in 150 isolated runs (jq-01M6Y7HWW24SZ0V32S3009NYYC). The agent's reading: the test sends SIGTERM before the daemon accepts the idle connection, and closing a Unix listener resets a not-yet-accepted connection (ECONNRESET), while decision Q5 promises EOF only for *accepted* idle connections. **Head decision:** don't loosen the assertion; remove the race instead (one round-trip on the idle connection before SIGTERM, so it is accepted, then keep asserting EOF). Goes into the next fix round as `sigterm-test-accept-race`.
+- Second sweep launched over the branch's changes (`git diff main...epic/cleanup-2026-11`, 67 files), in two batches of three lenses (` r4`).
+
+## 2026-11-08 ~21:30: second sweep (r4) returned; fix round 6
+
+- Batch A (wf_a0a56f86-3c2: security r4, durability and ack semantics r4, sinks r4) and batch B (wf_d4a10412-401: failure paths and lifecycle r4, test strength and docs r4, wire client and weir-ctl r4): all 21 agents finished; 16 findings verified, 0 refuted, none blocked. Deduplicated: security-r4-01 = sinks-r4-01 (redirect Location / 4xx body echo the URL path); failure-paths-and-lifecycle-r4-02 = wire-client-and-weir-ctl-r4-02 (weir-ctl `segments` / offline status lost+found). test-strength-and-docs-r4-06 (pr-body.md out of date) is left to stage 5, which rewrites the PR body.
+- **Owner decision (8 Nov):** sinks-r4-02 (RecordId repeats after a restart reuses a segment name; per-record HTTP keys and SQL id_column values collide, silent loss) is fixed server-side in PR #77 as `recordid-segment-instance`: the segment identity passed to RecordId::for_record gains `@<created_at hex>`; no SDK API change; every RecordId changes once at upgrade (Changed note).
+- Fix round 6: 13 items, minors included (owner: close every gap), plus `sigterm-test-accept-race` (make the idle connection accepted before SIGTERM, keep asserting EOF).
+
+## 2026-11-09: fix round 6 handover; owner decision on attest ids; fix round 7
+
+- wf_7f975832-eb3 returned `handover`: all 13 fixed (recordid-segment-instance 49c4188, security-r4-01 8260180, security-r4-02 59ec753, durability-and-ack-semantics-r4-01 00a42a5, failure-paths-and-lifecycle-r4-01 0081664, sigterm-test-accept-race 6648740, test-strength-and-docs-r4-01 ef15321, -r4-02 ade1ff0, wire-client-and-weir-ctl-r4-01 062b888, failure-paths-and-lifecycle-r4-02 4d9833a, test-strength-and-docs-r4-03 d47fe27, -r4-04 cc0f619, -r4-05 d9881b0); shas verified; quick gate on the tip green.
+- Regression proved on fix:recordid-segment-instance: weir-attest still chains over the bare `<shard>/<segment>`, so the ids delivered to sinks no longer match the attest chain input, and five docs still promise a head can be recomputed from the downstream's rows (probe passes on d06d110, fails on d9881b0).
+- **Owner decision (9 Nov):** keep attest's chain input unchanged (existing sidecars keep verifying); correct the docs now; "chain over the delivered id" (with a versioned sidecar) joins the attest-disposal-log epic. Fix round 7: `attest-docs-recordid-identity`.
+
+## 2026-11-09: fix round 7 stable; stage 4 done
+
+- Round 7 was blocked twice by the environment (beast rebooted mid-fix; then /srv/fast at 98% with 9.7G free, under the weir gate's 25G floor). The owner cleared space (313G free) and the run resumed.
+- wf_fe8dbc26-750 returned `stable`: attest-docs-recordid-identity (07e29ab): the attest docs now say the chain is built over the segment's file-name identity, not the delivered RecordId, and point to the attest-disposal-log epic; a docs_drift guard pins it. No regressions.
+- Stage 4 ends: second sweep done, every finding fixed or decided. Stage 5 (publish) relaunched: docs and PR body rewritten for everything since 7 Nov, full gate, macOS tests.
+
+## 2026-11-09: publish (attempt 3); PR #77 updated
+
+- Docs f4f4e1c and evidence fd2338e committed. The gate agent stopped before the full gate: the owner had removed miki_przygoda's docker group (9 Nov 10:05 UTC, deliberate). **Owner decision:** run Docker as `claude-head` (`security find-generic-password -a claude-head -s beast-sudo -w | ssh beast-root 'sudo -S -p "" docker …'`), docker only, nothing else as root, with a jobq placeholder booking for its capacity.
+- Full gate at fd2338e, in two halves: native (jq-01M7009AK331ADXE54M979HCY4) all native steps rc=0; Docker half: act conformance, harnesses, sink-integration, monitoring, docker-smoke and the three cross release builds rc=0; docs build rc=1 on a real bug (a book link to the non-book epics.md, fixed in fc034de by the head); Windows lost its ssh connection.
+- At fc034de: quick gate (jq-01M70ARA1TWRTE622WSBXZV2NA) rc=0; docs build rc=0; Windows rc=0 (detached container). Native macOS tests: 20 executables, 0 failing (weir-server bin 991 passed).
+- Pushed epic/cleanup-2026-11 (fc034de) and replaced PR #77's title and body (51 kept fixes: 53 fix trailers less the 2 owner-reverted attest fixes). Not merged.
+- beast: 148 throwaway worktrees removed; 18 dirty ones saved as patches in ~/work/weir/cleanup-2026-11/stale-probes/.

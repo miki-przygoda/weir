@@ -126,10 +126,20 @@ filesystem_type() {
   df -T "$wab_test_root" 2>/dev/null | awk 'NR==2 {print $2}' || echo "<unknown>"
 }
 
+# Match on the mount point, not the device name: tmpfs, overlay and bind
+# mounts share a device name, so the first /proc/mounts line for "tmpfs" was
+# /run, and the header printed /run's options for a /tmp-backed WAB.
 mount_options() {
-  local dev
-  dev=$(df "$wab_test_root" 2>/dev/null | awk 'NR==2 {print $1}') || return
-  awk -v d="$dev" '$1 == d {print $4; exit}' /proc/mounts 2>/dev/null || echo "<unavailable>"
+  local opts target
+  if command -v findmnt >/dev/null 2>&1; then
+    opts=$(findmnt -no OPTIONS -T "$wab_test_root" 2>/dev/null)
+  fi
+  if [[ -z "${opts:-}" ]]; then
+    target=$(df --output=target "$wab_test_root" 2>/dev/null | awk 'NR==2')
+    # The last line for a mount point is the one on top.
+    [[ -n "$target" ]] && opts=$(awk -v t="$target" '$2 == t {o = $4} END {print o}' /proc/mounts 2>/dev/null)
+  fi
+  echo "${opts:-<unavailable>}"
 }
 
 block_device_line() {

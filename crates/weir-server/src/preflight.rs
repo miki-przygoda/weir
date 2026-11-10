@@ -16,7 +16,9 @@
 //! 2. what sits at `socket_path`: a non-socket entry refuses (the late bind
 //!    would refuse it too), and a connect-only [`probe_socket`] refuses a live
 //!    socket or one whose state it cannot tell. It **never unlinks**: a stale
-//!    socket is left for `bind_hardened`, which removes it after recovery;
+//!    socket is left for `bind_hardened`, which removes it after recovery.
+//!    Then the socket's parent directory must exist, be a directory and be
+//!    writable by the daemon user, or the late bind would fail on it;
 //! 3. a test-bind of the metrics listener, dropped at once;
 //! 4. with `tcp_bind` set (`--features tls`): the TLS material, loaded once and
 //!    thrown away, then a test-bind of `tcp_bind`, dropped at once.
@@ -64,17 +66,21 @@ fn check_socket_path(path: &std::path::Path) -> io::Result<()> {
         Ok(meta) if !meta.file_type().is_socket() => {
             return Err(socket::non_socket_refusal(path, meta.mode() & 0o170_000));
         }
-        // A socket goes to the probe. A missing entry (or a missing parent,
-        // which systemd's RuntimeDirectory can cause) is the probe's `Absent`,
-        // and an unreadable parent is the probe's `Unknown`.
+        // A socket goes to the probe. A missing entry (or a missing parent)
+        // is the probe's `Absent`, and an unreadable parent is the probe's
+        // `Unknown`; the parent itself is checked after the probe.
         _ => {}
     }
 
     match socket::probe_socket(path) {
-        SocketProbe::Absent | SocketProbe::Stale => Ok(()),
-        SocketProbe::Live => Err(socket::live_socket_refusal(path)),
-        SocketProbe::Unknown(errno) => Err(socket::unknown_socket_refusal(path, errno)),
+        SocketProbe::Absent | SocketProbe::Stale => {}
+        SocketProbe::Live => return Err(socket::live_socket_refusal(path)),
+        SocketProbe::Unknown(errno) => return Err(socket::unknown_socket_refusal(path, errno)),
     }
+
+    // A missing, non-directory or unwritable parent probes as `Absent` (or
+    // `Unknown`), but the late bind would fail on it after delivery has begun.
+    socket::check_socket_parent(path)
 }
 
 /// A path that does not fit `sockaddr_un.sun_path` (with its terminating NUL)
@@ -321,10 +327,11 @@ mod tests {
         cleanup(&base);
     }
 
-    /// Review Focus 3: systemd's `RuntimeDirectory` may be gone at start.
-    /// Preflight lets it through to the bind's existing parent-missing error.
+    /// Review Focus 3: the socket's parent (say a `RuntimeDirectory` cleared
+    /// by a reboot) may be gone at start. The late bind would fail on it after
+    /// the drain had begun delivering, so preflight refuses it first.
     #[test]
-    fn preflight_passes_when_the_socket_parent_is_missing() {
+    fn preflight_refuses_when_the_socket_parent_is_missing() {
         let (config, dir) = config_in("no_parent", |cli| {
             cli.socket_path = Some(
                 crate::testutil::scratch_dir("preflight_no_parent_root")
@@ -332,9 +339,58 @@ mod tests {
                     .join("weir.sock"),
             );
         });
-        preflight(&config).expect("a missing parent is the bind's error, not preflight's");
+        let err = preflight(&config).expect_err("a missing parent must refuse");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound, "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("parent directory"), "{msg}");
+        assert!(
+            msg.contains(&*config.socket_path.parent().unwrap().to_string_lossy()),
+            "the refusal must name the parent: {msg}"
+        );
+        assert!(
+            !config.socket_path.parent().unwrap().exists(),
+            "preflight creates nothing"
+        );
         cleanup(&dir);
         cleanup(config.socket_path.parent().unwrap().parent().unwrap());
+    }
+
+    /// A parent that is a regular file, not a directory, refuses too.
+    #[test]
+    fn preflight_refuses_when_the_socket_parent_is_not_a_directory() {
+        let (mut config, dir) = config_in("parent_file", |_| {});
+        let file = dir.join("not_a_dir");
+        std::fs::write(&file, b"x").unwrap();
+        config.socket_path = file.join("weir.sock");
+
+        let err = preflight(&config).expect_err("a non-directory parent must refuse");
+        assert!(err.to_string().contains("parent directory"), "{err}");
+        cleanup(&dir);
+    }
+
+    /// A parent the daemon user cannot create entries in: connect reports
+    /// ENOENT (so the probe says `Absent`) but the late bind would fail with
+    /// EACCES. Preflight refuses it before recovery.
+    #[test]
+    fn preflight_refuses_when_the_socket_parent_is_not_writable() {
+        use std::os::unix::fs::PermissionsExt;
+        // Safety: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: root bypasses directory permissions");
+            return;
+        }
+        let (mut config, dir) = config_in("parent_ro", |_| {});
+        let parent = dir.join("ro");
+        crate::testutil::mkdir_p(&parent);
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o500)).unwrap();
+        config.socket_path = parent.join("weir.sock");
+
+        let result = preflight(&config);
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let err = result.expect_err("an unwritable parent must refuse");
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
+        assert!(err.to_string().contains("not writable"), "{err}");
+        cleanup(&dir);
     }
 
     #[test]

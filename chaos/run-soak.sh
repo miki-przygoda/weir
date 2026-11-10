@@ -17,12 +17,16 @@ LOG="$CHAOS_DIR/../$LABEL.console.log"
 sudo -A modprobe dm-flakey dm-delay 2>/dev/null
 
 DEADLINE=$(python3 -c "import tomllib; print(tomllib.load(open('$SCHEDULE','rb')).get('max_duration_secs','none'))")
+# The fault class comes from the schedule, through the orchestrator's own
+# faults.describe: a fixed label here once called every power-cut run kill-only.
+FAULT=$(python3 -c "import sys, tomllib; sys.path.insert(0, 'orchestrator'); import faults; print(faults.describe(tomllib.load(open('$SCHEDULE','rb'))))")
 
 {
   echo "==================================================================="
   echo "SOAK START      $(date -Is)"
   echo "label           $LABEL"
-  echo "schedule        $SCHEDULE (Phase 1: kill -9 only)"
+  echo "schedule        $SCHEDULE"
+  echo "fault           $FAULT"
   echo "internal stop   ${DEADLINE}s, clean, between episodes"
   echo "backstop        ${BACKSTOP}s SIGINT, only if the run hangs"
   echo "==================================================================="

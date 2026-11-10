@@ -602,9 +602,9 @@ struct ShardStat {
 /// `.wab` test can't shadow the others) and rolling up the dead-letter sibling
 /// through the same `dl_segments` filter the `dl` commands use. Returns the
 /// shards (sorted by name) plus the dead-letter `(file_count, bytes)`; any other
-/// non-shard directory (`quarantine/`, see `is_shard_dir_name`) is skipped. Factored
-/// out of `cmd_segments` so this load-bearing accounting is unit-testable
-/// without capturing stdout. Note: `confirmed` markers contribute 0 bytes (only
+/// non-shard directory (`quarantine/`, `lost+found`, see `is_shard_dir_name`)
+/// is skipped. Factored out of `cmd_segments` so this load-bearing accounting
+/// is unit-testable without capturing stdout. Note: `confirmed` markers contribute 0 bytes (only
 /// active + sealed segments hold live data).
 fn scan_segments(wab_dir: &Path) -> Result<(Vec<ShardStat>, u64, u64), String> {
     let entries =
@@ -637,8 +637,9 @@ fn scan_segments(wab_dir: &Path) -> Result<(Vec<ShardStat>, u64, u64), String> {
             }
             continue;
         }
-        // quarantine/ holds forensic copies (see `quarantine list`); counting it
-        // as a shard inflated the shard table and its byte total.
+        // Only shard_<N> is a shard. quarantine/ holds forensic copies (see
+        // `quarantine list`); counting it, or a foreign lost+found, as a shard
+        // inflated the shard table and its byte total.
         if !is_shard_dir_name(&name) {
             continue;
         }
@@ -677,10 +678,16 @@ fn scan_segments(wab_dir: &Path) -> Result<(Vec<ShardStat>, u64, u64), String> {
     Ok((shards, dl_files, dl_bytes))
 }
 
-/// Directories under `wab_dir` that are NOT shards: the dead-letter store
-/// (rolled up separately) and quarantine (forensic copies, see `quarantine list`).
+/// Whether a directory under `wab_dir` is a shard: only `shard_<N>` is, the
+/// rule the daemon's walks (`weir-server`'s `wab/mod.rs`, `wab/recovery.rs`,
+/// `status/poll.rs`) and `attest`'s `shard_dirs` use. That skips the
+/// dead-letter store (rolled up separately), quarantine (forensic copies, see
+/// `quarantine list`) and anything foreign, such as a root-owned `lost+found`
+/// when `wab_dir` is a mount root, which would otherwise show as a phantom
+/// shard row.
 fn is_shard_dir_name(name: &str) -> bool {
-    name != "dead_letter" && name != "quarantine"
+    name.strip_prefix("shard_")
+        .is_some_and(|id| id.parse::<usize>().is_ok())
 }
 
 /// `.wab.confirmed` > `.wab.sealed` > `.wab`, longest suffix first.
@@ -3835,6 +3842,38 @@ weir_ready 1
         let names: Vec<&str> = shards.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(names, vec!["shard_00"], "quarantine/ is not a shard");
         assert_eq!(shards[0].bytes, 10, "quarantined bytes are not shard bytes");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A directory under `wab_dir` that is not `shard_<N>` (here `lost+found`
+    /// at a mount root, and a stray `shard_x`) is not a shard, the daemon's
+    /// and `attest`'s rule: neither `segments` walk lists it.
+    #[test]
+    fn segments_walks_skip_directories_that_are_not_shard_n() {
+        let dir =
+            std::env::temp_dir().join(format!("weir_ctl_scan_foreign_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let shard = dir.join("shard_00");
+        std::fs::create_dir_all(&shard).unwrap();
+        std::fs::write(shard.join("seg_00000001.wab.sealed"), vec![0u8; 10]).unwrap();
+        for foreign in ["lost+found", "shard_x"] {
+            let f = dir.join(foreign);
+            std::fs::create_dir_all(&f).unwrap();
+            std::fs::write(f.join("seg_00000001.wab.sealed"), vec![0u8; 99]).unwrap();
+        }
+
+        let (shards, _, _) = scan_segments(&dir).unwrap();
+        let names: Vec<&str> = shards.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["shard_00"],
+            "only shard_<N> directories are shards"
+        );
+        assert_eq!(shards[0].bytes, 10);
+
+        let files = scan_segment_files(&dir).unwrap();
+        let shards_listed: Vec<&str> = files.iter().map(|f| f.shard.as_str()).collect();
+        assert_eq!(shards_listed, vec!["shard_00"]);
         std::fs::remove_dir_all(&dir).ok();
     }
 

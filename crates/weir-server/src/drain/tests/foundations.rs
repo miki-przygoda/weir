@@ -8,7 +8,7 @@ use crate::drain::publish::Publisher;
 use crate::drain::{DrainCtx, DrainExit, Wait, spawn_with, wait_slice};
 use crate::metrics::{DrainQueue, DrainQueueLabel};
 use crate::status::{DrainExitReason, StatusBoard};
-use crate::wab::segment::segment_identity;
+use crate::wab::segment::segment_address;
 use crate::wab::{
     format::Compression,
     segment::{WabSegment, segment_path},
@@ -914,7 +914,7 @@ fn a_zero_budget_abandons_a_commit_in_flight_within_100ms() {
         t.elapsed()
     );
     assert_eq!(exit.reason, DrainExitReason::DeadlineAbandoned);
-    assert_eq!(exit.abandoned, Some((segment_identity(&sealed), 0)));
+    assert_eq!(exit.abandoned, Some((segment_address(&sealed), 0)));
     assert!(
         sealed.exists() && !get_confirmed_path(&sealed).exists(),
         "never confirmed"
@@ -953,7 +953,7 @@ fn a_backoff_that_would_outlast_the_deadline_exits_at_once() {
         t.elapsed()
     );
     assert_eq!(exit.reason, DrainExitReason::DeadlineAbandoned);
-    assert_eq!(exit.abandoned, Some((segment_identity(&sealed), 0)));
+    assert_eq!(exit.abandoned, Some((segment_address(&sealed), 0)));
     assert_eq!(sink.call_count(), 1, "the retry never fired");
     assert!(sealed.exists());
     drop(tx);
@@ -991,7 +991,7 @@ fn a_stop_while_blocked_on_dead_letter_headroom_exits() {
     control.request_stop(Duration::from_secs(10));
     let exit = join_within(h, Duration::from_millis(500));
     assert_eq!(exit.reason, DrainExitReason::Stopped);
-    assert_eq!(exit.abandoned, Some((segment_identity(&sealed), 0)));
+    assert_eq!(exit.abandoned, Some((segment_address(&sealed), 0)));
     assert!(sealed.exists());
     drop(tx);
     std::fs::remove_dir_all(dir).ok();
@@ -1635,7 +1635,7 @@ fn the_drain_publishes_its_progress_to_the_board() {
         .in_flight
         .load_full()
         .expect("a segment in flight");
-    assert_eq!(f.segment, segment_identity(&backlog[0]));
+    assert_eq!(f.segment, segment_address(&backlog[0]));
     assert_eq!((f.attempt, f.processed, f.next_retry_at_ms), (1, 0, None));
     assert_eq!(board.drain.state(), Some(DrainStateValue::draining));
 

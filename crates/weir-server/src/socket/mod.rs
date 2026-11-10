@@ -857,6 +857,38 @@ fn split_parent_basename(path: &Path) -> io::Result<(&Path, &std::ffi::OsStr)> {
     Ok((parent, basename))
 }
 
+/// Preflight's check of the socket's parent directory: it must exist, be a
+/// directory (not a symlink to one, which [`open_parent_dirfd`] refuses) and
+/// be writable and searchable by the daemon user. Otherwise the late
+/// `bind_hardened` would fail on it after the drain has begun delivering.
+/// Opens the parent the way `bind_hardened` does and creates nothing.
+#[cfg(unix)]
+pub(crate) fn check_socket_parent(path: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let (parent, _) = split_parent_basename(path)?;
+    let refusal = |what: &str, e: io::Error| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "socket_path '{}': its parent directory '{}' {what} ({e}). Create it \
+                 as a directory writable by the daemon user, or choose another socket_path.",
+                path.display(),
+                parent.display()
+            ),
+        )
+    };
+    let dirfd =
+        open_parent_dirfd(parent).map_err(|e| refusal("cannot be opened as a directory", e))?;
+    let _dirfd_guard = OwnedDirFd(dirfd);
+    let c_parent = std::ffi::CString::new(parent.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "parent path contains null"))?;
+    // Safety: c_parent is a valid nul-terminated C string for the call.
+    if unsafe { libc::access(c_parent.as_ptr(), libc::W_OK | libc::X_OK) } != 0 {
+        return Err(refusal("is not writable", io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn open_parent_dirfd(parent: &Path) -> io::Result<libc::c_int> {
     use std::os::unix::ffi::OsStrExt;

@@ -37,18 +37,16 @@ pub(crate) fn recover_open_segments(wab_dir: &Path, metrics: &Arc<Metrics>) -> i
     shard_dirs.sort_by_key(|p| shard_id_from_path(p));
 
     for shard_dir in shard_dirs {
-        if !shard_dir.is_dir() {
-            continue;
-        }
-        let name = shard_dir.file_name().unwrap_or_default().to_string_lossy();
-        // Skip the daemon's own reserved subdirectories. `quarantine/` holds
-        // unrecoverable segments parked for an operator. `dead_letter/` holds
-        // segment-format files (dl_NNNNNNNN.wab[.sealed]) owned by the
-        // DeadLetterWriter, which manages their dl_ counter and size accounting;
-        // a crash mid-write can leave an active dl_*.wab there, and recovery must
-        // NOT treat dead_letter/ as a shard dir and re-seal that file — doing so
-        // bypasses dead-letter accounting and counter ownership (F16).
-        if name == "quarantine" || name == "dead_letter" {
+        // Only `shard_<N>` directories are shards. That skips the daemon's own
+        // reserved subdirectories: `quarantine/` holds unrecoverable segments
+        // parked for an operator, and `dead_letter/` holds segment-format files
+        // (dl_NNNNNNNN.wab[.sealed]) owned by the DeadLetterWriter, which manages
+        // their dl_ counter and size accounting; a crash mid-write can leave an
+        // active dl_*.wab there, and recovery must NOT re-seal that file (F16).
+        // It also skips anything foreign, such as a root-owned `lost+found` when
+        // `wab_dir` is a mount root: listing it would fail with EACCES and refuse
+        // startup over a directory the daemon never wrote.
+        if shard_id_from_path(&shard_dir).is_none() || !shard_dir.is_dir() {
             continue;
         }
         audit_segment_modes(&shard_dir, metrics);
@@ -300,8 +298,10 @@ pub(crate) fn recover_segment(
     //     `quarantine_reason` as None for these.
     //
     //   * MID-FILE CORRUPTION (bytes remain after the truncation point): a CRC
-    //     mismatch on a record whose length+CRC+payload were ALL fully read, or an
-    //     oversized `payload_len` field with more data behind it. Here the bytes
+    //     mismatch on a record whose length+CRC+payload were ALL fully read, an
+    //     oversized `payload_len` field with more data behind it, or a short
+    //     payload read whose bytes on disk hold a prefix matching the record's
+    //     CRC (a length corrupted upward, still under the cap). Here the bytes
     //     past `valid_end_offset` were fully written and may include
     //     individually-valid, acked-durable records that happen to sit after the
     //     corrupt one. Silently truncating them away is invisible data loss. So we
@@ -514,14 +514,48 @@ pub(crate) fn recover_segment(
         }
         let expected_crc = u32::from_le_bytes(crc_buf);
 
-        let mut payload = vec![0u8; payload_len];
-        match reader.read_exact(&mut payload) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                warn!(path = %path.display(), records = record_count, "WAB segment truncated mid-payload; truncating at last valid record");
-                break;
+        let mut payload = Vec::with_capacity(payload_len);
+        (&mut reader)
+            .take(payload_len as u64)
+            .read_to_end(&mut payload)?;
+        if payload.len() < payload_len {
+            // The file ended inside this payload. A torn tail does that, but so
+            // does a length field corrupted UPWARD (still under the cap), which
+            // runs the read past fully written, possibly acked-durable records.
+            // Tell them apart by the record's own CRC: if a shorter prefix of
+            // the bytes on disk hashes to the stored CRC, this record was written
+            // whole and its length is what is wrong, so the segment is preserved
+            // in quarantine like the neighbouring corruption branches. A torn
+            // payload matches only by a 2^-32 collision per prefix, and a false
+            // match costs only a copy.
+            let available = payload.len();
+            let mut hasher = crc32fast::Hasher::new();
+            let mut whole_record_len = None;
+            for (i, b) in payload.iter().enumerate() {
+                hasher.update(std::slice::from_ref(b));
+                if hasher.clone().finalize() == expected_crc {
+                    whole_record_len = Some(i + 1);
+                    break;
+                }
             }
-            Err(e) => return Err(e),
+            if let Some(real_len) = whole_record_len {
+                warn!(
+                    path = %path.display(),
+                    records = record_count,
+                    payload_len,
+                    real_len,
+                    "payload_len runs past EOF but a shorter prefix matches the record CRC; \
+                     likely a corrupt length; truncating at last valid record"
+                );
+                quarantine_reason = Some(format!(
+                    "payload_len {payload_len} at offset {valid_end_offset} runs past EOF ({available} byte(s) \
+                     on disk), but the first {real_len} byte(s) match the record CRC {expected_crc:#010x}: \
+                     a whole record behind a corrupt length, not a torn tail"
+                ));
+            } else {
+                warn!(path = %path.display(), records = record_count, "WAB segment truncated mid-payload; truncating at last valid record");
+            }
+            break;
         }
 
         let computed_crc = crc32fast::hash(&payload);
@@ -701,6 +735,18 @@ pub(crate) fn recover_segment(
     Ok(sealed)
 }
 
+/// Creates `<wab_dir>/quarantine/` (if needed) and fsyncs `wab_dir`, so the
+/// `quarantine` entry is crash-durable before anything is moved or copied into
+/// it. Without the `wab_dir` fsync a power loss could drop the whole directory
+/// after the caller has already made a truncate of the original durable,
+/// losing the only copy of the records after a mid-file corruption.
+fn create_quarantine_dir(wab_dir: &Path) -> io::Result<PathBuf> {
+    let quarantine_dir = wab_dir.join("quarantine");
+    super::create_dir_private(quarantine_dir.clone())?;
+    super::segment::fsync_parent_dir(&quarantine_dir)?;
+    Ok(quarantine_dir)
+}
+
 /// Moves a corrupt file to `<wab_dir>/quarantine/` and logs the reason.
 /// Failure to quarantine is returned as an error so the caller can decide
 /// whether to abort or continue.
@@ -715,8 +761,7 @@ pub(crate) fn recover_segment(
 /// original is moved out of the shard dir and the counter resets) — a free
 /// suffix is found first.
 pub(crate) fn quarantine(path: &Path, wab_dir: &Path, reason: &str) -> io::Result<()> {
-    let quarantine_dir = wab_dir.join("quarantine");
-    super::create_dir_private(quarantine_dir.clone())?;
+    let quarantine_dir = create_quarantine_dir(wab_dir)?;
     let file_name = path
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
@@ -749,8 +794,7 @@ pub(crate) fn quarantine(path: &Path, wab_dir: &Path, reason: &str) -> io::Resul
 /// the preserved artifact lands next to (and is named like) move-quarantined ones.
 /// Returns the destination path on success.
 fn copy_to_quarantine(path: &Path, wab_dir: &Path, reason: &str) -> io::Result<PathBuf> {
-    let quarantine_dir = wab_dir.join("quarantine");
-    super::create_dir_private(quarantine_dir.clone())?;
+    let quarantine_dir = create_quarantine_dir(wab_dir)?;
     let file_name = path
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no file name"))?;
@@ -773,8 +817,8 @@ fn copy_to_quarantine(path: &Path, wab_dir: &Path, reason: &str) -> io::Result<P
     // fsyncs a crash after the (durable) truncate+seal but before the copy's data
     // and dirent reach disk would lose the ONLY copy of the corrupt tail — the
     // exact opposite of the "PRESERVED in quarantine" guarantee the caller logs.
-    // Order: copy → fsync the copied file's data → fsync the quarantine dir so the
-    // new dirent survives a crash. `fsync_parent_dir(&dest)` fsyncs dest's parent,
+    // Order: (quarantine/ created and wab_dir fsynced) → copy → fsync the copied
+    // file's data → fsync the quarantine dir so the new dirent survives a crash. `fsync_parent_dir(&dest)` fsyncs dest's parent,
     // i.e. the quarantine dir, and is a no-op on non-Unix. The caller only truncates
     // after we return Ok, so durability is established first.
     fs::File::open(&dest)?.sync_all()?;
@@ -1373,6 +1417,83 @@ mod tests {
         fs::remove_dir_all(dir).ok();
     }
 
+    /// `copy_to_quarantine` creates `quarantine/` and the copy in it is the
+    /// ONLY place the records after a mid-file corruption survive once the
+    /// caller truncates the original. The copy and `quarantine/` are fsynced,
+    /// but the `quarantine` entry itself lives in `wab_dir`: until `wab_dir` is
+    /// fsynced a power loss can drop the whole directory, copy included, after
+    /// the truncate is already durable. So recovery must fsync `wab_dir` before
+    /// it truncates, and a failed fsync must fail closed (segment untouched).
+    #[cfg(unix)]
+    #[test]
+    fn recovery_mid_file_corruption_fsyncs_wab_dir_before_truncating() {
+        use crate::wab::segment::{WabSegment, segment_path, sync_hook};
+        let dir = tmp_dir("mid_file_fsyncs_wab_dir");
+        // The segment sits in a shard dir, as in production, so every fsync of
+        // `dir` itself comes from the quarantine path.
+        let shard = dir.join("shard_00");
+        crate::testutil::mkdir_p(&shard);
+        let path = segment_path(&shard, 1);
+        let payloads: &[&[u8]] = &[b"rec--00", b"rec--01", b"rec--02", b"rec--03", b"rec--04"];
+        {
+            let mut seg = WabSegment::create(&path, 0, Compression::None).unwrap();
+            for p in payloads {
+                seg.write_record(p).unwrap();
+            }
+        }
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[24 + 2 * 15 + 8] ^= 0xff;
+        fs::write(&path, &bytes).unwrap();
+
+        let metrics = noop_metrics();
+        sync_hook::fail(&dir, libc::EIO, u32::MAX);
+        recover_segment(&path, &dir, &metrics)
+            .expect_err("a failed wab_dir fsync must fail the quarantine, not truncate");
+        assert!(
+            sync_hook::calls(&dir) >= 1,
+            "recovery must fsync wab_dir after creating quarantine/"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            bytes,
+            "the segment must be left untouched when wab_dir cannot be fsynced"
+        );
+
+        sync_hook::clear(&dir);
+        recover_segment(&path, &dir, &metrics).unwrap();
+        assert!(sync_hook::calls(&dir) >= 2);
+        sync_hook::forget(&dir);
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// The same rule for the move-quarantine: `quarantine/` may be freshly
+    /// created, so its entry in `wab_dir` must be fsynced, and a failed fsync
+    /// is an error with the segment left where it was.
+    #[cfg(unix)]
+    #[test]
+    fn quarantine_fsyncs_wab_dir_after_creating_quarantine_dir() {
+        use crate::wab::segment::sync_hook;
+        let wab_dir = tmp_dir("quarantine_fsyncs_wab_dir");
+        let shard = wab_dir.join("shard_00");
+        crate::testutil::mkdir_p(&shard);
+        let seg = shard.join("seg_00000001.wab");
+        fs::write(&seg, b"corrupt").unwrap();
+
+        sync_hook::fail(&wab_dir, libc::EIO, 1);
+        let err = quarantine(&seg, &wab_dir, "test").unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EIO));
+        assert!(
+            seg.exists(),
+            "a failed fsync must leave the segment in place"
+        );
+
+        quarantine(&seg, &wab_dir, "test").unwrap();
+        assert_eq!(sync_hook::calls(&wab_dir), 2);
+        assert!(!seg.exists());
+        sync_hook::forget(&wab_dir);
+        fs::remove_dir_all(wab_dir).ok();
+    }
+
     /// Counterpart to the headline test: the TORN-TAIL (clean EOF) crash-recovery
     /// path must stay byte-for-byte unchanged — truncate cleanly, NO quarantine,
     /// NO metric bump. A partial trailing write was never durable, so there is
@@ -1466,6 +1587,69 @@ mod tests {
         assert!(!path.exists());
         assert!(sealed.to_str().unwrap().ends_with(".wab.sealed"));
 
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// wab-and-recovery-r3-01. A corrupted length field that is still under the
+    /// cap makes the payload read run past EOF — the same `UnexpectedEof` a torn
+    /// tail produces. But here record2 and record3 were fully written (and could
+    /// be acked `Durable`), so truncating them with only a WARN is silent loss.
+    /// Flipping bit 0 of byte 41 (record2 length 7 -> 65543) must preserve the
+    /// segment in quarantine, as the CRC-mismatch, oversized-length and
+    /// zero-length branches do.
+    #[test]
+    fn corrupt_length_running_past_eof_is_quarantined_not_truncated() {
+        use crate::metrics::{SegmentState, SegmentStateLabel};
+        let dir = tmp_dir("corrupt_len_past_eof");
+        let path = make_segment(&dir, 0, &[b"record1", b"record2", b"record3"]);
+
+        // record2 length field is bytes 39..43 (header 24 + rec1 15).
+        let mut bytes = fs::read(&path).unwrap();
+        assert_eq!(&bytes[39..43], &7u32.to_le_bytes());
+        bytes[41] ^= 0x01;
+        assert_eq!(u32::from_le_bytes(bytes[39..43].try_into().unwrap()), 65543);
+        fs::write(&path, &bytes).unwrap();
+
+        let metrics = noop_metrics();
+        let sealed = recover_segment(&path, &dir, &metrics).unwrap();
+
+        let recovered: Vec<weir_core::Payload> = crate::wab::SegmentReader::open(&sealed)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            recovered.len(),
+            1,
+            "the valid prefix (record1) is still sealed"
+        );
+        assert_eq!(recovered[0], b"record1" as &[u8]);
+
+        let quarantine = dir.join("quarantine");
+        assert!(
+            quarantine.exists(),
+            "a corrupt length that runs past EOF must preserve the tail in quarantine"
+        );
+        let copies: Vec<_> = fs::read_dir(&quarantine)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) != Some("reason"))
+            .collect();
+        assert!(
+            copies
+                .iter()
+                .any(|p| fs::read(p).map(|b| b == bytes).unwrap_or(false)),
+            "the quarantine copy must hold the original bytes, record2 and record3 included: {copies:?}"
+        );
+        assert_eq!(metrics.recovery_segments_quarantined.get(), 1);
+        assert_eq!(
+            metrics
+                .wab_segments
+                .get_or_create(&SegmentStateLabel {
+                    state: SegmentState::quarantined,
+                })
+                .get(),
+            1
+        );
         fs::remove_dir_all(dir).ok();
     }
 
@@ -1681,6 +1865,41 @@ mod tests {
             "recovery must not re-seal a dead_letter segment"
         );
 
+        fs::remove_dir_all(wab_dir).ok();
+    }
+
+    /// `wab_dir` at a filesystem mount root holds a root-owned 0700
+    /// `lost+found`. Recovery must treat only `shard_<N>` directories as
+    /// shards: listing a foreign directory it cannot read used to propagate
+    /// EACCES and refuse startup, so no WAB recovery ran at all.
+    #[cfg(unix)]
+    #[test]
+    fn recover_open_segments_ignores_an_unreadable_foreign_directory() {
+        use crate::wab::segment::{WabSegment, segment_path};
+        use std::os::unix::fs::PermissionsExt;
+        let wab_dir = tmp_dir("recover_ignores_foreign");
+        let shard_dir = wab_dir.join("shard_00");
+        crate::testutil::mkdir_p(&shard_dir);
+        let seg = segment_path(&shard_dir, 1);
+        WabSegment::create(&seg, 0, Compression::None)
+            .unwrap()
+            .write_record(b"live")
+            .unwrap();
+        let foreign = wab_dir.join("lost+found");
+        crate::testutil::mkdir_p(&foreign);
+        fs::set_permissions(&foreign, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_dir(&foreign).is_ok() {
+            fs::set_permissions(&foreign, fs::Permissions::from_mode(0o700)).unwrap();
+            eprintln!("skipping: a mode-000 directory is still readable (root?)");
+            fs::remove_dir_all(wab_dir).ok();
+            return;
+        }
+
+        let result = recover_open_segments(&wab_dir, &noop_metrics());
+        fs::set_permissions(&foreign, fs::Permissions::from_mode(0o700)).unwrap();
+
+        result.expect("a foreign directory must not fail recovery");
+        assert!(!seg.exists(), "the real shard segment is still recovered");
         fs::remove_dir_all(wab_dir).ok();
     }
 

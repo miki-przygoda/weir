@@ -12,9 +12,12 @@ categories = ["cryptography", "filesystem"]
 
 [dependencies]
 weir-wab = { workspace = true }
-# RecordId is the chain's input. It lives in the sink SDK because the drain
-# hands it to sinks as an idempotency key; that is exactly why it is the right
-# input here — the chain becomes verifiable against the downstream's own rows.
+# RecordId is the chain's input: RecordId::for_record over the segment's
+# file-name identity `<shard>/<segment>` and the record index. It is not the id
+# weir delivers to sinks, which since the RecordId change adds
+# `@<created_at hex>`, so a head cannot be recomputed from a downstream's
+# id_column values or Idempotency-Keys. Chaining over the delivered id is
+# planned in the attest-disposal-log epic (docs/superpowers/temper/epics.md).
 weir-sink-sdk = { workspace = true }
 sha2 = "0.10"
 crc32fast = "1.4"

@@ -300,7 +300,7 @@ impl DrainRuntime {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DrainExit {
     pub(crate) reason: DrainExitReason,
-    /// The segment left partly delivered (`segment_identity`, records processed).
+    /// The segment left partly delivered (`segment_address`, records processed).
     pub(crate) abandoned: Option<(String, u64)>,
     /// Paths still in `pending` plus what was left in the channel.
     pub(crate) pending_left: usize,

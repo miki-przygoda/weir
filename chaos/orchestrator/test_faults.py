@@ -600,5 +600,44 @@ class TestLiveOps(unittest.TestCase):
         self.assertFalse(ops.producer_socket_exists())
 
 
+class TestDescribe(unittest.TestCase):
+    """SETUP.md and the console banner state the fault class from the
+    schedule. They once said "Phase 1: kill -9 only" for every run, so an
+    archived power-cut run claimed it had cut no power."""
+
+    def test_a_kill_schedule_says_kill_and_no_power_loss(self):
+        line = faults.describe({"faults": {"kind": "kill_random"}})
+        self.assertIn("kill -9", line)
+        self.assertIn("fault=kill_random", line)
+        self.assertIn("says nothing about power loss",
+                      faults.setup_paragraph({"faults": {"kind": "kill_random"}}))
+        self.assertEqual(faults.describe({}), line)
+
+    def test_a_power_loss_schedule_says_power_cut(self):
+        sched = {"faults": {"kind": "power_loss"}, "storage": {"dm_target": "flakey"}}
+        self.assertIn("dm-flakey power cut", faults.describe(sched))
+        self.assertIn("fault=power_loss", faults.describe(sched))
+        self.assertNotIn("kill -9", faults.describe(sched))
+        self.assertNotIn("says nothing about power loss", faults.setup_paragraph(sched))
+
+    def test_a_trigger_names_itself_and_its_cut(self):
+        sched = {"faults": dict(SIGTERM_AT), "storage": {"dm_target": "flakey"}}
+        line = faults.describe(sched)
+        self.assertIn("sigterm_at", line)
+        self.assertIn("dm-flakey power cut", line)
+        self.assertIn("fault=power_loss", line)
+        killed = {"faults": dict(SIGTERM_AT, cut="kill")}
+        self.assertIn("kill -9", faults.describe(killed))
+        self.assertIn("fault=kill_random", faults.describe(killed))
+
+    def test_the_scripts_take_the_label_from_the_schedule(self):
+        here = os.path.dirname(os.path.abspath(__file__))
+        for script in ("run-soak.sh", "capture-setup.sh"):
+            with open(os.path.join(here, "..", script)) as f:
+                text = f.read()
+            self.assertIn("faults.describe", text, script)
+            self.assertNotIn("kill -9 only", text, script)
+
+
 if __name__ == "__main__":
     unittest.main()

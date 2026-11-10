@@ -37,8 +37,10 @@ const UNPARSEABLE: &str = "<unparseable>";
 ///
 /// When the boundary between userinfo and path is ambiguous (an `@` after
 /// the first `/`, `?` or `#`, as in an unencoded `/` inside a password), or
-/// what remains is not a plausible `host[:port]`, nothing is echoed either:
-/// over-redacting a display value is harmless, echoing half a password is not.
+/// what remains is not a plausible `host[:port]` (a port is digits only, so a
+/// `user:password` with no `@host` after it is not taken for one), nothing is
+/// echoed either: over-redacting a display value is harmless, echoing half a
+/// password is not.
 pub(crate) fn url_origin(url: &str) -> String {
     let Some(i) = url.find("://") else {
         return UNPARSEABLE.to_string();
@@ -51,14 +53,44 @@ pub(crate) fn url_origin(url: &str) -> String {
         && scheme
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
-    let host_ok = !host.is_empty()
-        && host.chars().all(|c| {
-            c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '[' | ']' | '%')
-        });
-    if !scheme_ok || !host_ok || tail.contains('@') {
+    if !scheme_ok || !is_host_port(host) || tail.contains('@') {
         return UNPARSEABLE.to_string();
     }
     format!("{scheme}://{host}")
+}
+
+/// `host[:port]` or `[ipv6][:port]`, where a port is digits only. A
+/// `user:password` left without its `@host` fails here, so it is not echoed
+/// as if it were a host and a port.
+fn is_host_port(authority: &str) -> bool {
+    let (host, port) = match authority.strip_prefix('[') {
+        Some(rest) => {
+            let Some((ip, after)) = rest.split_once(']') else {
+                return false;
+            };
+            let ip_ok = !ip.is_empty()
+                && ip
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '.' | '%'));
+            if !ip_ok {
+                return false;
+            }
+            match after.strip_prefix(':') {
+                Some(port) => ("", Some(port)),
+                None if after.is_empty() => ("", None),
+                None => return false,
+            }
+        }
+        None => match authority.split_once(':') {
+            Some((host, port)) if !host.is_empty() => (host, Some(port)),
+            Some(_) => return false,
+            None if !authority.is_empty() => (authority, None),
+            None => return false,
+        },
+    };
+    host.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        && port.is_none_or(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
 }
 
 #[derive(Default)]
@@ -561,8 +593,31 @@ mod tests {
             assert_eq!(url_origin(input), "<unparseable>", "{input}");
         }
         assert_eq!(url_origin("https://[::1]:8443/x"), "https://[::1]:8443");
+        assert_eq!(url_origin("https://h:8443/x"), "https://h:8443");
         // Userinfo itself may hold anything: it is dropped whole.
         assert_eq!(url_origin("https://SENTINEL PW@h"), "https://h");
+    }
+
+    /// Userinfo with no `@host` after it (the operator left the host out)
+    /// is not read as `host:port`: a port is digits only, so
+    /// `user:password` is not echoed, in the view or the startup line.
+    #[test]
+    fn url_origin_echoes_nothing_for_userinfo_without_a_host() {
+        for input in [
+            "mysql://weir:hunter2SECRET",
+            "mysql://weir:hunter2SECRET/db",
+            "https://user:SENTINEL?x",
+            "https://[::1]:SENTINEL",
+            "https://[::1]SENTINEL",
+            "https://h:1:SENTINEL",
+            "https://h:",
+        ] {
+            assert_eq!(url_origin(input), "<unparseable>", "{input}");
+        }
+        let mut c = config("nohost", PartialConfig::empty());
+        c.sink_url = crate::config::RedactedUrl(Some("mysql://weir:hunter2SECRET".into()));
+        let line = format!("{:?}", ConfigView::from(&c));
+        assert!(!line.contains("SECRET"), "{line}");
     }
 
     #[test]

@@ -126,7 +126,10 @@ impl StatusBoard {
             wab_cap: Some(CapEvidence {
                 max_bytes: max,
                 low_water_bytes: crate::wab::cap::low_water(max),
-                bytes_now: self.wab_bytes_now.load(Ordering::Relaxed),
+                bytes_now: match self.wab_bytes_now.load(Ordering::Relaxed) {
+                    crate::wab::cap::BYTES_UNKNOWN => 0,
+                    bytes => bytes,
+                },
                 rejecting: self.wab_cap_rejecting.load(Ordering::Relaxed),
                 first_scan_ok_unix_ms: self.wab.first_scan_ok_ms(),
                 last_scan_ok_unix_ms: self.wab.last_scan_ok_ms(),

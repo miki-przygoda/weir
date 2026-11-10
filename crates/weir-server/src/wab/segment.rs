@@ -47,6 +47,10 @@ pub(crate) struct WabSegment {
     /// Once set, `write_record` refuses further writes; the caller (`ShardWriter`)
     /// drops the segment and opens a fresh one.
     poisoned: bool,
+    /// The header's `created_at` (unix nanoseconds), kept so the writer can
+    /// name this segment instance in a record's `RecordId` without re-reading
+    /// the header it just wrote. See [`segment_identity`].
+    created_at: i64,
 }
 
 impl WabSegment {
@@ -72,6 +76,8 @@ impl WabSegment {
         let file = OpenOptions::new().write(true).create_new(true).open(path)?;
 
         let header = build_segment_header(shard_id, compression);
+        // Bytes [8..16] of the header, as `parse_segment_header` reads them back.
+        let created_at = i64::from_le_bytes(header[8..16].try_into().expect("8 bytes"));
 
         let mut hasher = CrcHasher::new();
         hasher.update(&header);
@@ -85,6 +91,7 @@ impl WabSegment {
             file_crc_hasher: hasher,
             compression,
             poisoned: false,
+            created_at,
         };
 
         seg.file.write_all(&header)?;
@@ -222,6 +229,11 @@ impl WabSegment {
         platform_fsync(&self.file)
     }
 
+    /// The `created_at` this segment's header carries, in unix nanoseconds.
+    pub(crate) fn created_at(&self) -> i64 {
+        self.created_at
+    }
+
     /// Returns true if the segment has reached or exceeded the configured
     /// rotation threshold. The threshold is owned by `ShardWriter` so a single
     /// `WabSegment` instance can be reused under different policies (e.g. tests).
@@ -315,9 +327,9 @@ pub(crate) fn sealed_path_for(active_path: &Path) -> PathBuf {
     p
 }
 
-/// A segment's address in the WAB, as `<shard-dir>/<file-name>` — the string
-/// mixed into every `RecordId` derived from that segment, and the `segment`
-/// field of a [`RecordCoordinate`](weir_core::RecordCoordinate).
+/// A segment's address in the WAB, as `<shard-dir>/<file-name>`: the `segment`
+/// field of a [`RecordCoordinate`](weir_core::RecordCoordinate), the segment the
+/// status board and the logs name, and the first half of [`segment_identity`].
 ///
 /// **The file name alone is not unique, and using it alone was a defect.** Every
 /// `ShardWriter` starts its counter at 1 and names files `seg_{counter:08}`
@@ -338,7 +350,7 @@ pub(crate) fn sealed_path_for(active_path: &Path) -> PathBuf {
 ///
 /// Falls back to the bare file name when there is no parent component, which
 /// only happens for a bare relative path in tests.
-pub(crate) fn segment_identity(segment: &Path) -> String {
+pub(crate) fn segment_address(segment: &Path) -> String {
     let file = segment
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -347,6 +359,30 @@ pub(crate) fn segment_identity(segment: &Path) -> String {
         Some(shard) => format!("{}/{}", shard.to_string_lossy(), file),
         None => file,
     }
+}
+
+/// A segment *instance*'s identity, `<shard-dir>/<file-name>@<created_at>`, with
+/// `created_at` the header's creation time in unix nanoseconds as 16 lowercase
+/// hex digits (the value `SinkBatch::segment_created_at` and the S3 key carry).
+/// This is the string mixed into every `RecordId` derived from the segment.
+///
+/// **The address alone is not unique either.** Segment counters restart at
+/// `seg_00000001` once a shard drains empty and the daemon restarts, or a pod
+/// comes back without its volume, so a later segment can reuse the address of
+/// one already delivered. A byte-identical record at the same index then got
+/// the delivered record's `RecordId`, and a downstream keyed on it (an
+/// `id_column` table, an idempotent HTTP endpoint) dropped an acked record as a
+/// duplicate. The header's creation time tells the two instances apart, and it
+/// is still stable across a replay of the same file.
+pub(crate) fn segment_identity(segment: &Path, created_at: i64) -> String {
+    identity_at(&segment_address(segment), created_at)
+}
+
+/// [`segment_identity`] from an address already in hand, for the socket layer,
+/// which holds the flusher's [`segment_address`] rather than a path.
+pub(crate) fn identity_at(address: &str, created_at: i64) -> String {
+    // Read as unsigned, like the batch key's `created_at`, so the width is fixed.
+    format!("{address}@{:016x}", created_at as u64)
 }
 
 /// Derives the segment counter from a segment filename regardless of which
@@ -416,6 +452,9 @@ pub(crate) trait SegmentHandle: Send {
     /// Seal the segment (sentinel + footer + fsync + atomic rename) and return
     /// the `.wab.sealed` path. Consumes the handle. Mirrors [`WabSegment::seal`].
     fn seal(self: Box<Self>) -> io::Result<PathBuf>;
+    /// The `created_at` written into this segment's header, in unix
+    /// nanoseconds. Mirrors [`WabSegment::created_at`].
+    fn created_at(&self) -> i64;
 }
 
 /// Creates segments and enumerates existing ones for a shard — the complete
@@ -481,6 +520,9 @@ impl SegmentHandle for WabSegment {
     fn seal(self: Box<Self>) -> io::Result<PathBuf> {
         WabSegment::seal(*self)
     }
+    fn created_at(&self) -> i64 {
+        WabSegment::created_at(self)
+    }
 }
 
 /// Manages the active segment for one shard. Opens the segment lazily on first write.
@@ -510,6 +552,11 @@ pub(crate) struct ShardWriter {
     /// rotation window: after a rotating write `active` is already `None` but
     /// this still names the sealed segment's last record.
     active_records: u64,
+    /// The header `created_at` of the segment `active_records` counts in — the
+    /// instance half of [`segment_identity`]. Kept, like `active_records`,
+    /// across the rotation window, so a rotating write still names the segment
+    /// it landed in.
+    active_created_at: i64,
     /// The filesystem backend. `FsSegmentStore` in production; a fault-injecting
     /// store in the DST harness. Boxed as `Arc<dyn>` so `ShardWriter` and the
     /// public `spawn` API stay free of a backend generic.
@@ -600,6 +647,7 @@ impl ShardWriter {
             active_opened_at: Instant::now(),
             active_path: None,
             active_records: 0,
+            active_created_at: 0,
             last_write_failure: None,
             store,
             metrics,
@@ -722,6 +770,7 @@ impl ShardWriter {
             let sealed = match self.active.take().unwrap().seal() {
                 Ok(sealed) => sealed,
                 Err(e) => {
+                    self.metrics.wab_seal_failures.inc();
                     self.last_write_failure = Some(WriteFailure::SegmentDropped);
                     // Cleared on this path too: leaving it pointing at a segment
                     // that no longer exists is the same "state not updated on
@@ -773,10 +822,22 @@ impl ShardWriter {
 
     /// Seals the current active segment and returns its sealed path.
     /// Returns `None` if no segment is currently open.
+    ///
+    /// On `Err` the segment is GONE, not still active: it is taken before the
+    /// seal, and `seal` consumes it. Its records stay in the unsealed `.wab`,
+    /// stranded until startup recovery seals it (same cost as the retirement in
+    /// [`fsync_current`](Self::fsync_current)); the failure is counted in
+    /// `weir_wab_seal_failures_total`.
     pub(crate) fn seal_current(&mut self) -> io::Result<Option<PathBuf>> {
         self.active_path = None;
         match self.active.take() {
-            Some(seg) => Ok(Some(seg.seal()?)),
+            Some(seg) => match seg.seal() {
+                Ok(sealed) => Ok(Some(sealed)),
+                Err(e) => {
+                    self.metrics.wab_seal_failures.inc();
+                    Err(e)
+                }
+            },
             None => Ok(None),
         }
     }
@@ -812,6 +873,15 @@ impl ShardWriter {
         self.active_records
     }
 
+    /// The header `created_at` of the segment the most recent
+    /// [`write_record`](Self::write_record) landed in — what turns
+    /// [`drain_address`](Self::drain_address) into the [`segment_identity`] the
+    /// drain mixes into that record's `RecordId`. Same validity as
+    /// [`last_record_index`](Self::last_record_index).
+    pub(crate) fn last_segment_created_at(&self) -> i64 {
+        self.active_created_at
+    }
+
     /// The address the drain will read the most recently written record from.
     ///
     /// `rotated` is whatever [`write_record`](Self::write_record) just returned:
@@ -828,11 +898,11 @@ impl ShardWriter {
     /// over so a caller never hands a producer an empty address.
     pub(crate) fn drain_address(&self, rotated: Option<&Path>) -> Option<String> {
         match rotated {
-            Some(sealed) => Some(segment_identity(sealed)),
+            Some(sealed) => Some(segment_address(sealed)),
             None => self
                 .active_path
                 .as_deref()
-                .map(|active| segment_identity(&sealed_path_for(active))),
+                .map(|active| segment_address(&sealed_path_for(active))),
         }
     }
 
@@ -843,7 +913,9 @@ impl ShardWriter {
                 .next_counter
                 .checked_add(1)
                 .expect("segment counter overflow");
-            self.active = Some(self.store.create(&path, self.shard_id, self.compression)?);
+            let created = self.store.create(&path, self.shard_id, self.compression)?;
+            self.active_created_at = created.created_at();
+            self.active = Some(created);
             // Stamp AFTER a successful create: a failed create leaves `active`
             // None, and a lifetime measured from a segment that never existed
             // would seal the next one early.
@@ -1364,6 +1436,9 @@ mod tests {
         fn seal(self: Box<Self>) -> io::Result<PathBuf> {
             self.inner.seal()
         }
+        fn created_at(&self) -> i64 {
+            self.inner.created_at()
+        }
     }
 
     /// A store whose `seal()` always fails. Writes and fsyncs pass through.
@@ -1407,6 +1482,9 @@ mod tests {
             Err(io::Error::other(
                 "injected seal failure (ENOSPC at finalize)",
             ))
+        }
+        fn created_at(&self) -> i64 {
+            self.inner.created_at()
         }
     }
 
@@ -1776,7 +1854,7 @@ mod tests {
                 .expect("a successful write always has a segment to name");
             let index = writer.last_record_index();
             predicted.push(RecordId::for_record(
-                &address,
+                &identity_at(&address, writer.last_segment_created_at()),
                 index,
                 &weir_core::Payload::copy_from_slice(payload),
             ));
@@ -1799,9 +1877,10 @@ mod tests {
 
         let mut derived: Vec<RecordId> = Vec::new();
         for segment in &sealed {
-            let identity = segment_identity(segment);
+            let reader = crate::wab::SegmentReader::open(segment).unwrap();
+            let identity = segment_identity(segment, reader.header().created_at);
             let mut read_index: u64 = 0;
-            for record in crate::wab::SegmentReader::open(segment).unwrap() {
+            for record in reader {
                 read_index += 1;
                 derived.push(RecordId::for_record(
                     &identity,

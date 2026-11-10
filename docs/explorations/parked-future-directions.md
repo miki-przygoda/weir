@@ -55,6 +55,15 @@ Parked 2026-10-15 from the safety-floor review (findings conf-durability-1 and
 conf-regressions-10). Needs a future major: it changes the id format, which is
 public SDK surface.
 
+**Status, November 2026: mostly addressed without a major.** The daemon now
+passes `RecordId::for_record` the segment *instance*,
+`<shard>/<file>@<header created_at as 16 hex digits>`, so a reused segment name
+(a restart on a drained `wab_dir`, a pod without its volume, a wiped or
+restored directory) no longer reuses ids; the SDK's API did not change. What
+is left: two instances that create same-named segments in the same nanosecond,
+and `weir-attest` and its published vectors, which still chain ids over the
+bare `<shard>/<file>` name. The rest of this entry is the original analysis.
+
 **The issue.** `RecordId::for_record` (weir-sink-sdk) is SHA-256 over the
 segment identity, the record's index in the segment and the payload. The
 segment identity is the file's path relative to `wab_dir`

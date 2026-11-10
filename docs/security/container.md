@@ -300,9 +300,13 @@ two places it controls:
 
 - **Out of logs.** The token is logged only as a presence boolean
   (`bearer = true|false`), never its value; its `Debug` impl renders
-  `<redacted>` (`crates/weir-server/src/sink/http.rs`). A sink URL's password
-  is run through `redact_url_password` before it reaches a log line, and the
-  `Config: Debug` impl wraps the URL in a redacting newtype.
+  `<redacted>` (`crates/weir-server/src/sink/http.rs`). The HTTP sink logs
+  only the `scheme://host[:port]` of its URL (startup line, transport errors,
+  health reason, admin status text), and only the origin of a redirect's
+  `Location`, and cuts its path and query out of an error body that echoes
+  them, since a webhook path or a presigned query can itself be the secret. The SQL sinks run a URL through
+  `redact_url_password` before it reaches a log line, and the `Config: Debug`
+  impl wraps the URL in a redacting newtype.
 - **Out of argv.** The bearer token is env-only by design — it is never
   sourced from a `--sink-*` flag or the TOML config file (so it does not
   appear in the process command line or on disk). This is documented in

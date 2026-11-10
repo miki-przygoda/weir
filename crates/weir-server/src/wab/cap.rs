@@ -10,6 +10,13 @@
 //! must NOT call this (the last value stands: fail-closed).
 use std::sync::atomic::{AtomicBool, Ordering};
 
+/// The `wab_bytes_now` value that means "no scan has measured the WAB yet":
+/// a failed startup scan stores it (spec §6 step 9). It is above every cap,
+/// so the push path's `evaluate` keeps the fail-closed flag set instead of
+/// releasing it against an unmeasured 0, until a poll scan stores a real
+/// size. Readers that report the size map it back to 0.
+pub(crate) const BYTES_UNKNOWN: u64 = u64::MAX;
+
 /// The level below which a rejecting cap releases. Divides before
 /// multiplying: `cap * 9` overflows above `u64::MAX / 9`, and the rounding
 /// loss is at most 9 bytes.

@@ -204,8 +204,12 @@ one coordinate — a trailing byte means the two ends disagree about the layout,
 and quietly using the prefix is how that disagreement becomes a wrong address.
 
 `record_id` is `SHA-256` over
-`segment_len ++ segment ++ index ++ payload_len ++ payload`, every length a
-little-endian `u64`. It is byte-identical to the per-record idempotency key the
+`identity_len ++ identity ++ index ++ payload_len ++ payload`, every length a
+little-endian `u64`, where `identity` is `segment`, then `@`, then the segment
+header's creation time in unix nanoseconds as 16 lowercase hex digits (e.g.
+`shard_00/seg_00000001.wab.sealed@18d2c17997b60400`). The creation time is not
+in the coordinate; it is what tells a segment apart from a later one that
+reuses its file name. It is byte-identical to the per-record idempotency key the
 daemon's drain hands a sink (the HTTP sink's `Idempotency-Key: sha256:<hex>`),
 which is what lets a producer correlate what it sent with what the downstream
 received. The length framing is what stops `("ab", 1)` and `("a", 0xb…)` from
@@ -378,7 +382,7 @@ protocol error ⇒ close" contract. The mapping is:
 | Body-decode failure | Nack reason |
 |---|---|
 | a zero-length record | `EmptyPayload` (`0x07`) |
-| more than `max_batch_records` records, or one over `max_payload_bytes` | `PayloadTooLarge` (`0x04`) |
+| more than `max_batch_records` records, or one over `max_payload_bytes` (the whole body is already capped at `max_payload_bytes` by the frame-length check, before it is read) | `PayloadTooLarge` (`0x04`) |
 | anything else — bad batch version, `record_count == 0`, a record length that disagrees with the body, trailing bytes | **`BadBatchFraming` (`0x0B`)** |
 
 `BadBatchFraming` is the reason a client sees for most malformed `PushBatch`
@@ -713,7 +717,11 @@ A non-Rust client that satisfies the following is wire-compatible:
       a priori. Treat a `Nack(PayloadTooLarge 0x04)` as **authoritative**: the
       frame exceeded the daemon's effective cap regardless of the client's own
       estimate. Sending larger frames is wasted I/O; the daemon closes the
-      connection after the Nack without reading the payload.
+      connection after the Nack without reading the payload. For a
+      `PushBatch` the cap applies to the **whole batch body**, not to each
+      record: a batch of records that each fit can still be refused.
+      `weir-client`'s `push_batch` checks the encoded body against the hard
+      cap locally and returns a recoverable `ClientError::PayloadTooLarge`.
 - [ ] Handles connection close mid-stream as "in-flight requests had
       unknown outcomes; retry on a fresh connection."
 

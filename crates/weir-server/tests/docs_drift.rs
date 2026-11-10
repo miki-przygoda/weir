@@ -1837,3 +1837,260 @@ fn the_threat_model_covers_the_health_listener_and_the_admin_socket() {
         problems.join("\n  ")
     );
 }
+
+const POSTGRES_SRC: &str = include_str!("../src/sink/postgres.rs");
+
+/// Every SQLSTATE the Postgres sink retries must be named as transient in the
+/// configuration reference and in the module doc. `25006` was made transient
+/// while both still said it dead-letters the batch.
+#[test]
+fn every_transient_postgres_sqlstate_is_documented() {
+    let body = POSTGRES_SRC
+        .split("pub(crate) fn is_transient_sqlstate")
+        .nth(1)
+        .expect("postgres.rs no longer defines is_transient_sqlstate; update this guard")
+        .split("\n}\n")
+        .next()
+        .unwrap();
+    let codes: Vec<&str> = body
+        .lines()
+        .filter(|l| l.trim_start().starts_with("||") || l.contains("state =="))
+        .filter_map(|l| l.split("// ").nth(1))
+        .map(|c| c.split_whitespace().next().unwrap_or(""))
+        .filter(|c| c.len() == 5 && *c != "23505")
+        .collect();
+    assert!(codes.len() >= 7, "parsed too few SQLSTATEs: {codes:?}");
+    let table = CONFIGURATION
+        .split("### Sink: Postgres")
+        .nth(1)
+        .expect("configuration.md has no Postgres section")
+        .split("#### Error classification")
+        .nth(1)
+        .expect("Postgres section has no Error classification table")
+        .split("####")
+        .next()
+        .unwrap();
+    let module_doc: String = POSTGRES_SRC
+        .lines()
+        .filter(|l| l.starts_with("//!"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut problems = Vec::new();
+    for code in &codes {
+        let tick = format!("`{code}`");
+        if !table
+            .lines()
+            .any(|l| l.contains(&tick) && l.contains("| transient |"))
+        {
+            problems.push(format!("configuration.md: no transient row for {code}"));
+        }
+        if !module_doc.contains(&tick) {
+            problems.push(format!("postgres.rs module doc: no mention of {code}"));
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+const DOCS_YML: &str = include_str!("../../../.github/workflows/docs.yml");
+
+/// docs.yml documents its `workflow_dispatch` trigger as the way to deploy the
+/// site on demand, so the steps that publish (the Pages upload and the deploy
+/// job) must run on a manual run of main, not only on a push. Gating them on
+/// `push` alone made a manual run build the book and publish nothing.
+#[test]
+fn a_manual_docs_run_on_main_publishes_the_site() {
+    assert!(
+        DOCS_YML.lines().any(|l| l.trim() == "workflow_dispatch:"),
+        "docs.yml no longer has a workflow_dispatch trigger"
+    );
+    let gates: Vec<&str> = DOCS_YML
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("if:") && l.contains("github.event_name"))
+        .collect();
+    assert_eq!(
+        gates.len(),
+        2,
+        "expected the upload-pages-artifact step and the deploy job to be the \
+         two event-gated publish steps in docs.yml, found {gates:?}"
+    );
+    for gate in gates {
+        assert!(
+            gate.contains("'workflow_dispatch'") && gate.contains("'push'"),
+            "a docs.yml publish gate skips manual runs:\n  {gate}"
+        );
+        assert!(
+            gate.contains("github.ref == 'refs/heads/main'"),
+            "a docs.yml publish gate no longer limits publishing to main:\n  {gate}"
+        );
+    }
+}
+
+const SINK_SDK_LIB: &str = include_str!("../../weir-sink-sdk/src/lib.rs");
+const INTEGRATING: &str = include_str!("../../../docs/getting-started/integrating.md");
+
+/// A document's prose with rustdoc markers stripped and whitespace collapsed,
+/// so a phrase is found however the lines were wrapped.
+fn prose(src: &str) -> String {
+    src.lines()
+        .map(|l| {
+            let t = l.trim_start();
+            t.strip_prefix("//!")
+                .or_else(|| t.strip_prefix("///"))
+                .unwrap_or(t)
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// `DedupToken` is a hash of a batch's bytes alone, so two distinct batches
+/// with the same bytes (a heartbeat every 30 s, one per timed-seal segment)
+/// share it, and a downstream that dedups on it drops the second while weir
+/// deletes it. The built-in ClickHouse and HTTP NDJSON sinks stopped sending
+/// it for that reason, but the sink-SDK docs and the integration guide went on
+/// telling third-party authors it was fine where a duplicate is cheap.
+#[test]
+fn no_doc_offers_the_content_only_dedup_token_as_a_downstream_key() {
+    let docs = [
+        ("crates/weir-sink-sdk/src/lib.rs", prose(SINK_SDK_LIB)),
+        ("docs/getting-started/integrating.md", prose(INTEGRATING)),
+        ("docs/architecture.md", prose(ARCHITECTURE)),
+    ];
+    let stale = [
+        "Fine for an archive",
+        "keeps deduplicating",
+        "`dedup_token()` is simpler",
+        "should instead read [`SinkBatch::dedup_token`] and pass it along",
+        "pass it downstream if your target can deduplicate on one",
+        "forward to a downstream capable of deduplicating on it",
+        "correctly — the same token",
+    ];
+    let mut problems = Vec::new();
+    for (path, text) in &docs {
+        for phrase in stale {
+            if text.contains(phrase) {
+                problems.push(format!("{path} still says {phrase:?}"));
+            }
+        }
+    }
+    for (path, text) in &docs[..2] {
+        if !text.contains("heartbeat") || !text.contains("segment_created_at") {
+            problems.push(format!(
+                "{path} must name the heartbeat hazard and the coordinate key \
+                 (segment_created_at, first RecordId, count) a sink can build instead"
+            ));
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// The shipped example config and the server crate's feature comments are
+/// read by operators who never open `docs/sinks/batch-keys.md`. After the
+/// ClickHouse and HTTP NDJSON sinks moved to the coordinate batch key, the
+/// example still called the NDJSON `Idempotency-Key` "the batch's DedupToken"
+/// and the `clickhouse-sink` feature still promised a "content-derived" token.
+#[test]
+fn shipped_config_comments_name_the_coordinate_batch_key() {
+    const SERVER_MANIFEST: &str = include_str!("../Cargo.toml");
+    let hash_prose = |src: &str| {
+        src.lines()
+            .map(|l| l.trim_start().trim_start_matches('#'))
+            .collect::<Vec<_>>()
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let example = hash_prose(CONFIG_EXAMPLE);
+    let manifest = hash_prose(SERVER_MANIFEST);
+    let mut problems = Vec::new();
+    for (path, text) in [
+        ("deploy/docker/weir.toml.example", &example),
+        ("crates/weir-server/Cargo.toml", &manifest),
+    ] {
+        for phrase in ["batch's DedupToken", "content-derived dedup token"] {
+            if text.contains(phrase) {
+                problems.push(format!("{path} still says {phrase:?}"));
+            }
+        }
+    }
+    if !example.contains("segment created_at, first RecordId, record count") {
+        problems.push(
+            "deploy/docker/weir.toml.example must say the NDJSON key is a sha256 of the \
+             batch coordinate (segment created_at, first RecordId, record count)"
+                .to_owned(),
+        );
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
+/// `weir-attest` chains `RecordId::for_record` over the segment's file-name
+/// identity `shard_NN/<file>` and the record index. Since every `RecordId`
+/// the drain delivers gained `@<created_at hex>`, that is no longer the id a
+/// sink receives, so a chain head cannot be recomputed from a downstream's
+/// `id_column` values or `Idempotency-Key`s. The attest docs went on saying it
+/// could, and that the chain input is the id the drain hands a sink.
+#[test]
+fn attest_docs_do_not_promise_a_head_recomputable_from_delivered_ids() {
+    const ATTEST_CHAIN: &str = include_str!("../../weir-attest/src/chain.rs");
+    const ATTEST_VERIFY: &str = include_str!("../../weir-attest/src/verify.rs");
+    const ATTEST_MANIFEST: &str = include_str!("../../weir-attest/Cargo.toml");
+    const ATTEST_README: &str = include_str!("../../weir-attest/README.md");
+    const CONFORMANCE: &str = include_str!("../../../docs/conformance.md");
+    let text = |src: &str| {
+        src.lines()
+            .map(|l| {
+                let t = l.trim_start();
+                t.strip_prefix("//!")
+                    .or_else(|| t.strip_prefix("///"))
+                    .or_else(|| t.strip_prefix("//"))
+                    .or_else(|| t.strip_prefix('#'))
+                    .unwrap_or(t)
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let docs = [
+        ("crates/weir-attest/src/chain.rs", text(ATTEST_CHAIN)),
+        ("crates/weir-attest/Cargo.toml", text(ATTEST_MANIFEST)),
+        ("docs/architecture.md", text(ARCHITECTURE)),
+        ("docs/monitoring.md", text(MONITORING)),
+        ("docs/security/threat-model.md", text(THREAT_MODEL)),
+        ("crates/weir-attest/README.md", text(ATTEST_README)),
+        ("crates/weir-attest/src/verify.rs", text(ATTEST_VERIFY)),
+        ("docs/conformance.md", text(CONFORMANCE)),
+    ];
+    let stale = [
+        "recomputed from the downstream's rows",
+        "verifiable against the downstream's own rows",
+        "already-frozen `RecordId`",
+        "what a sink could recompute",
+        "that is exactly why it is the right input here",
+        "so a client that reproduces it can correlate",
+    ];
+    let mut problems = Vec::new();
+    for (path, text) in &docs {
+        for phrase in stale {
+            if text.contains(phrase) {
+                problems.push(format!("{path} still says {phrase:?}"));
+            }
+        }
+    }
+    // The five places that made the claim must now state the limit and point
+    // at the epic that would restore it.
+    for (path, text) in &docs[..5] {
+        if !text.contains("cannot be recomputed") || !text.contains("attest-disposal-log") {
+            problems.push(format!(
+                "{path} must say a head cannot be recomputed from the ids weir \
+                 delivers to sinks, and point to the attest-disposal-log epic"
+            ));
+        }
+    }
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}

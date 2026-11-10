@@ -14,10 +14,14 @@ use weir_core::{Durability, Payload};
 #[derive(Debug)]
 pub struct RecordSlot {
     /// The segment's address in the buffer, `<shard-dir>/<sealed-file-name>` —
-    /// the string the drain will mix into this record's `RecordId`.
+    /// the coordinate's `segment`, and with `created_at` the string the drain
+    /// will mix into this record's `RecordId` (`wab::segment::identity_at`).
     pub segment: String,
     /// The record's 1-based ordinal within that segment.
     pub index: u64,
+    /// The segment header's `created_at` (unix nanoseconds), which tells this
+    /// segment apart from a later one that reuses its name.
+    pub created_at: i64,
 }
 
 /// What the WAB flusher tells the socket handler about one record.
@@ -30,7 +34,7 @@ pub struct AckOutcome {
     /// a `PushTracked` **and** the write actually reached a segment.
     ///
     /// Boxed because it rides in the flusher's per-batch pending-ack vectors:
-    /// unboxed it would grow every element from 8 to 40 bytes for a field the
+    /// unboxed it would grow every element from 8 to 48 bytes for a field the
     /// overwhelming majority of records leave empty. The allocation happens only
     /// for a tracked push.
     pub coordinate: Option<Box<RecordSlot>>,

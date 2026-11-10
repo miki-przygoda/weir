@@ -611,11 +611,22 @@ weir-ctl attest head   --wab-dir /var/lib/weir/wab               # print the new
 ```
 
 `seal` writes a `<segment>.wab.sealed.attest` sidecar per sealed segment,
-chaining each record's already-frozen `RecordId` into a running SHA-256 and
+chaining each record's `RecordId::for_record` over the segment's file-name
+identity `<shard>/<segment>` and the record index into a running SHA-256 and
 linking the segment's start hash to the previous segment's head. `verify`
 re-reads every byte and recomputes the chain from nothing — seconds on a
 256 MiB segment, so it is an audit operation, not a health check, and must
 never be wired into a readiness probe.
+
+That chain input is **not** the id weir delivers to sinks: since the
+`RecordId` change, a delivered id also carries `@<created_at hex>`, so a head
+cannot be recomputed from a downstream's `id_column` values or
+`Idempotency-Key`s, only from the sealed segments themselves. Chaining over
+the delivered id needs a versioned sidecar and is planned in the
+attest-disposal-log epic
+(`docs/superpowers/temper/epics.md`); until
+then the input is unchanged, so existing `.attest` sidecars keep verifying
+across the upgrade.
 
 **Records in an active, unsealed segment are not chained at all** — only
 `seal` puts anything into the chain, and it only ever sees sealed segments.
@@ -1136,6 +1147,7 @@ exposition; histograms expose `_bucket` / `_sum` / `_count`.
 |---|---|---|
 | `weir_wab_fsync_duration_seconds` | histogram | **The dominant latency signal.** Per-fsync duration. |
 | `weir_wab_fsync_failures_total` | counter | fsync returned an error. **Must be 0.** The failing batch is nacked, and the active segment is *retired* so no later batch can be acked over the hole. Nothing at runtime rescans an unsealed `.wab`, so any already-acked records left in that segment (up to `wab_segment_max_bytes`, 256 MiB by default) are **stranded until the daemon restarts** and crash recovery seals them. Stranded, not lost — but clear the storage fault and restart to release them. |
+| `weir_wab_seal_failures_total` | counter | A segment seal (size rotation, `segment_max_age` / `segment_max_lifetime` timer, or shutdown) returned an error — sentinel, footer, fsync or rename. **Must be 0.** The segment is retired unsealed and is **not** retried: its already-acked records stay in the `.wab`, which nothing at runtime rescans, so they are **stranded until the daemon restarts** and crash recovery seals and delivers them. Stranded, not lost — clear the storage fault and restart to release them. |
 | `weir_wab_group_commit_records` | histogram | Records covered by one WAB group fsync — the fsync amortisation factor. **1.0 means every record paid for its own fsync**, which is the condition that makes a round-trip-bound producer slow for a reason batching cannot fix, and the condition under which adding concurrency helps far more than adding batching. Read it together with `weir_wab_fsync_duration_seconds`: the two multiply into the per-record durable cost. |
 | `weir_wab_flusher_panics_total` | counter | Flusher thread panics. **Must be 0.** |
 | `weir_drain_panics_total` | counter | weir-drain thread panics caught and respawned by its supervisor. **Must be 0**; sustained values indicate a sink/drain logic bug, and exhausting the respawn budget stops delivery. |

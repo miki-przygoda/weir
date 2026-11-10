@@ -114,7 +114,8 @@ delivers it to ClickHouse later
   a process crash but not power loss
   ([WAB](../architecture.md#wab-srcwab)).
 - The sink sends one `INSERT INTO db.table (col) FORMAT RowBinary` per batch,
-  with `insert_deduplication_token = sha256(batch)`. It needs the opt-in
+  with an `insert_deduplication_token` derived from the batch's place in the
+  buffer ([batch key](../sinks/batch-keys.md)). It needs the opt-in
   `clickhouse-sink` build feature
   ([ClickHouse sink](../operations/configuration.md#sink-clickhouse-sink_type--clickhouse)).
 - Records go into **one `String` column** as opaque bytes; the target column
@@ -220,7 +221,7 @@ cases, and this page has nothing to add to that.
   to at least 1,000.** Its default is 100, which is below ClickHouse's own
   minimum recommendation. Its range is 1–10,000. Each `Sink::commit` is one
   `INSERT` and so at least one part.
-- **Then never change it.** The dedup token hashes the batch, so a different
+- **Then never change it.** The dedup token names the batch, so a different
   batch size re-splits a replayed segment into batches ClickHouse has not seen,
   and you get duplicates (same section).
 - **Use a dedup-capable engine,** and keep the dedup window larger than the

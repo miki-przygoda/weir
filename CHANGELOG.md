@@ -15,7 +15,247 @@ protocol** below.
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+- The HTTP sink now prints only the `scheme://host[:port]` of `sink_url`
+  in its startup `sink: http` log line, its transport-error retries, its
+  health `Down` reason and the admin status text. A 3xx dead-letter reason
+  names only the origin of its `Location`, and a 4xx/5xx body excerpt has
+  the configured path and query cut out. A webhook token in the path or a
+  presigned signature in any query key used to be printed in full, because
+  the redactor only knew userinfo and ten query keys, and an http-to-https
+  redirect or an echoing error body (`Cannot POST /path`) printed it too.
+  On upgrade: nothing to migrate, but a log search or alert that matched
+  the full URL in these lines no longer matches.
+- A config file that does not parse now names the line and column (or the
+  key) and what was expected, without quoting the offending line or value.
+  A TOML syntax error used to print the whole source line to stderr, and a
+  wrongly typed value was quoted, so a credential on that line was logged.
+  On upgrade: a config that parses is unaffected; only the wording of the
+  error for one that does not changes.
+- The ClickHouse sink's `insert_deduplication_token` and the HTTP sink's
+  NDJSON-mode `Idempotency-Key` are now a sha256 of the batch's place in
+  the buffer (segment `created_at`, first `RecordId`, record count; see
+  `docs/sinks/batch-keys.md`) instead of the batch's `DedupToken`. Two
+  segments that each held a byte-identical record, such as a heartbeat
+  every 30 s, shared a key, so ClickHouse dropped the second block with a
+  200 and an idempotent endpoint replayed its cached 2xx, and weir deleted
+  acked records with no error. After upgrading, a batch that was in flight
+  at the upgrade is re-sent once under the new key, so ClickHouse and an
+  idempotent HTTP endpoint may see it twice, once. HTTP per-record mode is
+  unchanged. The sink-SDK docs and the integration guide no longer offer
+  `DedupToken` as a downstream key where a duplicate is cheap: a custom
+  sink should key on `record_ids()` or build the same coordinate key. The
+  example config's `sink_send_idempotency_key` comment and the
+  `clickhouse-sink` feature comment now say so too.
+  A batch built without segment context still sends its `DedupToken`,
+  whose digest is unchanged from 1.x and is pinned again in both
+  `weir-sink-sdk` and the ClickHouse sink tests.
+- An explicit `admin_socket_path` reached through a symlink to `wab_dir`
+  (`/data/wab/admin.sock` when `/data` links to `/mnt/x`) is now refused at
+  startup as inside `wab_dir`. The check compared the path as written with
+  the canonical `wab_dir`, so the admin socket could be bound inside the WAB.
+  On upgrade: a deployment whose `admin_socket_path` resolves into `wab_dir`
+  this way fails to start until the path is moved outside `wab_dir`.
+- Every `RecordId` now names the segment instance, `shard_NN/<file>@<the
+  segment header's created_at as 16 hex digits>`, not just its file name.
+  Segment names restart at `seg_00000001` once a shard drains empty and the
+  daemon restarts, or a pod is redeployed without its volume, so a
+  byte-identical record such as a heartbeat got the id of one already
+  delivered: a Postgres/MySQL `id_column` table dropped it, an idempotent
+  HTTP endpoint replayed its cached 2xx in per-record mode, and weir deleted
+  an acked record with no error. Every `RecordId` value changes once at the
+  upgrade, so per-record HTTP `Idempotency-Key`s, `id_column` values, S3
+  object names and the ClickHouse/NDJSON batch keys (which include the first
+  `RecordId`) differ for records delivered after it. A record in flight at
+  the upgrade is re-sent once under its new id, so an `id_column` table may
+  hold it twice, once. A tracked push's coordinate keeps its `segment`
+  string; its `record_id` follows the new form. `weir-attest` still chains
+  over the bare `<shard>/<segment>` so existing `.attest` sidecars keep
+  verifying, which means an attest head can no longer be recomputed from a
+  downstream's `id_column` values or `Idempotency-Key`s, and the docs that
+  said it could now say so.
+
+### Fixed
+
+- The system test `sigterm_unlinks_the_socket_at_once_and_metrics_stay_up_until_exit`
+  now makes one HealthCheck round-trip on its idle connection before
+  SIGTERM. It sent SIGTERM before the daemon had accepted that connection,
+  so on a loaded machine the kernel reset it from the listen backlog
+  (ECONNRESET) and the test failed, though the lame duck promises EOF only
+  to accepted idle connections.
+- A daemon whose startup WAB size scan failed with `wab_max_bytes` set now
+  nacks pushes until a scan succeeds, and accepts them again when the first
+  poll scan that succeeds finds the WAB below the cap. The first push
+  released the fail-closed flag, judging the unscanned WAB as 0 bytes, so a
+  WAB already over the cap took writes, without bound while every later scan
+  failed. And once a scan succeeded, the flag went through the cap's
+  hysteresis, so a WAB between low water (90% of the cap) and the cap could
+  keep pushes nacked and `/readyz` at 503 `wab_cap_rejecting`.
+- `deploy/smoke-test.sh` now says it pushes and acks 20 records across
+  both durability tiers. It said 30 across three, though `push_simple`
+  pushes only `Durable` and `Buffered` since the `Batched` tier was retired.
+- An unknown `sink_type` (a typo such as `s4`) is now rejected with a
+  message that lists `s3` among the valid sink types. The list named
+  only `noop`, `http`, `mysql`, `postgres` and `clickhouse`, though
+  `--help` and the parser both accept `s3`.
+- A `PushBatch` the daemon refuses whole at admission (the `wab_max_bytes`
+  cap rejecting, or the `wab_dir` lost to another instance) now adds its
+  record count to `weir_records_nack_total{reason="internal_error"}` and
+  `weir_records_nack_internal_total{cause}`. It added 1 per frame, while both
+  are per-record counters, so rate panels undercounted refused records by up
+  to the batch size.
+- `--sink-mysql-id-column` and `--sink-postgres-id-column` on a build
+  without the matching sink feature are now rejected with a message naming
+  the feature to rebuild with, as `--help` says. They got the generic
+  "unknown arguments" error, because the feature-gated flag table did not
+  list them.
+- A manual run of the "Publish docs" workflow on `main` now deploys the
+  site, as its `workflow_dispatch` comment says. The Pages upload step and
+  the deploy job ran only on a push, so a manual run built the book and
+  published nothing.
+- The TypeScript and Python demo wire clients now treat a Nack frame
+  with an empty payload as a stream desync and close the connection, as
+  the Rust client does. Both read the missing reason byte as
+  `InternalError`, the one transient reason, so a caller kept using a
+  desynced connection. The Python client's `health_check` does the same:
+  it returned `False` on an empty Nack and kept the stream open. CI's
+  conformance job now runs both regression tests (`test_empty_nack.py`,
+  `desync_empty_nack.ts`).
+- The TypeScript demo wire client and the Python client's `health_check`
+  now treat a reply of the wrong kind as a stream desync, as the Rust
+  client does. The TypeScript client (a `HealthCheckResponse` to a Push,
+  an `Ack` to a HealthCheck, either to a PushTracked, an `AckTracked` to a
+  Push or HealthCheck, a reply of an unknown type) rejects the request it
+  answered and closes the connection. It resolved a Push answered with a
+  `HealthCheckResponse` as acked, a false ack, and left a request answered
+  with an untracked `AckTracked` or an unknown type pending forever, past
+  its timeout. The Python `health_check` (an `Ack`, an `AckTracked` or an
+  unknown type) closes the connection and raises `WeirError`; it returned
+  `False` and kept the stream open. CI's conformance job now runs the
+  regression tests (`desync_crossed_reply.ts`, and `test_empty_nack.py`
+  for the Python case).
+- The chaos harness's `run-soak.sh` banner and the `SETUP.md` that
+  `capture-setup.sh` writes into each run directory now state the fault
+  the schedule runs, from the orchestrator's own `faults.describe`. Both
+  said "Phase 1, `kill -9` only, no dm-flakey" for every schedule, so a
+  `power_loss` or lifecycle-trigger run archived a record claiming it
+  had cut no power.
+- `deploy/run_bare_metal_bench.sh` now reports the mount options of the
+  filesystem that holds the WAB test directory. It looked the device name up
+  in `/proc/mounts` and took the first match, so on a tmpfs `/tmp` the header
+  printed `/run`'s options.
+- The test that `weir_drain_state` and `weir_sink_health` exist on the first
+  scrape now matches each whole sample line. It matched bare words such as
+  `draining`, which the `weir_drain_state` HELP text contains, so it passed
+  with the `draining` label never created.
+- The `weir starting` log line and the admin config view no longer print a
+  `sink_url` or `sink_s3_endpoint` whose userinfo has no `@host` after it
+  (`mysql://weir:password`). The `user:password` was taken for `host:port`
+  and printed in full; such a URL now shows as `<unparseable>`.
+- The configuration reference no longer says `max_batch_records` and
+  `max_payload_bytes` multiply. `max_payload_bytes` caps a whole `PushBatch`
+  body, so a batch whose records each fit but whose body does not gets
+  `Nack(PayloadTooLarge)` and a closed connection; the docs now say so.
+- `WeirClient::push_batch` now rejects a batch whose encoded body exceeds
+  the 16 MiB protocol hard cap locally, as a recoverable
+  `ClientError::PayloadTooLarge`, even when every record fits. It used to
+  send the frame, get `Nack(PayloadTooLarge)` back and poison the
+  connection.
+- `weir-ctl attest seal` and `attest verify` now treat only `shard_<N>`
+  directories under `wab_dir` as shards, as the daemon does. A foreign
+  directory the weir user cannot read, such as a root-owned `lost+found` when
+  `wab_dir` is a mount root, no longer makes every `seal` exit 1 with no shard
+  chained, nor every `verify` exit 2 with `weir_attest_verify_failures` above 0.
+  `weir-ctl segments` (with or without `--files`) and the offline
+  `weir-ctl status` scan use the same rule, so such a directory no longer
+  shows as a phantom empty shard row.
+- The MySQL sink now strands, rather than dead-letters, a batch that fails
+  with server error `1040` (`ER_CON_COUNT_ERROR`, too many connections),
+  `1203` (`ER_TOO_MANY_USER_CONNECTIONS`) or `1053` (`ER_SERVER_SHUTDOWN`), as
+  the Postgres sink already does for pool errors and `57P01`. A server at its
+  `max_connections` limit, or a routine MySQL restart, no longer dead-letters
+  acked records.
+- The Postgres sink now strands, rather than dead-letters, a batch the
+  server rejects with SQLSTATE `25006` (`read_only_sql_transaction`), as the
+  MySQL sink already does for its read-only error `1290`. A sink URL that
+  points at a hot standby after a failover, or a database with
+  `default_transaction_read_only = on` during maintenance, no longer
+  dead-letters the acked backlog while the condition lasts. The
+  configuration reference and the sink's module doc list `25006` as
+  transient.
+- The S3 sink now strands, rather than dead-letters, a batch that S3 or
+  MinIO rejects with `400 AuthorizationHeaderMalformed`, the answer to a
+  request signed for the wrong region. A `sink_s3_region` that does not match
+  the bucket or endpoint, such as the `us-east-1` default for a bucket in
+  `eu-west-1`, no longer dead-letters the whole acked backlog.
+- Startup now refuses, in preflight and before recovery, a `socket_path`
+  whose parent directory is missing, not a directory, or not writable by the
+  daemon user. Before, the refusal came only at the producer-socket bind,
+  after the drain had begun replaying the backlog, so under
+  `Restart=on-failure` each restart re-delivered the head of the oldest
+  unconfirmed segment.
+- The ClickHouse sink now redacts its transport errors, so a password
+  passed as a `?password=` query parameter in the sink URL no longer appears
+  in the drain's WARN retry log, the sink failure status, the health
+  probe's error or the startup error for a non-http(s) URL such as a
+  `tcp://` native-protocol DSN.
+- A failed timed seal (`segment_max_age` or `segment_max_lifetime`) no longer
+  logs that the segment "stays active" and will be retried: it was already
+  retired, so its acked records were silently stranded in the unsealed `.wab`
+  until a restart. The failure is now logged at ERROR saying so, and every
+  failed seal is counted in the new `weir_wab_seal_failures_total`.
+- Startup recovery and replay now treat only `shard_<N>` directories under
+  `wab_dir` as shards, so a foreign directory the daemon cannot read, such as
+  a root-owned `lost+found` when `wab_dir` is a mount root, no longer fails
+  startup, no longer marks every drain rescan incomplete, and no longer fails
+  every WAB size scan, which with `wab_max_bytes` set refused every push for
+  good.
+- Recovery now fsyncs `wab_dir` after creating `quarantine/`, so the copy of
+  a mid-file-corrupt segment, the only place the acked records after the
+  corruption survive once the original is truncated, can no longer be lost
+  with the directory on power loss. A failed fsync leaves the segment
+  untouched.
+- Startup now fsyncs `wab_dir` after creating the `shard_NN` directories, so
+  the first `Durable` acks on a fresh `wab_dir` no longer land in a shard
+  directory whose own entry a power loss could still remove. A failed fsync
+  fails startup.
+- A `WEIR_*` environment variable that is not valid UTF-8 no longer has its
+  value printed in the startup error: the message names the variable only, so
+  a secret such as `WEIR_SINK_URL`'s credentials or
+  `WEIR_SINK_S3_SECRET_ACCESS_KEY` no longer reaches stderr or the journal.
+- A misspelt `log_level` such as `warning` or `information` no longer turns
+  every log line off without a word: `tracing` took a bare unknown word as a
+  target name, so nothing from weir matched. A bare word must now be a level
+  name; anything else is logged as a WARN and the daemon logs at `info`. A
+  single target is still written `target=level`.
+- The monitoring smoke test's "drain state = Draining" check now fails when a
+  non-chaos instance's drain has stopped or its `weir_drain_state` series is
+  missing: it summed only the `retrying_transient` and
+  `blocked_dead_letter_full` states, so a drain that had exited passed.
+- `deploy/smoke-test.sh` now fails when `weir-server` exits non-zero or
+  crashes on SIGTERM, and prints its log: the shutdown step only polled
+  `kill -0` and never read the exit status, so a failed shutdown passed as
+  "exited cleanly".
+- The chaos harness's Foundations gate (`chaos/orchestrator/gate.py`) now
+  refuses a run dir named twice: `runs/A` and `runs/A/` (or a symlink to it)
+  were keyed apart, so the run's cuts counted twice and a campaign could pass
+  the 1,000-cut and 200-per-schedule floors with half the cuts.
+- `deploy/smoke-test.sh` no longer reports a metric that is present as
+  missing from `/metrics` on about half its runs: it piped `echo | grep -q`
+  under `pipefail`, so `grep -q` exiting on the first match failed `echo` with
+  SIGPIPE. It now reads the body from a here-string, as `docker.yml` does.
+- Crash recovery no longer destroys acked records behind a corrupted record
+  length that is under the cap but runs past the end of the segment: it took
+  the short payload read for a torn tail and truncated with only a WARN. When
+  a shorter prefix of the bytes on disk matches the record's CRC, the segment
+  is now copied to `quarantine/` and counted, as the CRC-mismatch,
+  oversized-length and zero-length branches already did.
+- The DST repro line, `WEIR_DST_SEED=0x… cargo test -p weir-server
+  --features dst dst::`, now replays the failing seed: the random-seed sweep
+  reads `WEIR_DST_SEED` and runs only that seed. Nothing read the variable,
+  so the command reran the default 16-seed sweep and passed green while the
+  invariant violation was still there.
 
 ## [4.1.0] - 2026-10-26
 

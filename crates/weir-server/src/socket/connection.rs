@@ -26,6 +26,7 @@ use crate::{
     },
     models::{AckOutcome, WorkUnit},
     queue::QueueSender,
+    wab::segment::identity_at,
 };
 
 /// How long `handle_connection` waits for the queue to accept a work unit before
@@ -426,14 +427,25 @@ where
                     if refusal == AdmissionRefusal::WabCap {
                         metrics.wab_cap_rejections.inc();
                     }
+                    // The nack counters are per RECORD (see the `inc_by`
+                    // below), so a refused batch counts every record it
+                    // carried. The count comes from the bounded decoder, never
+                    // the peer-declared header field alone; a body that does
+                    // not decode still counts as one refused push.
+                    let refused = weir_core::decode_batch_body(
+                        payload.as_ref(),
+                        config.max_batch_records,
+                        config.max_payload_bytes,
+                    )
+                    .map_or(1, |records| records.len() as u64);
                     metrics
                         .records_nack
                         .get_or_create(&NackLabel {
                             tier: tv,
                             reason: MetricNack::internal_error,
                         })
-                        .inc();
-                    count_internal_nack(&metrics, refusal.cause(), 1);
+                        .inc_by(refused);
+                    count_internal_nack(&metrics, refusal.cause(), refused);
                     continue;
                 }
 
@@ -650,7 +662,14 @@ where
             let coordinate = outcome
                 .coordinate
                 .map(|slot| {
-                    let record_id = RecordId::for_record(&slot.segment, slot.index, &payload);
+                    // The id names the segment INSTANCE (address plus header
+                    // `created_at`), exactly as the drain derives it; the
+                    // coordinate carries the address alone.
+                    let record_id = RecordId::for_record(
+                        &identity_at(&slot.segment, slot.created_at),
+                        slot.index,
+                        &payload,
+                    );
                     RecordCoordinate::new(slot.segment, slot.index, *record_id.as_bytes())
                 })
                 .transpose();
@@ -1177,6 +1196,10 @@ mod tests {
         client
     }
 
+    /// The header `created_at` every slot from [`spawn_handler_with_slot`]
+    /// reports: `0x18d2c17997b60400`.
+    const SLOT_CREATED_AT: i64 = 1_788_704_730_000_000_000;
+
     /// Spawns a handler whose flusher acks durable and reports `slot` as the
     /// record's address — the shape of a real `PushTracked` round trip without
     /// standing up a WAB.
@@ -1195,6 +1218,7 @@ mod tests {
                     Box::new(crate::models::RecordSlot {
                         segment: segment.to_string(),
                         index,
+                        created_at: SLOT_CREATED_AT,
                     })
                 });
                 let _ = unit.ack_tx.send(AckOutcome::durable(coordinate));
@@ -1234,12 +1258,13 @@ mod tests {
         assert_eq!(
             coordinate.record_id(),
             RecordId::for_record(
-                "shard_00/seg_00000001.wab.sealed",
+                "shard_00/seg_00000001.wab.sealed@18d2c17997b60400",
                 7,
                 &weir_core::Payload::copy_from_slice(payload),
             )
             .as_bytes(),
-            "the coordinate's record_id must be the id the drain would derive"
+            "the coordinate's record_id must be the id the drain would derive: \
+             the segment address plus the header's created_at"
         );
     }
 
@@ -1473,6 +1498,32 @@ mod tests {
             .write_all(&push_frame(&oversized_payload))
             .await
             .unwrap();
+        let (msg_type, payload) = read_response(&mut client).await;
+        assert_eq!(msg_type, MessageType::Nack);
+        assert_eq!(payload[0], NackReason::PayloadTooLarge as u8);
+    }
+
+    /// `max_payload_bytes` caps the whole frame payload, so a `PushBatch`
+    /// body counts as one payload: two 600-byte records, each under a
+    /// 1024-byte cap, still make a body over it and are refused before the
+    /// body is read. `max_batch_records` and `max_payload_bytes` do not
+    /// multiply (docs/operations/configuration.md says so).
+    #[tokio::test]
+    async fn push_batch_body_over_config_cap_is_refused_even_when_each_record_fits() {
+        let cfg = ConnectionConfig {
+            max_payload_bytes: 1024,
+            ..test_cfg()
+        };
+        let mut client = spawn_handler(cfg).await;
+        let record = vec![0xabu8; 600];
+        let body = weir_core::encode_batch_body(&[&record[..], &record[..]]);
+        assert!(body.len() > 1024, "the body must exceed the cap");
+        let frame = Envelope::new(
+            Header::new(MessageType::PushBatch, Durability::Durable, 0),
+            body,
+        )
+        .encode();
+        client.write_all(&frame).await.unwrap();
         let (msg_type, payload) = read_response(&mut client).await;
         assert_eq!(msg_type, MessageType::Nack);
         assert_eq!(payload[0], NackReason::PayloadTooLarge as u8);
@@ -1834,7 +1885,9 @@ mod tests {
                 })
                 .get()
         };
-        assert_eq!(nacked(TierValue::durable), 3);
+        // Per record: the durable and tracked pushes, plus both records of
+        // the refused batch.
+        assert_eq!(nacked(TierValue::durable), 4);
         assert_eq!(nacked(TierValue::buffered), 1);
         assert_eq!(
             metrics
@@ -1939,6 +1992,40 @@ mod tests {
             "a queue-saturation Nack must NOT be attributed to the WAB cap — the \
              counter is the only way to tell the two apart on the wire"
         );
+    }
+
+    /// Spec §6 step 9: a failed startup scan leaves pushes nacked until a
+    /// scan succeeds. The push path must not judge the placeholder flag
+    /// against a WAB size nobody has measured: with `wab_bytes_now` still at
+    /// its initial 0 the hysteresis would release it on the first push.
+    #[tokio::test]
+    async fn a_failed_startup_scan_keeps_pushes_nacked_until_a_scan_succeeds() {
+        let missing = crate::testutil::scratch_dir("conn_gate_missing").join("no_such_wab_dir");
+        let board = crate::status::StatusBoard::for_test();
+        let m = Metrics::new().0;
+        assert_eq!(
+            crate::status::poll::startup_cap_gate(&missing, 1_000, &board, &m),
+            None
+        );
+        let cfg = ConnectionConfig {
+            wab_max_bytes: 1_000,
+            wab_bytes_now: Arc::clone(&board.wab_bytes_now),
+            wab_cap_rejecting: Arc::clone(&board.wab_cap_rejecting),
+            ..test_cfg()
+        };
+        let metrics = Arc::new(Metrics::new().0);
+        let mut client = spawn_handler_acking_with(cfg, Arc::clone(&metrics), Some(true)).await;
+        client.write_all(&push_frame(b"hello")).await.unwrap();
+        assert_eq!(
+            read_response(&mut client).await.0,
+            MessageType::Nack,
+            "no scan has succeeded: the push must nack"
+        );
+        assert!(
+            board.wab_cap_rejecting.load(Ordering::Relaxed),
+            "the push must not release the fail-closed flag"
+        );
+        assert_eq!(metrics.wab_cap_rejections.get(), 1);
     }
 
     #[tokio::test]
@@ -2420,6 +2507,47 @@ mod tests {
         c.write_all(&push_tracked_frame(b"x")).await.unwrap();
         assert_eq!(read_response(&mut c).await.0, MessageType::Nack);
         assert_eq!(internal(&m, NackInternalCause::coordinate), 1);
+    }
+
+    /// A batch refused whole at admission counts every record it carried,
+    /// not one per frame: `weir_records_nack_total` and
+    /// `weir_records_nack_internal_total` are per-record counters, the same
+    /// unit the batch success path uses for `records_accepted`.
+    #[tokio::test]
+    async fn a_batch_refused_at_admission_counts_each_record() {
+        let cap = ConnectionConfig {
+            wab_max_bytes: 1_000,
+            wab_bytes_now: Arc::new(AtomicU64::new(5_000)),
+            wab_cap_rejecting: Arc::new(AtomicBool::new(false)),
+            ..test_cfg()
+        };
+        let lost = ConnectionConfig {
+            wab_ownership_lost: Arc::new(AtomicBool::new(true)),
+            ..test_cfg()
+        };
+        for (cfg, cause) in [
+            (cap, NackInternalCause::wab_cap),
+            (lost, NackInternalCause::ownership_lost),
+        ] {
+            let m = Arc::new(Metrics::new().0);
+            let mut c = spawn_handler_acking_with(cfg, Arc::clone(&m), Some(true)).await;
+            let frame = Envelope::new(
+                Header::new(MessageType::PushBatch, Durability::Durable, 0),
+                weir_core::encode_batch_body(&[b"b1", b"b2", b"b3"]),
+            )
+            .encode();
+            c.write_all(&frame).await.unwrap();
+            assert_eq!(read_response(&mut c).await.0, MessageType::Nack);
+            assert_eq!(internal(&m, cause), 3, "{cause:?}");
+            let nacked = m
+                .records_nack
+                .get_or_create(&NackLabel {
+                    tier: durability_to_tier(Durability::Durable),
+                    reason: MetricNack::internal_error,
+                })
+                .get();
+            assert_eq!(nacked, 3, "{cause:?}");
+        }
     }
 
     #[tokio::test]

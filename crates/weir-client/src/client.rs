@@ -541,6 +541,13 @@ impl<S: Read + Write> WeirClient<S> {
     /// connection, exactly as a malformed single push does. So a bitmap only
     /// ever reports transient, retryable failures.
     ///
+    /// The daemon's payload cap applies to the whole batch body, not to each
+    /// record, so a batch of records that each fit can still be too large. This
+    /// method refuses a body over the 16 MiB hard cap locally, as a recoverable
+    /// [`ClientError::PayloadTooLarge`] that leaves the connection usable. A
+    /// daemon whose `max_payload_bytes` is lower answers `Nack(PayloadTooLarge)`
+    /// and closes the connection.
+    ///
     /// A daemon predating `PushBatch` answers `Nack(UnknownMessage)` and closes;
     /// that surfaces as a poisoning [`ClientError`], so reconnect and use
     /// [`push`](WeirClient::push).
@@ -579,6 +586,15 @@ impl<S: Read + Write> WeirClient<S> {
         }
 
         let body = encode_batch_body(&slices);
+        // The daemon caps the whole frame payload, not just each record, so a
+        // batch of records that each fit can still encode to a body over the
+        // hard cap. Refuse it here for the same reason as the per-record check.
+        if body.len() > MAX_PAYLOAD_HARD_CAP {
+            return Err(ClientError::PayloadTooLarge {
+                len: body.len(),
+                limit: MAX_PAYLOAD_HARD_CAP,
+            });
+        }
         let header = Header::new(MessageType::PushBatch, durability, 0);
         let frame = Envelope::new(header, body).encode();
         let resp = self.send_frame(&frame)?;

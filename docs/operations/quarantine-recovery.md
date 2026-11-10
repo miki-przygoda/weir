@@ -118,9 +118,11 @@ it.** Recovery delivered the valid prefix normally when it sealed the
 segment, and that same prefix lives in the file `quarantine/` preserved. A
 `requeue` run therefore **will** re-send records the sink already received.
 This is within weir's at-least-once contract, but **a dedup-capable sink will
-not filter these duplicates for you**: `DedupToken` is derived from a batch's
-contents *and its boundaries*, and a requeue re-batches the records, so the
-sink sees genuinely different batches and accepts both. Do not assume
+not filter these duplicates for you**: every key weir sends downstream (a
+record's `RecordId`, the ClickHouse and NDJSON [batch key](../sinks/batch-keys.md),
+an S3 object name) is derived from the record's place in the buffer, and a
+requeue writes the records into new segments, so the sink sees new keys and
+accepts both. Do not assume
 dedup saves you here, in any phrasing — plan for the duplicates at the
 consumer.
 

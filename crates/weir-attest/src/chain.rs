@@ -91,11 +91,16 @@ pub fn chain_origin(prev: ChainHead, header: &SegmentHeaderMeta, segment_name: &
 
 /// `Hᵢ = SHA256(Hᵢ₋₁ ‖ RecordIdᵢ)`.
 ///
-/// The input is the record's `RecordId`, not its payload. The id already
-/// commits to the segment name and the 1-based index, so a record relocated to
-/// a different segment or offset changes the chain even if its bytes are
-/// identical — and, more usefully, the id is what the drain hands a sink as its
-/// idempotency key, so the head can be recomputed from the downstream's rows.
+/// The input is the record's `RecordId`, not its payload: `RecordId::for_record`
+/// over the segment's file-name identity `<shard>/<segment>` and the 1-based
+/// index, so a record relocated to a different segment or offset changes the
+/// chain even if its bytes are identical. That is not the id weir delivers to
+/// sinks: since the `RecordId` change the drain's ids also carry
+/// `@<created_at hex>`, so a head cannot be recomputed from a downstream's
+/// `id_column` values or `Idempotency-Key`s. Chaining over the delivered id
+/// needs a versioned sidecar and is planned in the attest-disposal-log epic
+/// (`docs/superpowers/temper/epics.md`); this input is unchanged so existing
+/// `.attest` sidecars keep verifying.
 pub fn chain_step(prev: ChainHead, record_id: &RecordId) -> ChainHead {
     let mut h = Sha256::new();
     h.update(prev.as_bytes());

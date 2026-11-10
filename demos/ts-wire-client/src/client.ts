@@ -89,7 +89,7 @@ export interface PushResult {
  * response shape; the queue should encode the same invariant.
  */
 type Pending =
-  | { kind: "push"; resolve: (r: PushResult) => void; reject: (e: Error) => void }
+  | { kind: "push" | "health"; resolve: (r: PushResult) => void; reject: (e: Error) => void }
   | { kind: "tracked"; resolve: (c: RecordCoordinate) => void; reject: (e: Error) => void };
 
 export interface ClientOpts {
@@ -193,30 +193,38 @@ export class WeirClient {
     }
     switch (messageType) {
       case MessageType.Ack:
-      case MessageType.HealthCheckResponse:
-        if (pending.kind === "tracked") {
-          // A bare Ack in reply to a PushTracked is an error, not a success.
-          // The request determines the response shape, so an Ack here means the
-          // peer did not understand what was asked -- and resolving it would
-          // report a coordinate that does not exist.
-          pending.reject(
-            new WireError(
-              "daemon answered a PushTracked with a bare Ack; the record may be " +
-                "durable but its coordinate is unknown",
-              true,
-            ),
+      case MessageType.HealthCheckResponse: {
+        // The request determines the reply: Ack answers a Push, and
+        // HealthCheckResponse answers a HealthCheck. Any other pairing is a
+        // desync, not a success -- resolving a Push on a HealthCheckResponse
+        // would report a record as acked that nobody acked, and a bare Ack to a
+        // PushTracked would report a coordinate that does not exist. Poison, as
+        // the Rust reference client does.
+        const expected = pending.kind === "health" ? MessageType.HealthCheckResponse : MessageType.Ack;
+        if (pending.kind === "tracked" || messageType !== expected) {
+          const err = new WireError(
+            pending.kind === "tracked"
+              ? "daemon answered a PushTracked with a bare Ack; the record may be " +
+                  "durable but its coordinate is unknown (desync)"
+              : `response: message_type 0x${messageType.toString(16)} does not answer a ` +
+                  `${pending.kind === "health" ? "HealthCheck" : "Push"} (desync)`,
+            true,
           );
-          return;
+          pending.reject(err);
+          return this.fail(err);
         }
         pending.resolve({ acked: true });
         return;
+      }
       case MessageType.AckTracked: {
         if (pending.kind !== "tracked") {
           // An AckTracked for a request that never asked to be tracked is a
           // desync: the queue and the wire disagree about what is in flight.
-          return this.fail(
-            new WireError("response: AckTracked for an untracked request (desync)", true),
-          );
+          // Reject the request it answered: it is off the queue now, so
+          // neither onClose nor its timeout would ever settle it.
+          const err = new WireError("response: AckTracked for an untracked request (desync)", true);
+          pending.reject(err);
+          return this.fail(err);
         }
         try {
           pending.resolve(decodeCoordinate(payload));
@@ -226,7 +234,15 @@ export class WeirClient {
         return;
       }
       case MessageType.Nack: {
-        const reason = payload.length > 0 ? payload.readUInt8(0) : NackReason.InternalError;
+        if (payload.length === 0) {
+          // A Nack carries one reason byte. Without it the stream is desynced,
+          // not transiently failing: reading the gap as InternalError would
+          // keep the connection open. The Rust client poisons here too.
+          const err = new WireError("response: Nack with empty payload (desync)", true);
+          pending.reject(err);
+          return this.fail(err);
+        }
+        const reason = payload.readUInt8(0);
         const daemonVersion =
           reason === NackReason.VersionMismatch && payload.length > 1
             ? payload.readUInt8(1)
@@ -236,10 +252,14 @@ export class WeirClient {
         pending.reject(new NackError(reason, daemonVersion, closes));
         return;
       }
-      default:
-        return this.fail(
-          new WireError(`response: unexpected message_type 0x${messageType.toString(16)}`, true),
+      default: {
+        const err = new WireError(
+          `response: unexpected message_type 0x${messageType.toString(16)} (desync)`,
+          true,
         );
+        pending.reject(err);
+        return this.fail(err);
+      }
     }
   }
 
@@ -249,9 +269,9 @@ export class WeirClient {
    * `kind` is what lets dispatch tell an expected Ack from one that answers a
    * question it was not asked.
    */
-  private send(frame: Buffer): Promise<PushResult> {
+  private send(frame: Buffer, kind: "push" | "health" = "push"): Promise<PushResult> {
     return this.enqueue<PushResult>(frame, (resolve, reject) => ({
-      kind: "push",
+      kind,
       resolve,
       reject,
     }));
@@ -321,6 +341,7 @@ export class WeirClient {
         messageType: MessageType.HealthCheck,
         durability: Durability.Durable,
       }),
+      "health",
     );
   }
 

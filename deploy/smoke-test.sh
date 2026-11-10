@@ -2,7 +2,7 @@
 # deploy/smoke-test.sh — end-to-end smoke test for weir-server.
 #
 # Builds the binary, starts the daemon with a temp config, exercises the full
-# pipeline (push across all three durability tiers, health check, metrics),
+# pipeline (push across both durability tiers, health check, metrics),
 # then shuts down cleanly and verifies WAB segments were written to disk.
 #
 # Exit code: 0 = all checks passed, non-zero = something failed.
@@ -106,12 +106,12 @@ cargo run -q -p weir-client --example health_check -- \
 info "Health check: OK"
 
 # ── Push records across all durability tiers ──────────────────────────────────
-info "Pushing 10 records per durability tier (30 total)..."
+info "Pushing 10 records per durability tier (20 total)..."
 cargo run -q -p weir-client --example push_simple -- \
     --socket "$SOCKET_PATH" \
     --count 10 \
     || fail "push_simple example failed"
-info "All 30 records acked."
+info "All 20 records acked."
 
 # ── Metrics endpoint ──────────────────────────────────────────────────────────
 info "Checking metrics endpoint (http://127.0.0.1:$METRICS_PORT/metrics)..."
@@ -126,7 +126,10 @@ for metric in \
     weir_queue_depth \
     weir_wab_bytes_on_disk \
     weir_drain_state; do
-    if echo "$METRICS" | grep -q "$metric"; then
+    # A here-string, not `echo | grep -q`: under pipefail, grep -q exits on the
+    # first match and echo's write then fails with SIGPIPE, so a metric that is
+    # present was reported missing on about half the runs.
+    if grep -q -- "$metric" <<<"$METRICS"; then
         info "  ✓ $metric"
     else
         fail "Metric missing from /metrics output: $metric"
@@ -160,8 +163,18 @@ if kill -0 "$SERVER_PID" 2>/dev/null; then
     kill -KILL "$SERVER_PID" 2>/dev/null || true
     fail "Graceful shutdown timed out"
 fi
+# The daemon is our child, so wait reaps it and returns its exit status: a
+# panic or a non-zero exit on the way out (spec: exit 0 for every SIGTERM
+# shutdown) must fail the smoke test, not pass as a clean exit.
+SERVER_RC=0
+wait "$SERVER_PID" 2>/dev/null || SERVER_RC=$?
 SERVER_PID=""  # prevent double-kill in cleanup
-info "weir-server exited cleanly."
+if [[ "$SERVER_RC" -ne 0 ]]; then
+    error "weir-server exited with status $SERVER_RC after SIGTERM. Logs:"
+    cat "$LOG_PATH"
+    exit 1
+fi
+info "weir-server exited cleanly (status 0)."
 
 echo ""
 echo -e "${GREEN}✓ All smoke checks passed.${NC}"

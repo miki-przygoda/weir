@@ -53,20 +53,17 @@ pub(crate) fn compute_wab_bytes_on_disk(wab_dir: &Path) -> Option<u64> {
             return None;
         };
         let shard_path = entry.path();
-        if !shard_path.is_dir() {
-            continue;
-        }
-        // Skip the daemon's reserved subdirs — they aren't shards. dead_letter/
-        // (dl_*.wab.sealed) has its own weir_dead_letter_bytes_on_disk gauge, and
-        // quarantine/ holds forensic copies (both `.wab` and `.wab.sealed`,
-        // depending on whether crash recovery or the drain preserved them; see
-        // docs/wab_format.md); counting either here would double-count
-        // live-segment bytes (G15, mirrors recovery's skip).
-        let dir_name = shard_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("");
-        if dir_name == "dead_letter" || dir_name == "quarantine" {
+        // Only `shard_<N>` directories are shards, the same rule as recovery,
+        // replay and the lag scan. That skips the daemon's reserved subdirs:
+        // dead_letter/ (dl_*.wab.sealed) has its own
+        // weir_dead_letter_bytes_on_disk gauge, and quarantine/ holds forensic
+        // copies (both `.wab` and `.wab.sealed`, depending on whether crash
+        // recovery or the drain preserved them; see docs/wab_format.md);
+        // counting either here would double-count live-segment bytes (G15). It
+        // also skips anything foreign, such as a root-owned `lost+found` when
+        // `wab_dir` is a mount root: reading that as a shard failed every scan,
+        // and with `wab_max_bytes` set the cap then refused every push for good.
+        if crate::wab::segment::shard_id_from_path(&shard_path).is_none() || !shard_path.is_dir() {
             continue;
         }
         let Ok(shard_dir) = std::fs::read_dir(&shard_path) else {
@@ -562,6 +559,13 @@ impl WabPoll {
             &self.wab_bytes_now,
         ) {
             if let Some(st) = &self.status {
+                // Before the first successful scan the flag can only hold the
+                // fail-closed placeholder `startup_cap_gate` sets when its scan
+                // fails, not a cap crossing: judge this size afresh rather than
+                // through the hysteresis, which would keep refusing below the cap.
+                if st.board.wab.first_scan_ok_ms().is_none() {
+                    st.board.wab_cap_rejecting.store(false, Ordering::Relaxed);
+                }
                 st.board.wab.note_scan_ok(unix_ms_now());
                 // Spec §5.5: the refresh that clears the flag without traffic.
                 let rejecting = crate::wab::cap::evaluate(
@@ -1303,6 +1307,11 @@ pub(crate) fn startup_cap_gate(
             Some(bytes)
         }
         None => {
+            // Not the initial 0: the push path judges the flag against this,
+            // and 0 would release it on the first push.
+            board
+                .wab_bytes_now
+                .store(crate::wab::cap::BYTES_UNKNOWN, Ordering::Relaxed);
             if wab_max_bytes > 0 {
                 board.wab_cap_rejecting.store(true, Ordering::Relaxed);
                 metrics.wab_cap_rejecting.set(1.0);
@@ -1343,6 +1352,37 @@ mod wab_bytes_tests {
             Some(100),
             "only live shard segments count; dead_letter + quarantine are skipped"
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A directory under `wab_dir` that is not `shard_<N>` (here `lost+found`
+    /// at a mount root, root-owned and unreadable) is not a shard, as recovery,
+    /// replay and the lag scan already rule. Reading it as one failed every
+    /// scan, so with `wab_max_bytes` set the cap never cleared and the daemon
+    /// refused every push for good.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_foreign_directory_is_not_a_shard() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = crate::testutil::scratch_dir("wab_bytes_foreign");
+        let shard = root.join("shard_00");
+        crate::testutil::mkdir_p(&shard);
+        std::fs::write(shard.join("seg_00000001.wab.sealed"), vec![0u8; 100]).unwrap();
+        let foreign = root.join("lost+found");
+        crate::testutil::mkdir_p(&foreign);
+        std::fs::write(foreign.join("seg_00000009.wab.sealed"), vec![0u8; 999]).unwrap();
+        std::fs::set_permissions(&foreign, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&foreign).is_ok() {
+            std::fs::set_permissions(&foreign, std::fs::Permissions::from_mode(0o700)).unwrap();
+            eprintln!("skipping: a mode-000 directory is still readable (root?)");
+            std::fs::remove_dir_all(&root).ok();
+            return;
+        }
+        let got = compute_wab_bytes_on_disk(&root);
+        std::fs::set_permissions(&foreign, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(got, Some(100), "only shard_<N> directories are shards");
+        // Readable, it still does not count: its bytes are not the WAB's.
+        assert_eq!(compute_wab_bytes_on_disk(&root), Some(100));
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -2413,6 +2453,17 @@ mod tests {
             "fail-closed: nack until a scan succeeds"
         );
         assert!(capped.wab.first_scan_ok_ms().is_none());
+        assert_eq!(
+            capped.wab_bytes_now.load(Ordering::Relaxed),
+            crate::wab::cap::BYTES_UNKNOWN,
+            "unmeasured, not 0: the push path must not release the flag"
+        );
+        let ev = capped.evidence_at(crate::status::unix_ms_now());
+        assert_eq!(
+            ev.wab_cap.map(|c| c.bytes_now),
+            Some(0),
+            "reported as 0, as before"
+        );
         let uncapped = StatusBoard::for_test();
         startup_cap_gate(&missing, 0, &uncapped, &m);
         assert!(!uncapped.wab_cap_rejecting.load(Ordering::Relaxed));
@@ -2431,6 +2482,42 @@ mod tests {
         );
         assert!(board.wab.last_scan_ok_ms().is_some());
         assert_eq!(m.wab_cap_rejecting.get(), 0.0);
+    }
+
+    /// The flag a failed startup scan sets is a placeholder, not a cap
+    /// crossing: the first scan that succeeds judges the size afresh, so a
+    /// WAB between low water and the cap is accepted, not held by hysteresis
+    /// the daemon never entered. A WAB at the cap still rejects, and from
+    /// then on the hysteresis applies as usual.
+    #[tokio::test]
+    async fn the_first_poll_scan_after_a_failed_startup_scan_judges_the_size_afresh() {
+        let missing = crate::testutil::scratch_dir("poll_gate_placeholder").join("no_such_wab_dir");
+        let board = StatusBoard::for_test();
+        let m = Arc::new(Metrics::new().0);
+        assert_eq!(startup_cap_gate(&missing, 1_000, &board, &m), None);
+        assert!(board.wab_cap_rejecting.load(Ordering::Relaxed));
+        let mut poll = poll_for(&board, &m, 1_000, missing.clone());
+        poll.tick(Instant::now(), || async { Ok(Some(950)) }).await;
+        assert!(
+            !board.wab_cap_rejecting.load(Ordering::Relaxed),
+            "below the cap on the first successful scan: released"
+        );
+        assert_eq!(m.wab_cap_rejecting.get(), 0.0);
+
+        let over = StatusBoard::for_test();
+        startup_cap_gate(&missing, 1_000, &over, &m);
+        let mut poll = poll_for(&over, &m, 1_000, missing.clone());
+        poll.tick(Instant::now(), || async { Ok(Some(1_000)) })
+            .await;
+        assert!(
+            over.wab_cap_rejecting.load(Ordering::Relaxed),
+            "at the cap: still rejecting"
+        );
+        poll.tick(Instant::now(), || async { Ok(Some(950)) }).await;
+        assert!(
+            over.wab_cap_rejecting.load(Ordering::Relaxed),
+            "a real crossing keeps the hysteresis"
+        );
     }
 
     #[tokio::test]

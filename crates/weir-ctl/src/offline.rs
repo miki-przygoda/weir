@@ -321,6 +321,24 @@ mod tests {
         std::fs::remove_dir_all(&wab).ok();
     }
 
+    /// Only `shard_<N>` directories are shards, as in the daemon and
+    /// `attest`: a `lost+found` at a mount root is not one.
+    #[test]
+    fn directories_that_are_not_shard_n_are_not_scanned_as_shards() {
+        let wab = tmp("foreign");
+        std::fs::create_dir_all(wab.join("shard_00")).unwrap();
+        for foreign in ["lost+found", "shard_x"] {
+            let f = wab.join(foreign);
+            std::fs::create_dir_all(&f).unwrap();
+            std::fs::write(f.join("seg_00000001.wab.sealed"), b"WEIR").unwrap();
+        }
+        let f = scan_disk(&wab, NOW_MS).unwrap();
+        let names: Vec<&str> = f.shards.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["shard_00"]);
+        assert_eq!(f.undelivered_segments(), 0);
+        std::fs::remove_dir_all(&wab).ok();
+    }
+
     #[test]
     fn a_short_sealed_file_is_undelivered_and_unreadable() {
         let wab = tmp("short");

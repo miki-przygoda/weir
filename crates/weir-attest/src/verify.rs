@@ -6,9 +6,11 @@ use weir_sink_sdk::RecordId;
 
 /// The name a segment is chained under: `shard_NN/seg_....`.
 ///
-/// The parent directory is included because `RecordId` commits to the segment
-/// name the daemon uses, which is shard-qualified. Getting this wrong makes
-/// every chain head disagree with what a sink could recompute.
+/// The parent directory is included so a segment is chained under its
+/// shard-qualified file-name identity. This is deliberately not the drain's
+/// `segment_identity` (which adds `@<created_at hex>`): the chain input is
+/// frozen so existing `.attest` sidecars keep verifying, and getting this
+/// wrong makes every head disagree with the sidecars `seal` wrote.
 pub fn segment_name_for(path: &Path) -> String {
     let file = path
         .file_name()

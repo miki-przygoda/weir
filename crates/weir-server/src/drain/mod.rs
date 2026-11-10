@@ -68,7 +68,10 @@ use crate::{
         ParkedLabel, ParkedReason, SinkHealthLabel, SinkHealthState,
     },
     sink::{Sink, SinkError, SinkHealth},
-    wab::{SegmentReader, read_segment_record_count, segment::segment_identity},
+    wab::{
+        SegmentReader, read_segment_record_count,
+        segment::{segment_address, segment_identity},
+    },
 };
 
 pub(crate) use control::{DrainControl, DrainExit, DrainRuntime, Lifetime};
@@ -531,7 +534,7 @@ fn run_drain_supervised<S: Sink>(
             Ok(t) => {
                 break DrainExit {
                     reason: t.reason,
-                    abandoned: t.abandoned.map(|(p, n)| (segment_identity(&p), n)),
+                    abandoned: t.abandoned.map(|(p, n)| (segment_address(&p), n)),
                     pending_left: t.pending_left,
                     backlog_left: t.backlog_left,
                     last_panic: last_panic.clone(),
@@ -1906,7 +1909,7 @@ fn drain_thread_with<S: Sink>(
                             // sustained load, meant a HEAD request per segment).
                             publish_queues(publish, &metrics, pending.len(), backlog.len());
                             publish.in_flight(Some(InFlight {
-                                segment: segment_identity(&segment),
+                                segment: segment_address(&segment),
                                 attempt: 1,
                                 retries_left: config.max_retries,
                                 processed: skip,
@@ -2056,7 +2059,7 @@ fn drain_thread_with<S: Sink>(
                     .saturating_sub(retries_left)
                     .saturating_add(2);
                 let retry_record = |next_retry_at_ms: Option<u64>| InFlight {
-                    segment: segment_identity(&segment),
+                    segment: segment_address(&segment),
                     attempt,
                     retries_left,
                     processed,
@@ -3141,7 +3144,7 @@ fn enter_blocked(
         // SP-D (spec §5.13): once per episode, when it starts, so a flapping
         // cap does not repeat it.
         warn!(
-            segment = %segment_identity(&segment),
+            segment = %segment_address(&segment),
             needed_bytes = needed,
             "drain: dead_letter/ is full; delivery is blocked until space is freed \
              (weir-ctl dl requeue / dl drop) or dead_letter_max_bytes is raised. Ingest \
@@ -3277,12 +3280,15 @@ async fn process_segment_ctl<S: Sink>(
     //
     // `segment_identity` is the WAB's, not the drain's: the flusher predicts the
     // same string at ack time for a tracked push's `RecordCoordinate`, and the
-    // two must agree or the coordinate names a record the sink never keyed.
-    let segment_name = segment_identity(segment);
+    // two must agree or the coordinate names a record the sink never keyed. It
+    // carries the header's `created_at`, so a later segment that reuses this
+    // file name (counters restart once a shard drains empty) cannot hand a
+    // byte-identical record the id of one already delivered.
+    let segment_name = segment_identity(segment, segment_created_at);
     // SP-D (spec §5.13): every line logged inside a commit names the segment.
     // ERROR level so the span is enabled under any `log_level` that lets a
     // commit-path WARN or ERROR through.
-    let segment_span = tracing::error_span!("segment", segment = %segment_name);
+    let segment_span = tracing::error_span!("segment", segment = %segment_address(segment));
     let mut batch_ids: Vec<RecordId> = Vec::with_capacity(max_batch);
 
     // Set when the record loop stops on a record it cannot read and the segment
@@ -4990,21 +4996,23 @@ mod tests {
     fn record_ids_differ_across_shards_for_the_same_segment_number() {
         let a = Path::new("/var/lib/weir/wab/shard_00/seg_00000001.wab.sealed");
         let b = Path::new("/var/lib/weir/wab/shard_01/seg_00000001.wab.sealed");
+        // Even created in the same nanosecond, the shard tells them apart.
+        let t = 1_788_704_730_000_000_000;
         assert_eq!(
             a.file_name(),
             b.file_name(),
             "precondition: the basenames really do collide, which is the trap"
         );
         assert_ne!(
-            segment_identity(a),
-            segment_identity(b),
+            segment_identity(a, t),
+            segment_identity(b, t),
             "two shards' segment #1 must not share an identity"
         );
 
         let payload = Payload::from(b"heartbeat".as_ref());
         assert_ne!(
-            RecordId::for_record(&segment_identity(a), 1, &payload),
-            RecordId::for_record(&segment_identity(b), 1, &payload),
+            RecordId::for_record(&segment_identity(a, t), 1, &payload),
+            RecordId::for_record(&segment_identity(b, t), 1, &payload),
             "identical bytes at index 1 of each shard's segment #1 must not \
              produce the same idempotency key"
         );
@@ -5012,11 +5020,26 @@ mod tests {
 
     /// The property that must survive the fix: a re-read of the same segment
     /// yields the same identity, so the drain's own retry still deduplicates.
+    /// The form is `<shard>/<file>@<created_at as 16 lowercase hex digits>`.
     #[test]
     fn segment_identity_is_stable_for_the_same_segment() {
         let p = Path::new("/var/lib/weir/wab/shard_03/seg_00000042.wab.sealed");
-        assert_eq!(segment_identity(p), segment_identity(p));
-        assert_eq!(segment_identity(p), "shard_03/seg_00000042.wab.sealed");
+        let t = 1_788_704_730_000_000_000;
+        assert_eq!(segment_identity(p, t), segment_identity(p, t));
+        assert_eq!(
+            segment_identity(p, t),
+            "shard_03/seg_00000042.wab.sealed@18d2c17997b60400"
+        );
+        assert_eq!(segment_address(p), "shard_03/seg_00000042.wab.sealed");
+        // Zero-padded to a fixed width, and read as unsigned.
+        assert_eq!(
+            segment_identity(p, 1),
+            "shard_03/seg_00000042.wab.sealed@0000000000000001"
+        );
+        assert_eq!(
+            segment_identity(p, -1),
+            "shard_03/seg_00000042.wab.sealed@ffffffffffffffff"
+        );
     }
 
     /// A bare relative path (tests only) has no parent component; it must not
@@ -5024,8 +5047,23 @@ mod tests {
     #[test]
     fn segment_identity_tolerates_a_bare_file_name() {
         assert_eq!(
-            segment_identity(Path::new("seg_00000001.wab")),
-            "seg_00000001.wab"
+            segment_identity(Path::new("seg_00000001.wab"), 0),
+            "seg_00000001.wab@0000000000000000"
+        );
+    }
+
+    /// The same segment NAME with two different header `created_at` values is
+    /// two segment instances, and must give two different ids for a
+    /// byte-identical record at the same index.
+    #[test]
+    fn segment_identity_differs_across_instances_of_one_name() {
+        let p = Path::new("/var/lib/weir/wab/shard_00/seg_00000001.wab.sealed");
+        let payload = Payload::from(br#"{"status":"ok"}"#.as_ref());
+        let before = 1_788_704_730_000_000_000;
+        let after = before + 1;
+        assert_ne!(
+            RecordId::for_record(&segment_identity(p, before), 1, &payload),
+            RecordId::for_record(&segment_identity(p, after), 1, &payload),
         );
     }
 
@@ -5057,6 +5095,68 @@ mod tests {
              confirming all {expect_records} records"
         );
         (sink.seen_record_ids(), sink.seen_dedup_tokens())
+    }
+
+    /// The header's creation time, which is what tells two segment instances
+    /// with one file name apart.
+    fn header_created_at(segment: &Path) -> i64 {
+        crate::wab::SegmentReader::open(segment)
+            .unwrap()
+            .header()
+            .created_at
+    }
+
+    /// Segment names restart at `seg_00000001` once a shard drains empty and the
+    /// daemon restarts, or a pod comes back without its volume. A byte-identical
+    /// record at the same index of the reused name is a different record, and
+    /// must not present the `RecordId` of the one already delivered — a
+    /// downstream keyed on it (an `id_column` table, an idempotent HTTP
+    /// endpoint) would drop it as a duplicate: silent loss of an acked record.
+    ///
+    /// The other half is what the id is for: re-reading the same segment
+    /// instance gives the same ids, so a replay still deduplicates.
+    #[test]
+    fn record_ids_differ_across_segment_instances_with_one_name() {
+        let dir = tmp_dir("segment_instances");
+        let heartbeat: Vec<&[u8]> = vec![br#"{"status":"ok"}"#];
+
+        let first = make_sealed_segment(&dir, 0, &heartbeat);
+        let (ids_first, _) = drain_identity(&dir, &first, 1, 1);
+        let (ids_replay, _) = drain_identity(&dir, &first, 1, 1);
+        assert_eq!(
+            ids_first, ids_replay,
+            "a replay of the same segment instance must present the same ids"
+        );
+        let first_created_at = header_created_at(&first);
+
+        // The shard drains empty and the daemon restarts: the next segment takes
+        // the same name.
+        std::fs::remove_file(&first).unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        let second = make_sealed_segment(&dir, 0, &heartbeat);
+        assert_eq!(first, second, "precondition: the name really is reused");
+        assert_ne!(
+            first_created_at,
+            header_created_at(&second),
+            "precondition: the two instances have different headers"
+        );
+        let (ids_second, _) = drain_identity(&dir, &second, 1, 1);
+        assert_eq!(ids_second.len(), 1);
+        assert_eq!(
+            ids_second[0],
+            RecordId::for_record(
+                &segment_identity(&second, header_created_at(&second)),
+                1,
+                &Payload::from(heartbeat[0].to_vec()),
+            ),
+            "the drain's id is `segment_identity` (address plus header created_at)"
+        );
+        assert_ne!(
+            ids_first, ids_second,
+            "a byte-identical record at the same index of a reused segment name \
+             must not get the id of the record already delivered"
+        );
+        std::fs::remove_dir_all(dir).ok();
     }
 
     /// **The guarantee this branch exists to establish.** A sink must be able to
@@ -5588,6 +5688,9 @@ mod tests {
         let dir = tmp_dir("cursor_strand");
         let records: [&[u8]; 5] = [b"r1", b"r2", b"r3", b"r4", b"r5"];
         let sealed = make_sealed_segment(&dir, 0, &records);
+        // Read now: the segment is confirmed and deleted by the time the ids are
+        // checked.
+        let identity = segment_identity(&sealed, header_created_at(&sealed));
         let payload = |r: &[u8]| Payload::from(r.to_vec());
 
         let mut responses: Vec<MockResult> = vec![
@@ -5629,7 +5732,7 @@ mod tests {
         );
         let ids = sink.seen_record_ids();
         for (i, r) in records.iter().enumerate().take(2) {
-            let id = RecordId::for_record(&segment_identity(&sealed), i as u64 + 1, &payload(r));
+            let id = RecordId::for_record(&identity, i as u64 + 1, &payload(r));
             assert_eq!(
                 ids.iter().filter(|seen| **seen == id).count(),
                 1,

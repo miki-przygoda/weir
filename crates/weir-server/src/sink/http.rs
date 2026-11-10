@@ -48,7 +48,9 @@
 //!   Tradeoff is N round-trips per batch (mitigated by `concurrency`).
 //! - **`Ndjson`**: the whole commit batch goes in ONE POST as
 //!   newline-delimited bodies (`application/x-ndjson`), with a single
-//!   per-batch `Idempotency-Key`. One round-trip per batch instead of N —
+//!   per-batch `Idempotency-Key` derived from the batch's WAB coordinate (see
+//!   `batch_key`), so two segments holding byte-identical records get
+//!   distinct keys. One round-trip per batch instead of N —
 //!   the framing log/trace ingesters (Loki, ES `_bulk`) expect. The
 //!   endpoint returns one status, so the result is all-or-nothing: a 2xx
 //!   commits the batch, a permanent 4xx dead-letters the whole batch, and
@@ -65,7 +67,7 @@ use tracing::{debug, warn};
 use weir_core::Payload;
 
 use super::{CommitResult, Sink, SinkBatch, SinkError, SinkHealth};
-use weir_sink_sdk::{DedupToken, RecordId};
+use weir_sink_sdk::RecordId;
 
 /// How the HTTP sink frames a commit batch into HTTP requests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -101,7 +103,10 @@ pub struct HttpSinkConfig {
     /// Send `Idempotency-Key: sha256:<hex>` with each request so the endpoint
     /// can deduplicate retries that follow the drain's at-least-once contract.
     /// The value is the record's [`RecordId`] in per-record mode and the
-    /// batch's [`DedupToken`] in NDJSON mode.
+    /// batch key in NDJSON mode: a sha256 of the batch's WAB coordinate
+    /// (segment `created_at`, first `RecordId`, record count; see `batch_key`),
+    /// or its [`DedupToken`](weir_sink_sdk::DedupToken) for a batch built
+    /// without segment context.
     /// Default: true. Set false only if your endpoint can't tolerate the
     /// extra header (e.g. strict CORS, header allow-lists).
     pub send_idempotency_key: bool,
@@ -115,9 +120,9 @@ pub struct HttpSinkConfig {
 impl std::fmt::Debug for HttpSinkConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpSinkConfig")
-            // The URL may carry userinfo (user:password@host); redact the password
-            // so it never lands in a Debug-formatted log line (S25).
-            .field("url", &crate::sink::redact_url_password(&self.url))
+            // Only `scheme://host[:port]`: userinfo, path and query may all
+            // carry secrets (S25, security-r3-01).
+            .field("url", &crate::status::config_view::url_origin(&self.url))
             .field("timeout", &self.timeout)
             .field("max_batch_size", &self.max_batch_size)
             .field("batch_mode", &self.batch_mode)
@@ -216,22 +221,33 @@ impl HttpSink {
     }
 
     /// Single POST of a whole batch as newline-delimited (NDJSON) bodies, with
-    /// one per-batch Idempotency-Key — the batch's dedup token. The endpoint
-    /// returns one status for the whole batch, so the result is all-or-nothing.
-    async fn post_batch(&self, body: Vec<u8>, token: &DedupToken) -> Result<(), HttpSinkError> {
+    /// one per-batch Idempotency-Key — the batch key (`sha256:<hex>`, see
+    /// `batch_key`). The endpoint returns one status for the whole batch, so
+    /// the result is all-or-nothing.
+    async fn post_batch(&self, body: Vec<u8>, key: &str) -> Result<(), HttpSinkError> {
         let mut req = self
             .base_request()
             .header(reqwest::header::CONTENT_TYPE, "application/x-ndjson");
         if self.config.send_idempotency_key {
-            // The batch's dedup token, not a hash of this body. The two differ
-            // when the batch contained newline-bearing records: those are
-            // dead-lettered rather than framed, so the body is a subset. That is
-            // fine and slightly stronger — the token is stable for a given batch
-            // regardless of how the framing logic partitions it, so a replayed
-            // batch still presents the same key.
-            req = req.header("Idempotency-Key", token.to_prefixed_hex());
+            // The batch key, not a hash of this body. The body can be a subset
+            // of the batch when newline-bearing records were dead-lettered
+            // rather than framed; the key is stable for a given batch however
+            // the framing partitions it, so a replayed batch still presents
+            // the same key.
+            req = req.header("Idempotency-Key", key);
         }
         self.send_and_classify(req.body(body)).await
+    }
+
+    /// A reqwest error rendered without its URL, naming only the sink URL's
+    /// `scheme://host[:port]`: userinfo, path and query can all carry secrets
+    /// (security-r3-01).
+    fn transport_error_text(&self, e: reqwest::Error) -> String {
+        format!(
+            "{} for url ({})",
+            e.without_url(),
+            crate::status::config_view::url_origin(&self.config.url)
+        )
     }
 
     /// Sends a prepared request and classifies the response into the
@@ -244,16 +260,13 @@ impl HttpSink {
                 // Network-layer errors are all transient. Connect refused,
                 // DNS failure, timeout, broken pipe — drain retries.
                 //
-                // Defence in depth (S31): this string is stored in
-                // `Transport` and re-logged at warn! by the drain on *every*
-                // retry, so a `scheme://user:pass@host` sink URL must never
-                // bleed its password here. reqwest 0.12 already strips URL
-                // userinfo from its error Display (it lifts it into a Basic-auth
-                // header), but we own the redaction rather than delegating the
-                // guarantee to a transitive dep's formatting — `redact_url_password`
-                // is a no-op when no userinfo is present, so the useful host
-                // diagnostic survives.
-                let rendered = crate::sink::redact_url_password(&e.to_string());
+                // This string is stored in `Transport`, re-logged at warn! by
+                // the drain on *every* retry and kept for the admin view, so
+                // the sink URL must never bleed a secret here (S31,
+                // security-r3-01). reqwest's Display appends the FULL url
+                // (path and query included), so drop it and name only
+                // `scheme://host[:port]`, which keeps the host diagnostic.
+                let rendered = self.transport_error_text(e);
                 debug!(error = %rendered, "sink POST failed at transport layer");
                 return Err(HttpSinkError::Transport(rendered));
             }
@@ -271,21 +284,29 @@ impl HttpSink {
         // A 3xx surfaces here only because redirect-following is disabled (G01).
         // Treat it as a permanent misconfiguration — never committed: the
         // configured sink URL should point straight at the ingest endpoint, not a
-        // redirector. Reported with the Location so the operator can repoint it.
+        // redirector. Reported with the Location's origin so the operator can
+        // repoint it.
         if status.is_redirection() {
-            let raw_location = resp
+            // Only `scheme://host[:port]` of the Location is printed: an
+            // http-to-https upgrade echoes the configured path and query, which
+            // can carry the webhook secret (security-r4-01). A relative Location
+            // is resolved against the request URL first.
+            let location = match resp
                 .headers()
                 .get(reqwest::header::LOCATION)
                 .and_then(|v| v.to_str().ok())
-                .unwrap_or("<no Location header>");
-            // The Location header is downstream-controlled and is interpolated into
-            // the log line and the dead-letter reason, so sanitize + bound it the
-            // same way as the permanent-body excerpt below (S29 log-forging defense).
-            // reqwest already rejects CR/LF in header values, so this is defense in
-            // depth plus capping an otherwise-unbounded header value at 256.
-            let location = crate::sink::sanitize_log_excerpt(
-                &raw_location.chars().take(256).collect::<String>(),
-            );
+            {
+                Some(raw) => resp.url().join(raw).map_or_else(
+                    |_| "<unparseable>".to_string(),
+                    |u| crate::status::config_view::url_origin(u.as_str()),
+                ),
+                None => "<no Location header>".to_string(),
+            };
+            // Downstream-controlled and interpolated into the log line and the
+            // dead-letter reason: sanitize + bound it like the body excerpt below
+            // (S29 log-forging defense), as defense in depth.
+            let location =
+                crate::sink::sanitize_log_excerpt(&location.chars().take(256).collect::<String>());
             return Err(HttpSinkError::PermanentStatus {
                 status,
                 body_excerpt: format!(
@@ -322,15 +343,45 @@ impl HttpSink {
         // characters: the body is downstream-controlled and is interpolated into
         // log lines and the dead-letter reason, so a hostile endpoint could
         // otherwise inject forged log records or terminal escape sequences (S29).
+        // A body can echo the request path back (Express: `Cannot POST <path>`),
+        // so the sink URL's path and query are cut out before the excerpt is
+        // taken (security-r4-01).
         let bytes = crate::sink::read_body_capped(resp, crate::sink::RESPONSE_BODY_CAP).await;
-        let cut = bytes.len().min(256);
+        let body = redact_sink_url_echo(&String::from_utf8_lossy(&bytes), &self.config.url);
         let body_excerpt =
-            crate::sink::sanitize_log_excerpt(&String::from_utf8_lossy(&bytes[..cut]));
+            crate::sink::sanitize_log_excerpt(&body.chars().take(256).collect::<String>());
         Err(HttpSinkError::PermanentStatus {
             status,
             body_excerpt,
         })
     }
+}
+
+/// Cuts the sink URL's path and query out of downstream text that may echo
+/// them back, in both the configured spelling and reqwest's normalized one:
+/// either can carry a webhook token or a presigned signature (security-r4-01).
+fn redact_sink_url_echo(text: &str, sink_url: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Ok(u) = reqwest::Url::parse(sink_url) {
+        parts.push(u.path().to_string());
+        parts.extend(u.query().map(str::to_string));
+    }
+    if let Some(i) = sink_url.find("://") {
+        let rest = &sink_url[i + 3..];
+        if let Some(j) = rest.find(['/', '?', '#']) {
+            let tail = rest[j..].split('#').next().unwrap_or_default();
+            let (path, query) = tail.split_once('?').unwrap_or((tail, ""));
+            parts.push(path.to_string());
+            parts.push(query.to_string());
+        }
+    }
+    parts.retain(|p| p.len() > 1);
+    parts.sort_by_key(|p| std::cmp::Reverse(p.len()));
+    let mut out = text.to_string();
+    for p in &parts {
+        out = out.replace(p.as_str(), "<redacted>");
+    }
+    out
 }
 
 /// Computes the `Idempotency-Key` header value for a payload.
@@ -459,8 +510,11 @@ impl Sink for HttpSink {
                 self.commit_per_record(records, record_ids).await
             }
             HttpBatchMode::Ndjson => {
-                let (records, token) = batch.into_parts();
-                self.commit_ndjson(records, &token).await
+                // The batch's WAB coordinate, not a hash of its bytes: two
+                // segments that each hold the same heartbeat must not share a
+                // key (sinks-r3-02). See `batch_key`.
+                let key = format!("sha256:{}", super::batch_key::batch_key_hex(&batch));
+                self.commit_ndjson(batch.into_records(), &key).await
             }
         }
     }
@@ -553,7 +607,7 @@ impl HttpSink {
     async fn commit_ndjson(
         &self,
         batch: Vec<Payload>,
-        token: &DedupToken,
+        key: &str,
     ) -> Result<CommitResult, HttpSinkError> {
         if batch.is_empty() {
             return Ok(CommitResult::new(vec![], vec![]));
@@ -592,7 +646,7 @@ impl HttpSink {
             body.push(b'\n');
         }
 
-        match self.post_batch(body, token).await {
+        match self.post_batch(body, key).await {
             Ok(()) => Ok(CommitResult::new(framable, dead_lettered)),
             Err(HttpSinkError::PermanentStatus {
                 status,
@@ -646,12 +700,9 @@ impl HttpSink {
                 SinkHealth::Degraded(format!("HEAD returned {}", resp.status()))
             }
             Ok(resp) => SinkHealth::Down(format!("HEAD returned {}", resp.status())),
-            // Redact any URL password the transport error might carry (S31); see
-            // the matching note on the commit path.
-            Err(e) => SinkHealth::Down(format!(
-                "HEAD failed: {}",
-                crate::sink::redact_url_password(&e.to_string())
-            )),
+            // Only the URL origin, never its path or query (S31,
+            // security-r3-01); see the matching note on the commit path.
+            Err(e) => SinkHealth::Down(format!("HEAD failed: {}", self.transport_error_text(e))),
         }
     }
 }
@@ -664,6 +715,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use weir_sink_sdk::DedupToken;
 
     /// Test helper: build a `Payload` from a static byte string literal.
     fn p(s: &'static [u8]) -> Payload {
@@ -1096,6 +1148,129 @@ mod tests {
             ),
             other => panic!("expected Down for a closed port, got {other:?}"),
         }
+    }
+
+    // security-r3-01: webhook URLs carry the secret in the path, presigned
+    // URLs in query keys no denylist can enumerate (`X-Amz-Signature`,
+    // `client_secret`, ...). Nothing past `scheme://host[:port]` of the sink
+    // URL may reach Debug output, a transport error or a health message.
+    const PATH_SECRET: &str = "PATHSECRETTOKEN";
+    const QUERY_SECRET: &str = "QUERYSECRETVALUE";
+
+    fn secret_url(authority: &str) -> String {
+        format!(
+            "http://{authority}/services/T0/B0/{PATH_SECRET}\
+             ?X-Amz-Signature={QUERY_SECRET}&client_secret={QUERY_SECRET}"
+        )
+    }
+
+    #[test]
+    fn debug_prints_only_the_url_origin() {
+        let dbg = format!("{:?}", cfg(&secret_url("hooks.example.com")));
+        assert!(
+            !dbg.contains(PATH_SECRET) && !dbg.contains(QUERY_SECRET),
+            "URL path/query secret leaked in Debug: {dbg}"
+        );
+        assert!(dbg.contains("http://hooks.example.com"), "{dbg}");
+    }
+
+    #[tokio::test]
+    async fn transport_error_prints_only_the_url_origin() {
+        let sink = HttpSink::new(cfg(&secret_url("127.0.0.1:1"))).unwrap();
+        let err = sink
+            .commit(SinkBatch::from(vec![p(b"alpha")]))
+            .await
+            .unwrap_err();
+        let rendered = err.to_string();
+        assert!(
+            !rendered.contains(PATH_SECRET) && !rendered.contains(QUERY_SECRET),
+            "URL path/query secret leaked into the transport error: {rendered}"
+        );
+        assert!(rendered.contains("http://127.0.0.1:1"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn health_down_prints_only_the_url_origin() {
+        let sink = HttpSink::new(cfg(&secret_url("127.0.0.1:1"))).unwrap();
+        match sink.health().await {
+            SinkHealth::Down(msg) => {
+                assert!(
+                    !msg.contains(PATH_SECRET) && !msg.contains(QUERY_SECRET),
+                    "URL path/query secret leaked into health Down message: {msg}"
+                );
+                assert!(msg.contains("http://127.0.0.1:1"), "{msg}");
+            }
+            other => panic!("expected Down for a closed port, got {other:?}"),
+        }
+    }
+
+    /// Dead-letters one record against a mock that answers `response`, with
+    /// the sink pointed at `secret_url` on the mock's port, and returns the
+    /// dead-letter reason.
+    async fn reason_for_secret_url(response: String) -> String {
+        let resp: &'static str = Box::leak(response.into_boxed_str());
+        let (url, _counter) = spawn_mock_server(vec![resp]).await;
+        let authority = url
+            .trim_start_matches("http://")
+            .trim_end_matches('/')
+            .to_string();
+        let sink = HttpSink::new(cfg(&secret_url(&authority))).unwrap();
+        let result = sink
+            .commit(SinkBatch::from(vec![p(b"alpha")]))
+            .await
+            .unwrap();
+        assert_eq!(result.dead_lettered.len(), 1);
+        result.dead_lettered[0].1.clone()
+    }
+
+    // security-r4-01: an http-to-https upgrade echoes the configured path
+    // (and query) in its Location; only the target's origin may be printed.
+    #[tokio::test]
+    async fn redirect_reason_prints_only_the_location_origin() {
+        let reason = reason_for_secret_url(format!(
+            "HTTP/1.1 301 Moved Permanently\r\nLocation: https://hooks.example.com\
+             /services/T0/B0/{PATH_SECRET}?X-Amz-Signature={QUERY_SECRET}\r\n\
+             Content-Length: 0\r\n\r\n"
+        ))
+        .await;
+        assert!(
+            !reason.contains(PATH_SECRET) && !reason.contains(QUERY_SECRET),
+            "Location path/query secret leaked into the redirect reason: {reason}"
+        );
+        assert!(reason.contains("301"), "{reason}");
+        assert!(reason.contains("https://hooks.example.com"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn relative_redirect_reason_prints_no_path() {
+        let reason = reason_for_secret_url(format!(
+            "HTTP/1.1 308 Permanent Redirect\r\nLocation: /v2/services/T0/B0/{PATH_SECRET}\r\n\
+             Content-Length: 0\r\n\r\n"
+        ))
+        .await;
+        assert!(!reason.contains(PATH_SECRET), "{reason}");
+        assert!(reason.contains("http://127.0.0.1:"), "{reason}");
+    }
+
+    // sinks-r4-01: Express answers an unknown route with `Cannot POST <path>`,
+    // so a permanent-status body can echo the configured path secret back.
+    #[tokio::test]
+    async fn permanent_body_excerpt_redacts_the_sink_url_path_and_query() {
+        let body = format!(
+            "<pre>Cannot POST /services/T0/B0/{PATH_SECRET}\
+             ?X-Amz-Signature={QUERY_SECRET}&client_secret={QUERY_SECRET}</pre>"
+        );
+        let reason = reason_for_secret_url(format!(
+            "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ))
+        .await;
+        assert!(
+            !reason.contains(PATH_SECRET) && !reason.contains(QUERY_SECRET),
+            "sink URL secret echoed through the body excerpt: {reason}"
+        );
+        assert!(reason.contains("404"), "{reason}");
+        assert!(reason.contains("Cannot POST"), "{reason}");
     }
 
     #[tokio::test]
@@ -1570,6 +1745,59 @@ mod tests {
             "still sending the 1.x body-derived key: {}",
             key_lines[0]
         );
+    }
+
+    /// A one-record heartbeat batch as the drain builds it from `segment`,
+    /// whose header says it was created at `created_at`.
+    fn heartbeat_batch(segment: &str, created_at: i64) -> SinkBatch {
+        let records = vec![p(br#"{"status":"ok"}"#)];
+        let ids = vec![RecordId::for_record(segment, 0, &records[0])];
+        let token = DedupToken::for_payloads(records.iter());
+        SinkBatch::with_segment_context(records, token, ids, created_at)
+    }
+
+    /// sinks-r3-02: in NDJSON mode two distinct segments that each hold one
+    /// byte-identical heartbeat used to send the same `Idempotency-Key` (a pure
+    /// hash of the bytes), so an idempotent endpoint replayed its cached 2xx
+    /// for the second and the drain deleted acked records. The key must differ
+    /// between segments and stay the same on a replay of the same batch.
+    #[tokio::test]
+    async fn ndjson_byte_identical_batches_from_different_segments_get_different_keys() {
+        let captured = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let url = spawn_header_capture_server(Arc::clone(&captured)).await;
+        let sink = HttpSink::new(ndjson_cfg(&url)).unwrap();
+        let first = heartbeat_batch("seg-000001.wab", 1_788_704_730_000_000_000);
+        let second = heartbeat_batch("seg-000002.wab", 1_788_704_760_000_000_000);
+        sink.commit(first.clone()).await.unwrap();
+        sink.commit(second).await.unwrap();
+        sink.commit(first).await.unwrap(); // the drain replaying the first batch
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let headers = captured.lock().unwrap();
+        assert_eq!(headers.len(), 3, "NDJSON mode sends one request per batch");
+        let keys: Vec<String> = headers
+            .iter()
+            .map(|h| {
+                h.lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("idempotency-key:"))
+                    .unwrap_or_else(|| panic!("no Idempotency-Key in:\n{h}"))
+                    .split_once(':')
+                    .unwrap()
+                    .1
+                    .trim()
+                    .to_string()
+            })
+            .collect();
+        assert!(
+            keys[0].starts_with("sha256:") && keys[0].len() == "sha256:".len() + 64,
+            "key shape is sha256:<64 hex>: {}",
+            keys[0]
+        );
+        assert_ne!(
+            keys[0], keys[1],
+            "distinct segments with identical bytes must not share a key"
+        );
+        assert_eq!(keys[0], keys[2], "a replay must present the same key");
     }
 
     #[test]

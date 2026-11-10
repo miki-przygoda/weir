@@ -113,7 +113,9 @@ Each option below lists: **type**, **default**, **valid range**,
 - **Type**: absolute path
 - **Default**: `/run/weir/weir.sock`
 - **Validation**: must be absolute, no `..` components, no null bytes.
-  The parent directory must exist; weir does not create it.
+  The parent directory must exist and be writable by the daemon user;
+  weir does not create it, and refuses to start (before recovery) if it is
+  missing or not writable.
 - **CLI**: `--socket-path <path>`
 - **Env**: `WEIR_SOCKET_PATH`
 - **TOML**: `socket_path`
@@ -697,6 +699,8 @@ line accepts again before the next push arrives, and `weir_wab_cap_rejecting`
 was (fail-closed). A restart over the cap rejects from the first push: a
 synchronous size scan runs after recovery, before the producer socket binds,
 and if that scan fails with a cap set, pushes nack until a scan succeeds.
+That first successful scan judges the WAB against the cap itself, not the
+resume line, so a WAB below the cap accepts at once.
 
 **This is a soft high-water mark, not a hard limit.** The value it is checked
 against is refreshed every 5 seconds, so the WAB can overshoot by up to 5
@@ -937,7 +941,8 @@ alerts; those, with their runbooks, are in
 - **Env**: `WEIR_MAX_PAYLOAD_BYTES`
 - **TOML**: `max_payload_bytes`
 
-Maximum size of a single record payload. The hard cap of 16 MiB is
+Maximum size of a single frame payload: one record for a `Push`, the whole
+batch body for a `PushBatch`. The hard cap of 16 MiB is
 compiled into `weir-core` (`MAX_PAYLOAD_HARD_CAP`) and cannot be
 exceeded at runtime; raising the config value above the hard cap is a
 startup error.
@@ -984,10 +989,16 @@ arbitrary — it is the largest cap for which the `AckBatch` reply (3 bytes plus
 bound weir already publishes, so batching introduces no new largest response and
 no client gains a new allocation maximum.
 
-**When to tune**: lower it alongside `max_payload_bytes` on memory-constrained
-hosts — the two multiply, since a batch of N records each up to
-`max_payload_bytes` is one frame. Raising it toward 2048 trades a larger
-worst-case frame for fewer round trips.
+**When to tune**: the two caps do not multiply. A `PushBatch` is one frame, and
+`max_payload_bytes` caps that frame's whole payload (the batch body: every
+record plus its 4-byte length prefix) before it is read, so a batch can never
+be larger than one record may be. Two 600-byte records under a 1024-byte
+`max_payload_bytes` are refused with `Nack(PayloadTooLarge)` and the connection
+is closed, though each record fits on its own. Worst-case receive memory is
+therefore still `max_connections × max_payload_bytes` whatever this is set to;
+this knob bounds how many records one frame can declare, not the frame's size.
+Lower it to cap the per-record work of one frame; raising it toward 2048 allows
+fewer round trips for small records.
 
 ---
 
@@ -1362,7 +1373,7 @@ without it" error rather than an unknown-value one:
 | `"http"` | POSTs each record to `sink_url`; up to `sink_http_concurrency` POSTs in flight per batch | endpoints that already accept POST bodies |
 | `"mysql"` | writes a whole batch with one multi-row `INSERT` | the IOPS-compression downstream: N records → 1 statement |
 | `"postgres"` | Postgres counterpart to `"mysql"`; multi-row INSERT with `ON CONFLICT DO NOTHING` | same IOPS-compression story when the downstream is Postgres |
-| `"clickhouse"` | one HTTP `INSERT … FORMAT RowBinary` per batch with a sha256 `insert_deduplication_token` (**requires the `clickhouse-sink` build feature**) | bulk inserts into ClickHouse with replay-safe dedup (see the ClickHouse sink section below) |
+| `"clickhouse"` | one HTTP `INSERT … FORMAT RowBinary` per batch with a sha256 `insert_deduplication_token` (the batch key) (**requires the `clickhouse-sink` build feature**) | bulk inserts into ClickHouse with replay-safe dedup (see the ClickHouse sink section below) |
 | `"s3"` | writes each batch as one object to S3-compatible storage — AWS S3, MinIO, Cloudflare R2, Backblaze B2, Ceph (**requires the `s3-sink` build feature**) | durable archive that Athena/DuckDB/Spark read directly. The object key is replay-stable, so the downstream needs **no** dedup support at all ([full guide](../sinks/s3.md)) |
 
 #### `sink_type`
@@ -1400,15 +1411,24 @@ Mind the other exposure surfaces: passing `--sink-url` on the **command line**
 puts the credential in the process argv, visible via `ps aux` to any same-uid
 process; and even `WEIR_SINK_URL` is readable via `/proc/<pid>/environ` or
 `ps eww`. The env var is the best of the three (off disk, out of `ps aux`);
-restrict who can read the daemon's `/proc` entry. weir redacts credentials in
-its own logs and the config-debug line: both the URL **userinfo** password
+restrict who can read the daemon's `/proc` entry. weir keeps the URL's
+credentials out of its own logs. The `weir starting` line and the admin config
+view show only `scheme://host[:port]`, and a URL whose userinfo has no `@host`
+after it (`mysql://weir:password`) shows as `<unparseable>`. The HTTP sink also
+prints only `scheme://host[:port]` of `sink_url` in its `sink: http` startup
+line, its transport-error retries, its health `Down` reason and the admin status
+text. A 3xx is reported with only the origin of its `Location`, and the
+configured path and query are cut out of an error body that echoes them, so a
+webhook token in the path or a presigned signature in any query key
+(`X-Amz-Signature`, `client_secret`, ...) is never printed. The SQL sinks
+(MySQL, Postgres, ClickHouse) scrub the URL **userinfo** password
 (`scheme://user:<redacted>@host`) and the values of known **credential query
 parameters** (`?password=`, `?token=`, `?access_token=`, `?secret=`,
-`?api_key=`/`?apikey=`, `?sig=`/`?signature=`, `?passwd=`/`?pwd=`) are scrubbed
-wherever a sink URL is logged, including inside transport-error strings on every
-retry. This is a defence-in-depth denylist, not a guarantee for arbitrary custom
-credential parameters — prefer a bearer token (`WEIR_SINK_BEARER_TOKEN`) or the
-userinfo form, and treat the `/proc`/`ps` surfaces above as the real boundary.
+`?api_key=`/`?apikey=`, `?sig=`/`?signature=`, `?passwd=`/`?pwd=`) wherever
+they log a URL, including inside transport-error strings on every retry. That
+is a defence-in-depth denylist, not a guarantee for arbitrary custom credential
+parameters — prefer a bearer token (`WEIR_SINK_BEARER_TOKEN`) or the userinfo
+form, and treat the `/proc`/`ps` surfaces above as the real boundary.
 
 For HTTP, the body is the raw payload bytes; `Content-Type` is
 `application/octet-stream`. The endpoint is expected to return:
@@ -1504,10 +1524,11 @@ deployments.
 > **double-counting** on replay. Pick a value and freeze it for the life of the
 > deployment. This applies to:
 >
-> - **ClickHouse** — `insert_deduplication_token`. ClickHouse deduplicates per
->   *block*, so there is no per-record alternative here.
+> - **ClickHouse** — `insert_deduplication_token`, the batch key. ClickHouse
+>   deduplicates per *block*, so there is no per-record alternative here.
 > - **HTTP in `ndjson` batch mode** — one POST carries the whole batch, so the
->   `Idempotency-Key` is the batch's `DedupToken`, not a per-record key.
+>   `Idempotency-Key` is the batch key (its first record and record count), not
+>   a per-record key. See [batch keys](../sinks/batch-keys.md).
 > - **S3** — one object per batch, so the object key names the batch. See
 >   [the S3 sink guide](../sinks/s3.md#why-that-precondition-is-specific-to-this-sink).
 > - **Postgres / MySQL with no `sink_*_id_column`** — the only thing written is
@@ -1550,11 +1571,15 @@ drain to retry the whole segment. The endpoint needs to dedupe to
 avoid double-writes. In per-record mode (`sink_http_batch = "none"`,
 the default) the key is the record's `RecordId`
 (`weir_sink_sdk::RecordId`), derived from the record's WAB coordinate
-(segment file name + index within it) *and* its payload — a retried
+(the segment instance — shard directory, file name and the creation time in
+its header — plus the index within it) *and* its payload — a retried
 record always presents the same key, but two distinct records never
 collide just because their payload bytes match. In `ndjson` mode the
-key is the batch's `DedupToken` — a pure hash of the batch's payload
-bytes (see [`sink_http_batch`](#sink_http_batch)).
+key is the batch key — a sha256 of the batch's WAB coordinate (segment
+`created_at`, first `RecordId`, record count), so two segments carrying
+byte-identical records get different keys (see
+[`sink_http_batch`](#sink_http_batch) and
+[batch keys](../sinks/batch-keys.md)).
 
 **Format**: `sha256:` prefix + 64-char lowercase hex digest. The
 prefix lets endpoints distinguish weir's scheme from other key sources
@@ -1662,8 +1687,20 @@ newlines, use per-record mode (`sink_http_batch = "none"`), where each record is
 its own POST body and newlines are fine.
 
 **Idempotency in NDJSON mode**: a single `Idempotency-Key: sha256:<hex>`
-is sent for the whole batch — the **batch dedup token**, the same
-primitive the ClickHouse sink passes as `insert_deduplication_token`.
+is sent for the whole batch — the **batch key**, the same value the
+ClickHouse sink passes as `insert_deduplication_token`: a sha256 of the
+segment's `created_at`, the batch's first `RecordId` and its record
+count. A replay of the same batch presents the same key, and two
+segments carrying byte-identical records (a heartbeat every 30 s)
+present different keys. The exact preimage is in
+[batch keys](../sinks/batch-keys.md).
+
+> **Changed after 4.1.0.** Through 4.1.0 this key was the batch's
+> `DedupToken`, a pure hash of the payload bytes, so two distinct
+> batches with identical bytes shared a key and the endpoint dropped the
+> second while weir deleted it. After upgrading, a batch that was in
+> flight at the upgrade is re-sent once under the new key, so the
+> endpoint may see it twice, once.
 
 > **Changed in 2.0.** This key was previously a hash of the joined NDJSON
 > request body. It is now derived from the length-delimited record
@@ -1672,7 +1709,7 @@ primitive the ClickHouse sink passes as `insert_deduplication_token`.
 > batch in flight across the upgrade can be delivered twice. Per-record
 > mode is unaffected — it still sends a per-record key.
 
-Because the key is content-derived, it inherits the same batch-stability
+Because the key names the batch, it inherits the same batch-stability
 caveat as ClickHouse's dedup token — see the note under
 [`sink_max_batch_size`](#sink_max_batch_size): changing
 `sink_max_batch_size` across a restart re-splits a replayed segment into
@@ -1838,9 +1875,10 @@ Column that receives each record's **`RecordId`** as 64 lower-hex characters —
 the per-record idempotency key. `CHAR(64)` is the right type. Put the `UNIQUE`
 constraint here.
 
-A `RecordId` is the record's WAB coordinate — the segment it was written to plus
-its absolute index *within that segment* — hashed with its bytes. That gives it
-the two properties a dedup key needs and a content hash cannot have together:
+A `RecordId` is the record's WAB coordinate — the segment it was written to
+(its shard, file name and header creation time) plus its absolute index
+*within that segment* — hashed with its bytes. That gives it the two
+properties a dedup key needs and a content hash cannot have together:
 
 - **Unique across records with identical bytes.** A payload hash collides on a
   repeated heartbeat or a repeated metering event, and `INSERT IGNORE` then
@@ -1855,29 +1893,18 @@ requeue` re-pushes records into a *new* segment, so they arrive as new ids and
 are inserted again. Both requeue commands say so before asking for
 confirmation.
 
-> **Feed each table from one weir instance with a persistent `wab_dir`.** A
-> `RecordId` is unique only within one `wab_dir`'s history. The segment part of
-> it is the file's path relative to `wab_dir` (`shard_03/seg_00000042.wab.sealed`),
-> and every `wab_dir` numbers its segments from 1 in each shard. Nothing in the
-> id says *which* `wab_dir`. So two weir instances writing to the same table,
-> or one instance whose `wab_dir` was wiped, recreated or restored from an older
-> backup (or had its `.confirmed` tombstones deleted), will reuse coordinates
-> another record already had. A record whose bytes match the earlier record at
-> the same coordinate then gets an **identical** `RecordId`, although it is a
-> different record. That is exactly the fixed-shape case the id exists for: a
-> heartbeat, a "one unit consumed" event. `ignore` (the default) and `plain`
-> with this column both treat a present id as *already delivered*, so the
-> second record is **silently dropped**: acked by weir, delivered, and never
-> stored, with no dead-letter and no error.
->
-> Run one weir instance per table, on a `wab_dir` that survives restarts and
-> redeploys (a persistent volume, not an `emptyDir` or a container's writable
-> layer). If several instances must feed one destination, give each its own
-> table and combine them downstream (a view or a `UNION ALL`); weir writes
-> only the payload and id columns, so it cannot tell one table which instance
-> a row came from. A future major release may mix a per-`wab_dir` instance
-> nonce into the id; the issue is parked in the repository's
-> `docs/explorations/parked-future-directions.md`.
+> **The segment part names the segment instance, not only its file.** It is
+> the file's path relative to `wab_dir` plus `@` and the creation time in the
+> segment's header, in unix nanoseconds as 16 hex digits
+> (`shard_03/seg_00000042.wab.sealed@18d2c17997b60400`). Segment numbers
+> restart from 1 in each shard of a fresh `wab_dir`, after a restart on one
+> that has drained empty, and on a pod redeployed without its volume. The
+> creation time keeps a reused file name from reusing the ids of records
+> already delivered, so a heartbeat or a "one unit consumed" event at the same
+> index of a reused name gets a new id and is stored, where `ignore` (the default) and
+> `plain` would otherwise treat it as *already delivered* and drop it. A replay
+> of the same segment reads the same header, so its records keep their ids and
+> the replay still deduplicates.
 
 Rejected at startup: an id column equal to `sink_mysql_column` (the generated
 statement would name one column twice, which MySQL rejects permanently — the
@@ -1902,9 +1929,9 @@ How to phrase the INSERT statement.
   `UNIQUE` constraint on [`sink_mysql_id_column`](#sink_mysql_id_column) so
   crash-recovery retries are idempotent without consumer-side dedup. A `UNIQUE`
   on the payload instead discards distinct records that share bytes. The id
-  is unique only within one `wab_dir`: feed the table from a single weir
-  instance with a persistent `wab_dir`, or a second instance's records can be
-  dropped as duplicates (see [`sink_mysql_id_column`](#sink_mysql_id_column)).
+  names the segment instance a record was read from, so a segment name reused
+  after a restart does not reuse its ids (see
+  [`sink_mysql_id_column`](#sink_mysql_id_column)).
 - `"plain"` → `INSERT INTO ...`. Duplicates surface as `ER_DUP_ENTRY`
   (code 1062) and are resolved row by row rather than retried; see
   [Plain insert mode and duplicate keys](#plain-insert-mode-and-duplicate-keys-mysql-and-postgres).
@@ -1921,6 +1948,7 @@ How to phrase the INSERT statement.
 | 1213 `ER_LOCK_DEADLOCK` | transient | retry |
 | 1290 `ER_OPTION_PREVENTS_STATEMENT` (e.g. `--read-only`) | transient | retry |
 | 1317 `ER_QUERY_INTERRUPTED` | transient | retry |
+| 1040 `ER_CON_COUNT_ERROR`, 1203 `ER_TOO_MANY_USER_CONNECTIONS`, 1053 `ER_SERVER_SHUTDOWN` | transient | retry (the server is at its connection limit or restarting) |
 | 1045 `ER_ACCESS_DENIED_ERROR`, 1044 `ER_DBACCESS_DENIED_ERROR`, 1142 `ER_TABLEACCESS_DENIED_ERROR` | transient | retry until the grant or password is fixed (a misconfiguration, not the record's fault) |
 | 1062 `ER_DUP_ENTRY` (Plain mode only) | resolved row by row | see [Plain insert mode and duplicate keys](#plain-insert-mode-and-duplicate-keys-mysql-and-postgres) |
 | 1064 `ER_PARSE_ERROR`, 1146 `ER_NO_SUCH_TABLE`, 1054 `ER_BAD_FIELD_ERROR` | permanent | dead-letter the batch with the server-supplied message |
@@ -2023,9 +2051,10 @@ Column that receives each record's **`RecordId`** as 64 lower-hex characters —
 the per-record idempotency key. `CHAR(64)` is the right type. Put the `UNIQUE`
 constraint here.
 
-A `RecordId` is the record's WAB coordinate — the segment it was written to plus
-its absolute index *within that segment* — hashed with its bytes. That gives it
-the two properties a dedup key needs and a content hash cannot have together:
+A `RecordId` is the record's WAB coordinate — the segment it was written to
+(its shard, file name and header creation time) plus its absolute index
+*within that segment* — hashed with its bytes. That gives it the two
+properties a dedup key needs and a content hash cannot have together:
 
 - **Unique across records with identical bytes.** A payload hash collides on a
   repeated heartbeat or a repeated metering event, and `ON CONFLICT DO NOTHING`
@@ -2040,29 +2069,18 @@ requeue` re-pushes records into a *new* segment, so they arrive as new ids and
 are inserted again. Both requeue commands say so before asking for
 confirmation.
 
-> **Feed each table from one weir instance with a persistent `wab_dir`.** A
-> `RecordId` is unique only within one `wab_dir`'s history. The segment part of
-> it is the file's path relative to `wab_dir` (`shard_03/seg_00000042.wab.sealed`),
-> and every `wab_dir` numbers its segments from 1 in each shard. Nothing in the
-> id says *which* `wab_dir`. So two weir instances writing to the same table,
-> or one instance whose `wab_dir` was wiped, recreated or restored from an older
-> backup (or had its `.confirmed` tombstones deleted), will reuse coordinates
-> another record already had. A record whose bytes match the earlier record at
-> the same coordinate then gets an **identical** `RecordId`, although it is a
-> different record. That is exactly the fixed-shape case the id exists for: a
-> heartbeat, a "one unit consumed" event. `on_conflict_do_nothing` (the default) and `plain`
-> with this column both treat a present id as *already delivered*, so the
-> second record is **silently dropped**: acked by weir, delivered, and never
-> stored, with no dead-letter and no error.
->
-> Run one weir instance per table, on a `wab_dir` that survives restarts and
-> redeploys (a persistent volume, not an `emptyDir` or a container's writable
-> layer). If several instances must feed one destination, give each its own
-> table and combine them downstream (a view or a `UNION ALL`); weir writes
-> only the payload and id columns, so it cannot tell one table which instance
-> a row came from. A future major release may mix a per-`wab_dir` instance
-> nonce into the id; the issue is parked in the repository's
-> `docs/explorations/parked-future-directions.md`.
+> **The segment part names the segment instance, not only its file.** It is
+> the file's path relative to `wab_dir` plus `@` and the creation time in the
+> segment's header, in unix nanoseconds as 16 hex digits
+> (`shard_03/seg_00000042.wab.sealed@18d2c17997b60400`). Segment numbers
+> restart from 1 in each shard of a fresh `wab_dir`, after a restart on one
+> that has drained empty, and on a pod redeployed without its volume. The
+> creation time keeps a reused file name from reusing the ids of records
+> already delivered, so a heartbeat or a "one unit consumed" event at the same
+> index of a reused name gets a new id and is stored, where `on_conflict_do_nothing` (the default) and
+> `plain` would otherwise treat it as *already delivered* and drop it. A replay
+> of the same segment reads the same header, so its records keep their ids and
+> the replay still deduplicates.
 
 With this set each row takes **two** bind parameters instead of one. Postgres's
 wire protocol caps a statement at 65 535 parameters and `sink_max_batch_size` is
@@ -2093,10 +2111,10 @@ it unset every statement weir generates is byte-identical to previous releases.
 
 Plain mode without `sink_postgres_id_column` draws a startup WARN.
 
-Either mode with an id column assumes **one weir instance with a persistent
-`wab_dir` feeds the table**: a `RecordId` is unique only within one `wab_dir`,
-so a second instance, or a reset `wab_dir`, can produce the id of a record
-already stored, and both modes then drop the new record as a duplicate (see
+Either mode with an id column treats a present id as a record already stored.
+The id names the segment instance a record was read from, header creation time
+included, so a segment name reused after a restart or a reset `wab_dir` does
+not reuse the ids of records already stored (see
 [`sink_postgres_id_column`](#sink_postgres_id_column)).
 
 #### Error classification
@@ -2108,6 +2126,7 @@ already stored, and both modes then drop the new record as a duplicate (see
 | `55P03` `lock_not_available` | transient | retry |
 | `57014` `query_canceled` | transient | retry |
 | `57P01` `admin_shutdown`, `57P02` `crash_shutdown`, `57P03` `cannot_connect_now` | transient | retry |
+| `25006` `read_only_sql_transaction` (a hot standby, or `default_transaction_read_only = on`) | transient | retry |
 | `23505` `unique_violation` (Plain mode only) | resolved row by row | see [Plain insert mode and duplicate keys](#plain-insert-mode-and-duplicate-keys-mysql-and-postgres) |
 | `42P01` `undefined_table`, `42703` `undefined_column`, `42601` `syntax_error`, `28P01` `invalid_password` | permanent | dead-letter the batch with the server-supplied message |
 | anything else | permanent | dead-letter the batch |
@@ -2251,13 +2270,22 @@ sent as HTTP basic auth, redacted in logs).
 
 The drain is at-least-once per segment, so a crash mid-commit replays the
 batch. ClickHouse has no `ON CONFLICT`; instead the sink sends a
-deterministic `insert_deduplication_token = sha256(batch)` on each insert,
-so a replayed byte-identical batch is deduplicated by ClickHouse **provided
+deterministic `insert_deduplication_token` on each insert: the batch key, a
+sha256 of the segment's `created_at`, the batch's first `RecordId` and its
+record count (exact preimage in [batch keys](../sinks/batch-keys.md)). A
+replayed batch is deduplicated by ClickHouse **provided
 the target table uses a dedup-capable engine** — a `Replicated*MergeTree`
 (where `insert_deduplicate` is on by default) or a `MergeTree` with
 `non_replicated_deduplication_window` set. Mind the dedup window (default
 last ~100 blocks). If the engine isn't dedup-capable, the token is harmless
 and dedup falls back to your table design.
+
+Two batches carrying byte-identical records from different segments (a
+heartbeat every 30 s) get different tokens, so ClickHouse inserts both.
+Through 4.1.0 the token was the batch's `DedupToken`, a pure hash of the
+bytes, and ClickHouse dropped the second as a duplicate block. After
+upgrading, a batch that was in flight at the upgrade is re-sent once under
+the new token, so it may be inserted twice, once.
 
 Reference schema:
 
@@ -2284,9 +2312,12 @@ SETTINGS non_replicated_deduplication_window = 100;
 
 - **Type**: string
 - **Default**: `"info"`
-- **Valid values**: `trace`, `debug`, `info`, `warn`, `error`, or any
-  `tracing-subscriber::EnvFilter` directive (e.g.
-  `"weir_server=debug,info"` to set per-module levels).
+- **Valid values**: `trace`, `debug`, `info`, `warn`, `error`, `off`, or
+  any `tracing-subscriber::EnvFilter` directive (e.g.
+  `"weir_server=debug,info"` to set per-module levels). A bare word must be
+  a level name: a target is written `target=level`. A value that is not
+  valid (a misspelt level such as `warning`, for instance) is logged as a
+  WARN at startup and weir logs at `info`.
 - **CLI**: `--log-level <level>`
 - **Env**: `WEIR_LOG_LEVEL`
 - **TOML**: `log_level`

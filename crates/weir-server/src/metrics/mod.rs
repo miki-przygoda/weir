@@ -672,6 +672,10 @@ pub(crate) struct Metrics {
     /// succeed but the data is generally lost ("fsyncgate"). Check logs for
     /// the shard_id and error string.
     pub wab_fsync_failures: Counter<u64, AtomicU64>,
+    /// Segment seals (rotation, timed or shutdown) that returned an error. The
+    /// segment is retired unsealed, so its already-acked records are stranded
+    /// in the `.wab` until a restart's crash recovery seals and delivers them.
+    pub wab_seal_failures: Counter<u64, AtomicU64>,
 
     // ── Sink / drain ──────────────────────────────────────────────────────────
     pub sink_commit_duration: Histogram,
@@ -1042,6 +1046,13 @@ impl Metrics {
              the kernel buffered the write but couldn't push it to stable storage. \
              Producers whose records were in the failed fsync receive \
              Nack(InternalError). Check logs for the shard_id and error string"
+        );
+        let wab_seal_failures = reg!(
+            Counter::<u64, AtomicU64>::default(),
+            "weir_wab_seal_failures",
+            "Segment seals (rotation, timed or shutdown) that returned an error. \
+             The segment is retired unsealed: its acked records are stranded in \
+             the .wab until a restart's crash recovery seals and delivers them"
         );
         let sink_commit_duration = reg!(
             Histogram::new(LATENCY_BUCKETS.iter().copied()),
@@ -1578,6 +1589,7 @@ impl Metrics {
             wab_flusher_panics,
             drain_panics,
             wab_fsync_failures,
+            wab_seal_failures,
             sink_commit_duration,
             sink_commit_records,
             sink_health,
@@ -2000,6 +2012,7 @@ mod tests {
             "weir_drain_state",
             "weir_dead_letter_blocked_duration_seconds",
             "weir_wab_fsync_failures",
+            "weir_wab_seal_failures",
             "weir_wab_flusher_panics",
             "weir_wab_cap_rejections",
             "weir_wab_unexpected_mode",
@@ -2098,25 +2111,25 @@ mod tests {
     fn drain_state_and_sink_health_pre_initialised() {
         let (_m, reg) = Metrics::new();
         let out = encode_to_string(&reg);
-        assert!(
-            out.contains("draining"),
-            "drain_state draining label missing"
-        );
-        assert!(
-            out.contains("retrying_transient"),
-            "drain_state retrying_transient label missing"
-        );
-        assert!(
-            out.contains("blocked_dead_letter_full"),
-            "drain_state blocked label missing"
-        );
-        // The terminal state must exist at 0 from boot too, so a scraper can
-        // baseline (and alert on) it before the drain has ever stopped.
-        assert!(
-            out.contains("weir_drain_state{state=\"stopped\"} 0"),
-            "drain_state stopped label missing or not pre-initialised to 0:\n{out}"
-        );
-        assert!(out.contains("healthy"), "sink_health healthy label missing");
+        // Match whole sample lines, not bare label words: the weir_drain_state
+        // HELP text itself names state="draining" and state="stopped", so a
+        // substring check would pass with the label never created.
+        for line in [
+            "weir_drain_state{state=\"draining\"} 1.0",
+            "weir_drain_state{state=\"retrying_transient\"} 0.0",
+            "weir_drain_state{state=\"blocked_dead_letter_full\"} 0.0",
+            // The terminal state must exist at 0 from boot too, so a scraper
+            // can baseline (and alert on) it before the drain has ever stopped.
+            "weir_drain_state{state=\"stopped\"} 0.0",
+            "weir_sink_health{state=\"healthy\"} 1.0",
+            "weir_sink_health{state=\"degraded\"} 0.0",
+            "weir_sink_health{state=\"down\"} 0.0",
+        ] {
+            assert!(
+                out.lines().any(|l| l == line),
+                "sample `{line}` missing from the first scrape:\n{out}"
+            );
+        }
     }
 
     /// The label order is the contract operators query by:

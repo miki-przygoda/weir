@@ -327,6 +327,13 @@ pub(crate) fn recover(
     for shard_id in 0..shard_count {
         create_dir_private(shard_dir_path(wab_dir, shard_id))?;
     }
+    // A shard directory just created is linked into `wab_dir`, and that entry
+    // is crash-durable only after `wab_dir` itself is fsynced (the rule
+    // segments and `dead_letter/` already follow). Without this, the first
+    // Durable ack on a fresh `wab_dir` could sit in a shard dir a power loss
+    // removes. Runs before any flusher exists, so no ack precedes it.
+    #[cfg(unix)]
+    segment::sync_path(wab_dir)?;
     recover_open_segments(wab_dir, metrics)?;
     Ok(RecoverySummary {
         shard_dirs: shard_count,
@@ -549,24 +556,19 @@ pub(crate) fn scan_unconfirmed_sealed(
     let mut unconfirmed = Vec::new();
     let mut incomplete = false;
     for sdir in shard_dirs {
+        // Only `shard_<N>` directories are shards (mirrors
+        // recover_open_segments). That skips quarantine/ (parked segments),
+        // dead_letter/ (owned by the DeadLetterWriter, never replayed as a
+        // shard) and anything foreign, such as a root-owned `lost+found` at a
+        // mount root, whose EACCES would otherwise fail startup replay and
+        // mark every rescan incomplete.
+        let Some(idx) = segment::shard_id_from_path(&sdir) else {
+            continue;
+        };
         if !sdir.is_dir() {
             continue;
         }
-        let name = sdir
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .into_owned();
-        // Skip the daemon's reserved subdirs (mirrors recover_open_segments):
-        // quarantine/ holds parked segments; dead_letter/ is owned by the
-        // DeadLetterWriter and must not be replayed as a shard.
-        if name == "quarantine" || name == "dead_letter" {
-            continue;
-        }
         if let Some(shard_count) = shard_count
-            && let Some(idx) = name
-                .strip_prefix("shard_")
-                .and_then(|n| n.parse::<usize>().ok())
             && idx >= shard_count
         {
             warn!(
@@ -835,10 +837,16 @@ fn due_timed_seal(
 /// drain. Shared by both timers so the metric bump, the hand-off and the
 /// failure behaviour cannot drift apart depending on which one fired.
 ///
-/// Returns `true` when no segment is active any more (sealed, or there was
-/// none) — the caller's cue to stop the idle clock until the next write opens a
-/// fresh segment. Returns `false` when the seal failed and the segment is still
-/// active, so the next cycle retries instead of losing the attempt.
+/// Returns `true` when no segment is active any more — the caller's cue to stop
+/// the idle clock until the next write opens a fresh segment. That includes a
+/// FAILED seal: [`ShardWriter::seal_current`] has already taken the segment
+/// (`WabSegment::seal` consumes it), so there is nothing left to retry, and a
+/// retry would not be sound anyway — a failed fsync drops the dirty pages and a
+/// half-written sentinel cannot be appended to. The already-acked records stay
+/// in the unsealed `.wab`, which only startup recovery rescans, so they are
+/// stranded until the daemon restarts; the failure is counted
+/// (`weir_wab_seal_failures_total`) and logged at ERROR so that is visible.
+/// Returns `false` only if a segment is somehow still active afterwards.
 fn seal_before_size_threshold<C: BlockingClock>(
     writer: &mut ShardWriter,
     drain_tx: &Sender<PathBuf>,
@@ -872,13 +880,18 @@ fn seal_before_size_threshold<C: BlockingClock>(
         }
         Ok(None) => true,
         Err(e) => {
-            warn!(
+            error!(
                 shard = shard_id,
                 error = %e,
                 reason = reason.as_str(),
-                "timed seal failed; will retry next cycle (segment stays active)"
+                "timed seal failed; the segment is retired unsealed and is NOT \
+                 retried. Its already-acked records stay in the .wab on disk, \
+                 which nothing at runtime rescans, so they are STRANDED until the \
+                 daemon restarts and crash recovery seals and delivers them. \
+                 Stranded, not lost: clear the storage fault and restart to \
+                 release them (weir_wab_seal_failures_total)"
             );
-            false
+            !writer.has_active_segment()
         }
     }
 }
@@ -1262,6 +1275,7 @@ fn flush_batch<C: BlockingClock>(
                     Box::new(RecordSlot {
                         segment,
                         index: writer.last_record_index(),
+                        created_at: writer.last_segment_created_at(),
                     })
                 })
             } else {
@@ -1939,6 +1953,43 @@ mod tests {
         fs::remove_dir_all(dir).ok();
     }
 
+    /// A directory under `wab_dir` that is not `shard_<N>` (here `lost+found`
+    /// at a mount root, root-owned and unreadable) is not a shard: startup
+    /// replay must not fail on it, and the rescan must not mark every poll
+    /// incomplete because of it.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_foreign_directory_is_not_a_shard() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp_dir("scan_unreadable_foreign");
+        let first = sealed_in_shard(&shard_dir_path(&dir, 0), 1, b"first");
+        let foreign = dir.join("lost+found");
+        crate::testutil::mkdir_p(&foreign);
+        fs::set_permissions(&foreign, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_dir(&foreign).is_ok() {
+            fs::set_permissions(&foreign, fs::Permissions::from_mode(0o700)).unwrap();
+            eprintln!("skipping: a mode-000 directory is still readable (root?)");
+            fs::remove_dir_all(dir).ok();
+            return;
+        }
+
+        let (m, _reg) = crate::metrics::Metrics::new();
+        let startup = scan_unconfirmed_sealed(&dir, Some(1), &m, &|_| false, false);
+        let rescan = scan_unconfirmed_sealed(&dir, None, &m, &|_| false, false);
+        fs::set_permissions(&foreign, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let startup = startup.expect("startup replay ignores a non-shard directory");
+        assert_eq!(startup.segments, vec![first.clone()]);
+        assert!(!startup.incomplete);
+        let rescan = rescan.expect("the rescan ignores a non-shard directory");
+        assert_eq!(rescan.segments, vec![first]);
+        assert!(
+            !rescan.incomplete,
+            "a foreign directory is not a skipped shard"
+        );
+        fs::remove_dir_all(dir).ok();
+    }
+
     /// A stale `*.confirmed.tmp` is the leftover of a sidecar write that died
     /// (a crash, ENOSPC). The scan deletes it; it is never mistaken for a
     /// segment or a sidecar. Something that is not a regular file under that
@@ -2315,6 +2366,56 @@ mod tests {
         );
     }
 
+    /// A timed seal that fails must not be reported as "segment stays active,
+    /// retry next cycle": `seal_current` has already taken the segment, so there
+    /// is nothing left to retry. The acked records sit in an unsealed `.wab`
+    /// that only startup recovery rescans — stranded until a restart, and the
+    /// failure has to be counted so an operator can see it.
+    #[test]
+    fn a_failed_timed_seal_reports_no_active_segment_and_counts_the_failure() {
+        let dir = tmp_dir("timed_seal_fails");
+        let metrics = Arc::new(crate::metrics::Metrics::new().0);
+        let mut writer = ShardWriter::new_with_store(
+            0,
+            dir.clone(),
+            64 * 1024 * 1024,
+            Arc::clone(&metrics),
+            Arc::new(FsSegmentStore),
+            Compression::None,
+            1,
+        );
+        writer.scan_and_advance_counter().unwrap();
+        writer.write_record(b"acked-before-the-timer").unwrap();
+        let active = segment_path(&dir, 1);
+        assert!(active.exists(), "the record opened seg 1");
+        // Occupy the sealed name: WabSegment::seal refuses to rename over it.
+        fs::write(segment::sealed_path_for(&active), b"occupied").unwrap();
+
+        let (drain_tx, drain_rx) = crossbeam_channel::bounded::<PathBuf>(1);
+        let no_active = seal_before_size_threshold(
+            &mut writer,
+            &drain_tx,
+            0,
+            &metrics,
+            TimedSeal::Idle,
+            &crate::wab::dst::SimClock::new(),
+            &handoff::HandoffState::detached(0, Arc::clone(&metrics)),
+        );
+
+        assert!(
+            no_active,
+            "seal_current took the segment before failing, so none is active"
+        );
+        assert!(!writer.has_active_segment());
+        assert!(drain_rx.try_recv().is_err(), "nothing was handed off");
+        assert!(
+            active.exists(),
+            "the unsealed .wab stays on disk for startup recovery"
+        );
+        assert_eq!(metrics.wab_seal_failures.get(), 1);
+        fs::remove_dir_all(dir).ok();
+    }
+
     #[test]
     fn a_flusher_marks_its_shard_up_after_the_counter_scan_and_returns_input_closed() {
         let slot = ShardSlot::detached();
@@ -2478,6 +2579,33 @@ mod tests {
                 assert_eq!(mode & 0o777, 0o700, "shard_{id:02} must be private");
             }
         }
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// The shard directories `recover` creates are linked into `wab_dir`, and
+    /// that link is crash-durable only once `wab_dir` itself is fsynced. The
+    /// first Durable ack on a fresh `wab_dir` lands in a segment under one of
+    /// them, so `recover` must fsync `wab_dir` before any flusher starts, and
+    /// a failed fsync must fail startup rather than ack into an entry a power
+    /// loss could undo.
+    #[cfg(unix)]
+    #[test]
+    fn recover_fsyncs_wab_dir_so_new_shard_dirs_are_durable() {
+        use crate::wab::segment::sync_hook;
+        let dir = tmp_dir("recover_fsyncs_wab_dir");
+        let metrics = Arc::new(Metrics::new().0);
+
+        sync_hook::fail(&dir, libc::EIO, 0);
+        recover(&dir, 2, &metrics).unwrap();
+        assert!(
+            sync_hook::calls(&dir) >= 1,
+            "recover must fsync wab_dir after creating the shard dirs"
+        );
+
+        sync_hook::fail(&dir, libc::EIO, 1);
+        let err = recover(&dir, 2, &metrics).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EIO));
+        sync_hook::forget(&dir);
         fs::remove_dir_all(dir).ok();
     }
 

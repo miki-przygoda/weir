@@ -162,9 +162,10 @@ pub(crate) fn build_drain_spawner(
                 HttpBatchMode::PerRecord => config.sink_http_concurrency.to_string(),
             };
             info!(
-                // The URL may carry userinfo (user:password@host); redact the
-                // password so it never reaches a log line (S25).
-                url = %crate::sink::redact_url_password(&url),
+                // Only `scheme://host[:port]`: the URL may carry a secret in
+                // its userinfo (S25), its path (webhook tokens) or any query
+                // key (presigned signatures), which no denylist can enumerate.
+                url = %crate::status::config_view::url_origin(&url),
                 bearer = bearer_token.is_some(),
                 timeout_secs = config.sink_timeout_secs,
                 max_batch_size = config.sink_max_batch_size,

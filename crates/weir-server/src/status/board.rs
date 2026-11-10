@@ -203,7 +203,7 @@ const NO_UID: u64 = u64::MAX;
 #[cfg_attr(not(test), allow(dead_code))] // PR 2 constructs these
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct InFlight {
-    /// `wab::segment::segment_identity` of the segment.
+    /// `wab::segment::segment_address` of the segment.
     pub segment: String,
     pub attempt: u32,
     pub retries_left: u32,

@@ -197,6 +197,64 @@ fn feature_compiled(feature: &str) -> bool {
     }
 }
 
+/// A config-file error that names where the problem is but not what was
+/// written there. `toml::de::Error`'s Display quotes the offending source line
+/// on a syntax error and serde quotes the offending value on a type error
+/// (`invalid type: string "..."`); either can be a credential, and `main`
+/// prints the error to stderr. This keeps the position, the parser's message
+/// and the key path, and drops the line and the value.
+#[derive(Debug)]
+struct RedactedTomlError(String);
+
+impl RedactedTomlError {
+    /// A syntax error from parsing `contents`: line and column plus the
+    /// parser's message, never the line itself.
+    fn syntax(e: &toml::de::Error, contents: &str) -> Self {
+        let message = e.message().trim_end();
+        let Some(start) = e.span().map(|s| s.start) else {
+            return Self(format!("TOML syntax error: {message}"));
+        };
+        let before = contents.get(..start).unwrap_or(contents);
+        let line = before.matches('\n').count() + 1;
+        let column = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+        Self(format!(
+            "TOML syntax error at line {line}, column {column}: {message}"
+        ))
+    }
+
+    /// A value that does not fit its key: the key path and what was expected,
+    /// never the value given.
+    fn value(e: &toml::de::Error) -> Self {
+        // serde's messages are "<what was given>, expected <what fits>"; the
+        // first half can quote the value, so only the second half is kept.
+        let expected = e
+            .message()
+            .rsplit_once(", expected ")
+            .map(|(_, exp)| exp.trim_end());
+        // With no source span, the Display is the message followed by an
+        // `in `<key path>`` line. The message is a prefix and is dropped.
+        let shown = e.to_string();
+        let key = shown
+            .strip_prefix(e.message())
+            .and_then(|rest| rest.lines().find_map(|l| l.trim().strip_prefix("in ")))
+            .map(str::to_owned);
+        Self(match (key, expected) {
+            (Some(k), Some(exp)) => format!("invalid value for {k}: expected {exp}"),
+            (Some(k), None) => format!("invalid value for {k}"),
+            (None, Some(exp)) => format!("invalid value: expected {exp}"),
+            (None, None) => "invalid value".to_owned(),
+        })
+    }
+}
+
+impl std::fmt::Display for RedactedTomlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RedactedTomlError {}
+
 /// Reads the TOML config file, returning the parsed layer plus any advisory
 /// warnings (unknown / feature-gated keys). Warnings are returned rather than
 /// `warn!`'d because this runs before the tracing subscriber is initialised;
@@ -215,7 +273,7 @@ pub(super) fn read(path: &Path) -> Result<Option<(PartialConfig, Vec<String>)>, 
 
     let value: toml::Value = toml::from_str(&contents).map_err(|e| ConfigError::ParseError {
         field: "config file",
-        source: Box::new(e),
+        source: Box::new(RedactedTomlError::syntax(&e, &contents)),
     })?;
 
     let warnings = collect_unknown_key_warnings(&value);
@@ -225,7 +283,7 @@ pub(super) fn read(path: &Path) -> Result<Option<(PartialConfig, Vec<String>)>, 
             .try_into()
             .map_err(|e: toml::de::Error| ConfigError::ParseError {
                 field: "config file",
-                source: Box::new(e),
+                source: Box::new(RedactedTomlError::value(&e)),
             })?;
 
     let s = raw.server.unwrap_or_default();
@@ -500,5 +558,59 @@ mod tests {
             "admin keys must not be reported as unknown: {warnings:?}"
         );
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Reads `contents` as a config file and returns the error `main` would
+    /// print, in the `{:?}` form `main`'s `?` uses.
+    fn read_err(tag: &str, contents: &str) -> String {
+        let dir = crate::testutil::scratch_dir(tag);
+        crate::testutil::mkdir_p(&dir);
+        let path = dir.join("weir.toml");
+        std::fs::write(&path, contents).unwrap();
+        let err = match read(&path) {
+            Ok(_) => panic!("{tag}: the config must not parse"),
+            Err(e) => e,
+        };
+        std::fs::remove_dir_all(&dir).ok();
+        format!("{err:?}")
+    }
+
+    /// A TOML syntax error must not echo the offending line: toml's Display
+    /// prints it verbatim, and a credential on that line went to stderr. The
+    /// position must still be there for the operator to find it.
+    #[test]
+    fn syntax_error_does_not_echo_the_offending_line() {
+        let err = read_err(
+            "filecfg_syntax_secret",
+            "[server]\nsink_s3_secret_access_key = \"wJalrXUtnFEMI/K7MDENG\" x\n",
+        );
+        assert!(!err.contains("wJalrXUtnFEMI"), "secret printed: {err}");
+        assert!(err.contains("line 2"), "position lost: {err}");
+
+        let err = read_err(
+            "filecfg_syntax_url",
+            "[server]\nsink_url = \"https://u:hunter2@h/x\n",
+        );
+        assert!(!err.contains("hunter2"), "secret printed: {err}");
+        assert!(err.contains("line 2"), "position lost: {err}");
+    }
+
+    /// A value of the wrong type must not echo the value either: serde's
+    /// "invalid type: string \"...\"" quotes it. The key must still be named.
+    #[test]
+    fn type_error_does_not_echo_the_value() {
+        let err = read_err(
+            "filecfg_type_secret",
+            "[server]\nshard_count = \"wJalrXUtnFEMI/K7MDENG\"\n",
+        );
+        assert!(!err.contains("wJalrXUtnFEMI"), "value printed: {err}");
+        assert!(err.contains("shard_count"), "key lost: {err}");
+
+        let err = read_err(
+            "filecfg_type_int",
+            "[server]\nsink_s3_secret_access_key = 918273645\n",
+        );
+        assert!(!err.contains("918273645"), "value printed: {err}");
+        assert!(err.contains("sink_s3_secret_access_key"), "key lost: {err}");
     }
 }
