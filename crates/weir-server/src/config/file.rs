@@ -260,10 +260,10 @@ impl std::error::Error for RedactedTomlError {}
 /// `warn!`'d because this runs before the tracing subscriber is initialised;
 /// `Config::load` replays them afterward (F54).
 ///
-/// A file that does not exist is `Ok(None)`, not an error: env-only
-/// deployments (the Docker image always passes `--config`) run without one.
-/// It is no longer silent, though: `Config::load` turns `None` into a WARN
-/// naming the path (spec §3.4).
+/// A file that does not exist is `Ok(None)` here; `Config::load` decides what
+/// that means (spec §3.4, D10): an explicit `--config` is a startup error, the
+/// implicit default path is not (env-only deployments, such as the Docker
+/// image, run without one).
 pub(super) fn read(path: &Path) -> Result<Option<(PartialConfig, Vec<String>)>, ConfigError> {
     let contents = match std::fs::read_to_string(path) {
         Ok(c) => c,

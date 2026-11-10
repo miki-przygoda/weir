@@ -244,7 +244,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         warn!("config: {w}");
     }
     // Name the config source, so "which file did it read?" is answerable from
-    // the log alone. A missing file has its own WARN above (spec §3.4).
+    // the log alone. Only the implicit default path can be missing here (an
+    // explicit --config that does not exist failed Config::load, D10); with a
+    // noop sink that also has its NOOP SINK WARN above (spec §3.4).
     info!(
         config_file = %config_source.path.display(),
         origin = if config_source.explicit { "--config" } else { "default path" },

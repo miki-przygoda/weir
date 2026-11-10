@@ -131,9 +131,10 @@ pub(super) const DEFAULT_CONFIG_PATH: &str = "/etc/weir/weir.toml";
 /// Which config file to read, and whether the operator named it.
 ///
 /// `--config` defaults to [`DEFAULT_CONFIG_PATH`], so the path alone cannot tell
-/// an operator's explicit `--config /etc/weir/weir.toml` (the Docker image's
-/// CMD) from the implicit default. `explicit` keeps that distinction for the
-/// missing-file warning (spec §3.4).
+/// an operator's explicit `--config /etc/weir/weir.toml` (the systemd unit's
+/// `ExecStart`) from the implicit default. `explicit` keeps that distinction: a
+/// missing explicit file is a startup error, a missing default is not (spec
+/// §3.4, D10).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ConfigPath {
     pub(crate) path: PathBuf,
@@ -468,9 +469,9 @@ mod tests {
                 explicit: true
             }
         );
-        // Explicit even when it names the default path (the Docker CMD does).
-        let (_, docker) = parse_from(args(&["--config", DEFAULT_CONFIG_PATH])).unwrap();
-        assert!(docker.explicit);
+        // Explicit even when it names the default path (the systemd unit does).
+        let (_, unit) = parse_from(args(&["--config", DEFAULT_CONFIG_PATH])).unwrap();
+        assert!(unit.explicit);
         let (_, implicit) = parse_from(args(&[])).unwrap();
         assert_eq!(
             implicit,
