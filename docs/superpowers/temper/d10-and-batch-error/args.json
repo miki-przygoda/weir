@@ -1,0 +1,88 @@
+{
+  "epic": "d10-and-batch-error",
+  "repo": "/Users/miki_przygoda/Projects/GitHub-Projects/weir",
+  "branch": "epic/d10-and-batch-error",
+  "base": "main",
+  "default_branch": "main",
+  "spec": "docs/superpowers/temper/d10-and-batch-error/spec.md",
+  "plan": "docs/superpowers/temper/d10-and-batch-error/plan.md",
+  "log": "docs/superpowers/temper/d10-and-batch-error/log.md",
+  "host": {
+    "kind": "ssh",
+    "name": "beast",
+    "root": "/home/miki_przygoda/work/weir",
+    "clone": "/srv/bulk/Projects/weir/src"
+  },
+  "gates": {
+    "quick": "ssh beast 'cd <worktree> && JOBQ_SUBMITTER=temper-cleanup ~/.local/bin/jobq submit --profile rust --project weir --cores 4 --mem 4G --timeout 3h --cwd \"$(pwd -P)\" --name <label>-quick -- bash .temper/gate-quick.sh', then `~/.local/bin/jobq wait <id>` until it ends (see the build rule)",
+    "full": "ssh beast 'cd <worktree> && JOBQ_SUBMITTER=temper-cleanup ~/.local/bin/jobq submit --profile rust --project weir --cores 4 --mem 8G --timeout 5h --cwd \"$(pwd -P)\" --name <label>-full -- bash .temper/gate-full.sh', then `~/.local/bin/jobq wait <id>` until it ends (see the build rule)"
+  },
+  "build_rule": "Every build, test, clippy or gate on beast runs as a jobq job: never run cargo, a gate script or a test binary directly in your ssh session (beast's ~/agents/CLAUDE.md; a session that compiled outside jobq was OOM-killed). Work in a worktree under ~/work/weir/ on beast; jobq's --cwd is that worktree's physical path (`pwd -P`).\n\nSubmit, then wait in the foreground (a single Bash call must stay under 10 minutes, so never use `jobq run` for a gate, and never end your turn while a job of yours is queued or running):\n  ssh beast 'cd <worktree> && JOBQ_SUBMITTER=temper-cleanup ~/.local/bin/jobq submit --profile rust --project weir --cores 4 --mem 4G --timeout 3h --cwd \"$(pwd -P)\" --name <your-label>-quick -- bash .temper/gate-quick.sh'\n  ssh beast '~/.local/bin/jobq wait <id>'   (call it again, with a Bash timeout of 600000 ms, until the job ends; its exit status is the gate's)\nThe full gate is the same with `--mem 8G --timeout 5h --name <your-label>-full -- bash .temper/gate-full.sh`. One cargo command (a reproduction, a single test) is the same with `--mem 4G --timeout 1h --name <your-label>-run -- bash .temper/gate-run.sh <cargo args>`, e.g. `... -- bash .temper/gate-run.sh test -p weir-wab segment`.\nA job's env is cleared: pass variables as `-- env VAR=value bash .temper/gate-run.sh ...`. Read results from `~/.local/bin/jobq logs <id> --tail 400` (it prints only the last 200 lines by default) and from the gate's summary, /srv/bulk/Projects/weir/logs/gate/<worktree dir name>/latest-<quick|full|run>/summary.txt, whose last line is `GATE <name> rc=N`. A job's peak memory includes page cache: if a job is OOM-killed, resubmit once with a 2G larger --mem and say so in your result. Never cancel or touch another submitter's jobs. Keep at most one job of yours queued or running at a time. Beast's rule is at most 4 builds of this run at once: before each submit, run `ssh beast 'JOBQ_SUBMITTER=temper-cleanup ~/.local/bin/jobq list --mine | grep -cE \" (queued|running) \"'`; while it prints 4 or more, wait with `ssh beast 'sleep 120'` and check again.\nNever set CARGO_TARGET_DIR or make another target dir: the gate slots are the build dirs; a gate that waits for a slot or for jobq's memory is normal. Never run sudo, never run the chaos harness's power-cut campaign, never touch docker images, volumes or containers that aren't weir's, never write the CI-skip token in a commit message. Commits carry only the `Temper-Task` trailer: no Co-Authored-By, Claude-Session or \"Generated with\" lines. Never print a secret or token.\nA fix also adds one line under CHANGELOG.md `## [Unreleased]` (replace its \"Nothing yet.\" line), in `### Fixed`, or `### Changed` for a behaviour an operator can notice, in the file's existing style. The `docs_drift` and `demo_drift` tests guard figures and version strings in the docs: if a fix trips one, fix the doc, never weaken the guard.\nClean up what you start on beast (test processes, tmux servers); leave worktrees in place.",
+  "flaky": [],
+  "tasks": [
+    {
+      "id": "d10-hard-error",
+      "title": "an explicit missing --config refuses to start",
+      "wave": 0,
+      "owns": [
+        "crates/weir-server/src/config/mod.rs",
+        "crates/weir-server/src/config/cli.rs",
+        "crates/weir-server/src/config/file.rs",
+        "crates/weir-server/src/main.rs",
+        "crates/weir-server/tests/system.rs",
+        "crates/weir-server/tests/deploy.rs",
+        "deploy/docker/Dockerfile",
+        "deploy/docker/docker-compose.yml",
+        "docs/operations/configuration.md"
+      ],
+      "uses": [],
+      "provides": [
+        "C1"
+      ],
+      "text": "### d10-hard-error: an explicit missing --config refuses to start\n\n- Owns: `crates/weir-server/src/config/mod.rs`, `crates/weir-server/src/config/cli.rs`, `crates/weir-server/src/config/file.rs`, `crates/weir-server/src/main.rs`, `crates/weir-server/tests/system.rs`, `crates/weir-server/tests/deploy.rs`, `deploy/docker/Dockerfile`, `deploy/docker/docker-compose.yml`, `docs/operations/configuration.md`\n- Uses: none\n- Provides: C1\n- Wave: 0\n\nImplement contract C1. Steps, tests first:\n1. In `crates/weir-server/tests/system.rs`, the test near line 1812 asserts that an explicit `--config` to a missing file still starts and WARNs: replace it with one that asserts the new behaviour (non-zero exit with the C1 message, and no WAB dir, lock or socket created), and add one for the implicit default missing (starts; with no sink configured the NOOP SINK WARN appears). Add unit tests in `config/mod.rs` for the explicit-missing error and its Display.\n2. In `config/mod.rs`: return the C1 error from loading when explicit and not found; drop the explicit branch and the \"will become a startup error\" sentence from `missing_config_file_warning` (it now covers only the implicit case); log the config source at INFO for the implicit-missing case, keeping the NOOP SINK WARN.\n3. `deploy/docker/Dockerfile`: `CMD [\"weir-server\"]`; update the comment above it (bind-mount `/etc/weir/weir.toml` to use a file; pass `--config` only for another path). Check `deploy/docker/docker-compose.yml` for an explicit `--config` and keep it consistent; check `crates/weir-server/tests/deploy.rs` for anything pinning the old CMD.\n4. `docs/operations/configuration.md`: the config-file section says an explicit missing `--config` is a startup error and an implicit missing default is not; remove the \"future minor release\" wording. Leave `deploy/systemd/weir.service` unchanged (owner, 10 Nov).\n5. Quick gate green."
+    },
+    {
+      "id": "client-too-many-records",
+      "title": "a batch over the record cap reports a count",
+      "wave": 0,
+      "owns": [
+        "crates/weir-client/src/client.rs",
+        "crates/weir-client/src/unix.rs",
+        "crates/weir-client/tests/client_server.rs",
+        "crates/weir-client/tests/protocol.rs",
+        "crates/weir-client/README.md"
+      ],
+      "uses": [],
+      "provides": [
+        "C2"
+      ],
+      "text": "### client-too-many-records: a batch over the record cap reports a count\n\n- Owns: `crates/weir-client/src/client.rs`, `crates/weir-client/src/unix.rs`, `crates/weir-client/tests/client_server.rs`, `crates/weir-client/tests/protocol.rs`, `crates/weir-client/README.md`\n- Uses: none\n- Provides: C2\n- Wave: 0\n\nImplement contract C2. Steps, tests first:\n1. A test that `push_batch` with `MAX_BATCH_RECORDS_HARD_CAP + 1` one-byte records returns `TooManyRecords { count: 2049, limit: 2048 }`, sends no bytes, and that the same client then pushes successfully; a test of the Display text; a test that `is_recoverable()` is true and `is_poisoned()` false for it. Find every existing test asserting `PayloadTooLarge` for the record-count case (`git grep -n PayloadTooLarge crates/weir-client`) and move it to `TooManyRecords`.\n2. Add the variant, its Display, and its rows in `is_recoverable` / the doc table near line 162; return it where `records.len() > MAX_BATCH_RECORDS_HARD_CAP` (client.rs ~570) and at any other batch entry point with the same check. Update `PayloadTooLarge`'s doc to say bytes only.\n3. Update the crate README if it documents the batch errors.\n4. Quick gate green."
+    },
+    {
+      "id": "changelog-upgrade-notes",
+      "title": "the CHANGELOG for both changes",
+      "wave": 1,
+      "owns": [
+        "CHANGELOG.md"
+      ],
+      "uses": [
+        "C1",
+        "C2"
+      ],
+      "provides": [],
+      "text": "### changelog-upgrade-notes: the CHANGELOG for both changes\n\n- Owns: `CHANGELOG.md`\n- Uses: C1, C2\n- Provides: none\n- Wave: 1\n\nUnder `## [Unreleased]`: in `### Changed`, the D10 entry (an explicit `--config` file that doesn't exist now stops startup; the systemd unit passes one; the Docker image's CMD no longer passes `--config`, so env-only container users are unaffected) and the TooManyRecords entry (callers that matched `PayloadTooLarge` for an over-long batch must also match `TooManyRecords`; `PayloadTooLarge` now means bytes only). In `### Added` if the file's style calls for it: the new variant. Keep the file's style; amend, don't duplicate, any entry #77 already has on these topics. Quick gate green (it runs the drift guards for CHANGELOG changes)."
+    }
+  ],
+  "behaviour_groups": [
+    {
+      "key": "config-startup",
+      "title": "D10 config-file startup behaviour (spec flows 1-3)"
+    },
+    {
+      "key": "client-batch",
+      "title": "The client's batch record-count error (spec flow 4)"
+    }
+  ],
+  "done": [],
+  "answers": {}
+}
