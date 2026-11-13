@@ -16,3 +16,9 @@
 
 - Build run wf_70eb87ee-39e stopped by the head (its orchestration runs on the Mac). State: wave 0 committed on its task branches — `temper/d10-and-batch-error/d10-hard-error` d6dbe91 (its checker's quick gate succeeded, jq-01M72ZSJT4JGDJH24CG838CN3K) and `temper/d10-and-batch-error/client-too-many-records` b98030c; both fetched back to the Mac; no uncommitted edits in their worktrees. Not yet merged into the epic branch; wave 1 (CHANGELOG) not started.
 - Resume: refresh `done` (host_sync fetch + done_tasks.py), `attempt` 1, Workflow resume of wf_70eb87ee-39e with `target/temper/build-d10.js`.
+
+## 2026-11-13: build relaunched in cc1
+
+- The Mac's run wf_70eb87ee-39e can't be resumed here (a resume works only in the session that ran it), so the build launches fresh in cc1 with `host: local`, `done: []` (done_tasks.py at ad06f72) and attempt 0. The wave-0 task branches exist with their commits (d6dbe91, b98030c); the implementers continue from them.
+- `act` is not in the box yet: installing it from nektos/act's release was refused by the box's auto-mode permission check. The build doesn't need it; the full gate (checkpoint, publish) does.
+2026-11-13 relaunch build attempt 0
