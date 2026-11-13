@@ -227,11 +227,25 @@ fn started(layout_socket: PathBuf) -> impl Fn(&[String]) -> bool {
     move |log: &[String]| log.iter().any(|l| l.contains("weir starting")) && layout_socket.exists()
 }
 
-fn require_default_absent() {
-    assert!(
-        !Path::new(DEFAULT_PATH).exists(),
-        "precondition: {DEFAULT_PATH} must not exist on the host running this test"
-    );
+/// Whether `path` is known to be absent. A file there, or a path that can't
+/// be checked (`try_exists` errs, e.g. an unreadable /etc/weir), returns
+/// false with a skip note on stderr: the tests that need no default file
+/// skip on such a host, as `system.rs` does, instead of failing.
+fn default_config_absent(path: &Path) -> bool {
+    match path.try_exists() {
+        Ok(false) => true,
+        Ok(true) => {
+            eprintln!("skipping: {} exists on this host", path.display());
+            false
+        }
+        Err(e) => {
+            eprintln!(
+                "skipping: cannot tell whether {} exists: {e}",
+                path.display()
+            );
+            false
+        }
+    }
 }
 
 fn d10_message(path: &Path) -> String {
@@ -513,7 +527,9 @@ fn config_startup_05_default_file_present_is_read() {
 /// error" warning appears.
 #[test]
 fn config_startup_06_missing_default_starts_and_logs_source() {
-    require_default_absent();
+    if !default_config_absent(Path::new(DEFAULT_PATH)) {
+        return;
+    }
     let layout = Layout::new("06");
     let mut cmd = weir();
     cmd.env("WEIR_SOCKET_PATH", &layout.socket_path)
@@ -546,7 +562,9 @@ fn config_startup_06_missing_default_starts_and_logs_source() {
 /// logs the NOOP SINK WARN.
 #[test]
 fn config_startup_07_missing_default_noop_sink_warns() {
-    require_default_absent();
+    if !default_config_absent(Path::new(DEFAULT_PATH)) {
+        return;
+    }
     let layout = Layout::new("07");
     let mut cmd = weir();
     cmd.env("WEIR_SOCKET_PATH", &layout.socket_path)
@@ -689,11 +707,13 @@ fn config_startup_09_dockerfile_cmd_and_comment() {
 ///
 /// `systemctl start weir` needs root to install the unit; this test runs the
 /// unit's ExecStart command line (with the built binary in place of
-/// /usr/local/bin/weir-server) on this host, which has no
+/// /usr/local/bin/weir-server) on this host; it skips when the host has
 /// /etc/weir/weir.toml.
 #[test]
 fn config_startup_10_systemd_execstart_fails_on_missing_file() {
-    require_default_absent();
+    if !default_config_absent(Path::new(DEFAULT_PATH)) {
+        return;
+    }
     let unit = fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../deploy/systemd/weir.service"),
     )
@@ -880,4 +900,33 @@ fn rand_suffix() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .subsec_nanos() as u128
+}
+
+// ── the default-path precondition ────────────────────────────────────────────
+
+/// The tests that need no file at the default path run only when that path is
+/// known to be absent: an existing file (weir installed the documented way)
+/// or a path that can't be checked (an unreadable /etc/weir) makes them skip,
+/// not fail, since neither says anything about the code under test.
+#[test]
+fn config_startup_default_absent_precondition() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let scratch = Scratch::new("precond");
+    let absent = scratch.path().join("weir.toml");
+    assert!(default_config_absent(&absent), "absent: run");
+
+    fs::write(&absent, "").unwrap();
+    assert!(!default_config_absent(&absent), "present: skip");
+
+    let locked = scratch.path().join("locked");
+    fs::create_dir(&locked).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    let hidden = locked.join("weir.toml");
+    // Root reads through mode 000, so the unreadable case is judged only
+    // when the dir really is unreadable to this user.
+    if fs::read_dir(&locked).is_err() {
+        assert!(!default_config_absent(&hidden), "unreadable: skip");
+    }
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
 }
