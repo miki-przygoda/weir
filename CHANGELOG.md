@@ -75,6 +75,31 @@ protocol** below.
   verifying, which means an attest head can no longer be recomputed from a
   downstream's `id_column` values or `Idempotency-Key`s, and the docs that
   said it could now say so.
+- An explicit `--config` naming a file that does not exist now refuses to
+  start: `config file <path> (passed with --config) does not exist`, exit
+  status 1, before preflight, the WAB lock or any socket bind, so nothing is
+  touched on disk. 4.1.0 only WARNed, and a mistyped path could still run the
+  daemon on defaults (the `noop` sink, acking and discarding every record).
+  With no `--config`, a missing `/etc/weir/weir.toml` still starts on
+  `WEIR_*` env and defaults: the `config source` INFO line says the file was
+  not loaded, and the `NOOP SINK` WARN remains when the sink resolves to
+  `noop`. On upgrade: the systemd unit passes `--config
+  /etc/weir/weir.toml`, so a systemd host without that file now fails to
+  start with this error in the journal; create the file or edit the unit.
+  The Docker image's CMD no longer passes `--config` (it is plain
+  `weir-server`, which still reads a bind-mounted `/etc/weir/weir.toml`), so
+  env-only containers keep working; a container or compose file that passes
+  `--config` itself needs the file to exist.
+- `ClientError::PayloadTooLarge` now means bytes only: a single record, or a
+  whole `push_batch` body, over the 16 MiB protocol hard cap. A `push_batch`
+  of more than 2,048 records (`MAX_BATCH_RECORDS_HARD_CAP`) now returns the
+  new `ClientError::TooManyRecords { count, limit }` (`too many records:
+  {count} exceeds the {limit}-record batch hard cap`), where it returned
+  `PayloadTooLarge` with the record count in `len`. Like that return, it is
+  local and recoverable: no bytes are sent and the connection stays usable.
+  On upgrade: code that matched `PayloadTooLarge` to catch an over-long batch
+  must also match `TooManyRecords`. `ClientError` is `#[non_exhaustive]`, so
+  the new variant is additive.
 
 ### Fixed
 
@@ -161,7 +186,8 @@ protocol** below.
   the 16 MiB protocol hard cap locally, as a recoverable
   `ClientError::PayloadTooLarge`, even when every record fits. It used to
   send the frame, get `Nack(PayloadTooLarge)` back and poison the
-  connection.
+  connection. A batch over the record cap is `TooManyRecords` (see
+  **Changed**).
 - `weir-ctl attest seal` and `attest verify` now treat only `shard_<N>`
   directories under `wab_dir` as shards, as the daemon does. A foreign
   directory the weir user cannot read, such as a root-owned `lost+found` when
