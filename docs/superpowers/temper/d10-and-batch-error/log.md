@@ -39,3 +39,5 @@
 - msrv rc=1, without checking the code: `error: toolchain '1.88-x86_64-unknown-linux-gnu' is not installed` (the box has only stable).
 - Container steps, not counted (owner's rule): act-ci-conformance, act-ci-harnesses, act-ci-sink-integration, act-ci-monitoring, act-docker-smoke, act-docs-build (rc=127), windows, build-x86_64-apple-darwin, build-aarch64-apple-darwin, build-aarch64-unknown-linux-gnu (rc=1): not run in the box (no act); covered by the PR GitHub CI.
 - Not decided here: the owner's rule says no other binary and counts msrv as native. Asked the owner: install the 1.88 toolchain with rustup, or treat msrv as covered by GitHub CI.
+- **Owner answer (13 Nov):** count msrv as GitHub CI: no 1.88 toolchain in the box; msrv joins the steps "not run in the box; covered by the PR GitHub CI". Written into `build_rule` in args.json.
+2026-11-13 relaunch build attempt 2
