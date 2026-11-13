@@ -144,6 +144,9 @@ HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 \
 
 USER weir
 
-# Config file is expected at /etc/weir/weir.toml (bind-mount or secret).
-# Override CMD or pass --wab-dir / --socket-path flags to skip the file.
-CMD ["weir-server", "--config", "/etc/weir/weir.toml"]
+# With no --config, weir-server reads /etc/weir/weir.toml if it exists: to use
+# a config file, bind-mount (or mount a secret at) /etc/weir/weir.toml. With no
+# file there it runs on WEIR_* env vars and defaults (env-only deployments).
+# Pass --config only for a file at another path: an explicit --config that
+# does not exist refuses to start.
+CMD ["weir-server"]

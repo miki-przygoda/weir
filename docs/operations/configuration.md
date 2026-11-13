@@ -19,9 +19,10 @@ Weir merges four layers in this precedence order (first match wins):
    `WEIR_TLS_CERT`, `WEIR_TLS_KEY`, `WEIR_TLS_CLIENT_CA`). Useful in
    container orchestrators (Kubernetes, ECS, systemd `Environment=`).
 3. **TOML file** — default path `/etc/weir/weir.toml`, overridable via
-   `--config <path>`. A missing file is **not** an error; the loader
-   falls through to env + defaults, but it logs a WARN naming the path
-   (see [A missing config file](#a-missing-config-file)). Unknown keys
+   `--config <path>`. A missing file at the default path is **not** an
+   error (the loader falls through to env + defaults); a missing file
+   passed with `--config` **is** (see
+   [A missing config file](#a-missing-config-file)). Unknown keys
    produce a `warn!` log but don't fail startup.
 4. **Built-in defaults** — every option has one; running `weir-server`
    with no flags, no env vars, and no config file will start the
@@ -32,23 +33,26 @@ The merge happens once at startup. Config is not reloaded on SIGHUP
 
 ### A missing config file
 
-A config file that does not exist still loads (env-only container deployments
-depend on that: the Docker image's CMD always passes
-`--config /etc/weir/weir.toml`), but it is no longer silent. Startup logs a
-WARN, prefixed `config:`, naming the path:
+What a missing config file means depends on whether you named it:
 
-- with `--config <path>`: `config file <path> (passed with --config) does not
-  exist; running on command-line flags, WEIR_* environment variables and
-  built-in defaults only. A missing --config file will become a startup error
-  in a future minor release`
-- without `--config`: `no config file at the default path /etc/weir/weir.toml;
-  running on command-line flags, WEIR_* environment variables and built-in
-  defaults only`
+- **With `--config <path>`**, a file that does not exist is a startup error.
+  The daemon exits at once with status 1, before it creates the WAB directory,
+  takes the lock or binds a socket, and prints
+  `config file <path> (passed with --config) does not exist`. A mistyped path
+  can no longer turn a durable pipeline into a silent discard. The systemd unit
+  passes `--config /etc/weir/weir.toml`, so a systemd install without that file
+  fails to start, with this error in the journal.
+- **Without `--config`**, a missing default file (`/etc/weir/weir.toml`) is not
+  an error: the daemon runs on command-line flags, `WEIR_*` environment
+  variables and built-in defaults. Env-only container deployments depend on
+  this; the Docker image's CMD passes no `--config`, so bind-mount your file at
+  `/etc/weir/weir.toml`, and pass `--config` only for a file at another path.
+  The INFO `config source` line below shows `loaded=false`.
 
-When nothing else configured a sink, `sink_type` resolves to `noop`, which acks
-and discards every record. The warning then starts with `NOOP SINK:` and adds
-that every record is acknowledged and then DISCARDED, because that is the case
-where a mistyped path silently turns a durable pipeline into a discard.
+When the default file is missing and nothing else configured a sink,
+`sink_type` resolves to `noop`, which acks and discards every record. Startup
+then logs a WARN, prefixed `config:`, that starts with `NOOP SINK:`, names the
+default path, and says that every record is acknowledged and then DISCARDED.
 
 Every start also logs one INFO line, `config source`, with fields
 `config_file`, `origin` (`--config` or `default path`) and `loaded`
