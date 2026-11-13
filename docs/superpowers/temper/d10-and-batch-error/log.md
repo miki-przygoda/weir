@@ -61,3 +61,12 @@
 - Behaviour spec 481c27f; acceptance 577a0a6 (config-startup), 287da63 (client-batch): 17 passing, 0 failing, green rounds 0, no questions.
 - Untestable here: CONFIG-STARTUP-05 and -08 need the weir-server:local image; `docker build` fails at apt-get update because the proxy refuses deb.debian.org (403). Both tests are committed and run only with WEIR_ACCEPTANCE_DOCKER=1; they must run where the image builds (GitHub CI, the head's ci box).
 - All commit shas verified on the epic branch; done = acceptance:client-batch, acceptance:config-startup, behaviour-spec, changelog-upgrade-notes, checkpoint, client-too-many-records, d10-hard-error. No flaky reruns.
+
+## 2026-11-13: stabilise 4a sweep (wf_f8b48cd5-696)
+
+- Lenses: security, failure paths and lifecycle, test strength and docs, durability and ack semantics. 4 findings verified, 0 refuted, 0 unverified, no blocked lenses. Nothing severe or critical.
+- important test-strength-and-docs-01: CONFIG-STARTUP-08 (env-only Docker start) skips unless WEIR_ACCEPTANCE_DOCKER=1, which nothing sets.
+- minor failure-paths-and-lifecycle-01: acceptance 06/07/10 panic instead of skipping when /etc/weir/weir.toml exists; absence judged with Path::exists().
+- minor failure-paths-and-lifecycle-02: docs/architecture.md:135 still describes the pre-D10 missing-file behaviour.
+- minor test-strength-and-docs-02: docs/getting-started/integrating.md:120 leaves TooManyRecords out of the recoverable errors.
+- Owner selected all four for the fix wave (13 Nov). No lens raised the checkpoint's 2,048-vs-1,024 batch-cap gap.
