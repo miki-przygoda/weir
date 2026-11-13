@@ -14,7 +14,7 @@
     "quick": "bash \"$(git rev-parse --show-toplevel)/.temper/gate-quick.sh\"",
     "full": "bash \"$(git rev-parse --show-toplevel)/.temper/gate-full.sh\""
   },
-  "build_rule": "Build and test only in this box, through the gates: `bash .temper/gate-quick.sh`, `bash .temper/gate-full.sh`, or single cargo runs through `bash .temper/gate-run.sh <cargo args>`. There is no jobq on beast (ops/jobq.md): the box's memory cap (10 GiB) is the limit; at most 2 heavy builds at once, and a workflow at most 2 building agents. Run every gate in the foreground (a session waiting on a background job can end its turn), with a Bash timeout of 600000 ms; if a gate outlasts one call, start it with `setsid nohup bash .temper/gate-full.sh >/dev/null 2>&1 </dev/null &` and poll `/build/weir-gate/logs/<worktree>/latest-<gate>/summary.txt` in the foreground until its last line is `GATE <gate> rc=N`. Never set CARGO_TARGET_DIR or make another target dir: the slots are the build dirs. The full gate needs `act` at /usr/local/bin/act (install it with sudo from nektos/act's GitHub release if missing) and docker; if a container step can't run in this box, say which and why in the result rather than working around it. Never write the CI-skip token in a commit message. Commits carry only the `Temper-Task` trailer: no Co-Authored-By, Claude-Session or \"Generated with\" lines. Never print a secret or token. Push only `cc1/*` branches to gitolite.\nCHANGELOG.md is owned by the wave-1 task changelog-upgrade-notes only; no other task touches it. The `docs_drift` and `demo_drift` tests guard figures and version strings in the docs: if a fix trips one, fix the doc, never weaken the guard.",
+  "build_rule": "Build and test only in this box, through the gates: `bash .temper/gate-quick.sh`, `bash .temper/gate-full.sh`, or single cargo runs through `bash .temper/gate-run.sh <cargo args>`. There is no jobq on beast (ops/jobq.md): the box's memory cap (10 GiB) is the limit; at most 2 heavy builds at once, and a workflow at most 2 building agents. Run every gate in the foreground (a session waiting on a background job can end its turn), with a Bash timeout of 600000 ms; if a gate outlasts one call, start it with `setsid nohup bash .temper/gate-full.sh >/dev/null 2>&1 </dev/null &` and poll `/build/weir-gate/logs/<worktree>/latest-<gate>/summary.txt` in the foreground until its last line is `GATE <gate> rc=N`. Never set CARGO_TARGET_DIR or make another target dir: the slots are the build dirs. The full gate needs `act` at /usr/local/bin/act (install it with sudo from nektos/act's GitHub release if missing) and docker; if a container step can't run in this box, say which and why in the result rather than working around it. Never write the CI-skip token in a commit message. Commits carry only the `Temper-Task` trailer: no Co-Authored-By, Claude-Session or \"Generated with\" lines. Never print a secret or token. Push only `cc1/*` branches to gitolite.\nCHANGELOG.md is owned by the wave-1 task changelog-upgrade-notes only; no other task touches it. The `docs_drift` and `demo_drift` tests guard figures and version strings in the docs: if a fix trips one, fix the doc, never weaken the guard.\nFull gate in this box (owner decision, 13 Nov 2026): do NOT install act or any other binary. Judge the full gate on its native steps only (fmt, clippy x4, demo-version, every test step, load-norun, msrv, deny, dst-300, build-x86_64-unknown-linux-gnu with its TLS smoke): the gate passes when every native step has rc=0, whatever the script's overall exit status. The container steps (act-*, windows, the cross builds) are expected to fail without act or with docker limits: list them as \"not run in the box (no act); covered by the PR GitHub CI\" and do not count them. Quote each native step's rc from the gate's summary.",
   "flaky": [],
   "tasks": [
     {
@@ -80,7 +80,12 @@
       "title": "The client's batch record-count error (spec flow 4)"
     }
   ],
-  "done": [],
+  "done": [
+    "changelog-upgrade-notes",
+    "client-too-many-records",
+    "d10-hard-error"
+  ],
   "answers": {},
-  "attempt": 0
+  "attempt": 1,
+  "gate_slots": 2
 }

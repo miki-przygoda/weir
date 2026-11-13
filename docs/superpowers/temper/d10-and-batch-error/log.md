@@ -22,3 +22,12 @@
 - The Mac's run wf_70eb87ee-39e can't be resumed here (a resume works only in the session that ran it), so the build launches fresh in cc1 with `host: local`, `done: []` (done_tasks.py at ad06f72) and attempt 0. The wave-0 task branches exist with their commits (d6dbe91, b98030c); the implementers continue from them.
 - `act` is not in the box yet: installing it from nektos/act's release was refused by the box's auto-mode permission check. The build doesn't need it; the full gate (checkpoint, publish) does.
 2026-11-13 relaunch build attempt 0
+
+## 2026-11-13: build returned blocked at the checkpoint
+
+- Run wf_d4e9b978-edc (attempt 0): done_now d10-hard-error, client-too-many-records, changelog-upgrade-notes (trailers on the epic branch at 63c15b2, done_tasks.py confirms); commits {}; no flaky reruns.
+2026-11-13 blocked[none] checkpoint
+- checkpoint (agent's reason, data): did not start the full gate: act is not at /usr/local/bin/act, no act runner images, and the workflow forbids sudo.
+- **Owner answer (13 Nov ~20:35Z):** do NOT install act or any other binary. Judge the full gate on its native steps only (fmt, clippy x4, demo-version, every test step, load-norun, msrv, deny, dst-300, build-x86_64-unknown-linux-gnu with its TLS smoke): it passes when every native step has rc=0. The container steps (act-*, windows, the cross builds) are expected to fail without act or with docker limits: listed as "not run in the box (no act); covered by the PR GitHub CI", not counted. Publish's full gate uses the same rule.
+- How it reaches the run: the build workflow's validator accepts `args.answers` keys only for task ids ("answer for unknown task checkpoint" would make the launch invalid), and the checkpoint prompt doesn't read answers; it does carry `build_rule`. So the answer is appended to `build_rule` in args.json (which stabilise and publish also pass), and `answers` stays `{}`.
+2026-11-13 relaunch build attempt 1
