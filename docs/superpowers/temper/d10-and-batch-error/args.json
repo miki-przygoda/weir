@@ -81,11 +81,16 @@
     }
   ],
   "done": [
+    "acceptance:client-batch",
+    "acceptance:config-startup",
+    "behaviour-spec",
     "changelog-upgrade-notes",
+    "checkpoint",
     "client-too-many-records",
     "d10-hard-error"
   ],
   "answers": {},
-  "attempt": 2,
-  "gate_slots": 2
+  "attempt": 0,
+  "gate_slots": 2,
+  "build_attempt": 2
 }
