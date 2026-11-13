@@ -31,3 +31,11 @@
 - **Owner answer (13 Nov ~20:35Z):** do NOT install act or any other binary. Judge the full gate on its native steps only (fmt, clippy x4, demo-version, every test step, load-norun, msrv, deny, dst-300, build-x86_64-unknown-linux-gnu with its TLS smoke): it passes when every native step has rc=0. The container steps (act-*, windows, the cross builds) are expected to fail without act or with docker limits: listed as "not run in the box (no act); covered by the PR GitHub CI", not counted. Publish's full gate uses the same rule.
 - How it reaches the run: the build workflow's validator accepts `args.answers` keys only for task ids ("answer for unknown task checkpoint" would make the launch invalid), and the checkpoint prompt doesn't read answers; it does carry `build_rule`. So the answer is appended to `build_rule` in args.json (which stabilise and publish also pass), and `answers` stays `{}`.
 2026-11-13 relaunch build attempt 1
+
+## 2026-11-13: checkpoint blocked again (attempt 1): msrv
+
+2026-11-13 blocked[none] checkpoint
+- Full gate at 05f0d03, log /build/weir-gate/logs/epic/full-20261113T203955Z: `GATE full rc=1 (11 failed)`. Native steps rc=0: fmt, clippy-default, clippy-all, clippy-nodefault, clippy-s3, demo-version, test-ws, test-s3, test-srv, test-srv-bins, test-ws-all, test-srv-all, test-srv-bins-all, load-norun, deny, dst-300, build-x86_64-unknown-linux-gnu (with its TLS smoke).
+- msrv rc=1, without checking the code: `error: toolchain '1.88-x86_64-unknown-linux-gnu' is not installed` (the box has only stable).
+- Container steps, not counted (owner's rule): act-ci-conformance, act-ci-harnesses, act-ci-sink-integration, act-ci-monitoring, act-docker-smoke, act-docs-build (rc=127), windows, build-x86_64-apple-darwin, build-aarch64-apple-darwin, build-aarch64-unknown-linux-gnu (rc=1): not run in the box (no act); covered by the PR GitHub CI.
+- Not decided here: the owner's rule says no other binary and counts msrv as native. Asked the owner: install the 1.88 toolchain with rustup, or treat msrv as covered by GitHub CI.
