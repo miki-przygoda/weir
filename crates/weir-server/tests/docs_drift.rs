@@ -1018,6 +1018,31 @@ fn the_startup_order_doc_lists_the_phases_in_order() {
     );
 }
 
+/// D10: architecture.md's config section states what the daemon does with a
+/// missing config file. An explicit `--config` to a missing file is a startup
+/// error with the message `config/mod.rs` prints; only a missing default file
+/// is an empty layer.
+#[test]
+fn the_architecture_config_section_states_d10() {
+    let section = ARCHITECTURE
+        .split("### Config (`src/config/`)")
+        .nth(1)
+        .and_then(|s| s.split("\n### ").next())
+        .expect("docs/architecture.md must keep a `### Config (`src/config/`)` section");
+    assert!(
+        CONFIG_MOD_SRC.contains("(passed with --config) does not exist"),
+        "the D10 error text moved; update this guard and architecture.md"
+    );
+    assert!(
+        section.contains("(passed with --config) does not exist"),
+        "the config section must say an explicit missing --config is a startup error, with its message"
+    );
+    assert!(
+        !section.contains("a missing config file is treated as an empty layer"),
+        "only a missing default file is an empty layer (D10)"
+    );
+}
+
 const SYSTEMD_UNIT: &str = include_str!("../../../deploy/systemd/weir.service");
 const SYSTEMD_README: &str = include_str!("../../../deploy/systemd/README.md");
 const COMPOSE: &str = include_str!("../../../deploy/docker/docker-compose.yml");
