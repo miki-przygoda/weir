@@ -87,10 +87,35 @@
     "changelog-upgrade-notes",
     "checkpoint",
     "client-too-many-records",
-    "d10-hard-error"
+    "d10-hard-error",
+    "fix:failure-paths-and-lifecycle-01",
+    "fix:failure-paths-and-lifecycle-02",
+    "fix:test-strength-and-docs-01",
+    "fix:test-strength-and-docs-02"
   ],
   "answers": {},
   "attempt": 0,
   "gate_slots": 2,
-  "build_attempt": 2
+  "build_attempt": 2,
+  "second_sweep_findings": [
+    {
+      "id": "second:failure-paths-and-lifecycle-01",
+      "severity": "minor",
+      "file": "crates/weir-server/tests/acceptance_config_startup.rs",
+      "line": 293
+    },
+    {
+      "id": "second:test-strength-and-docs-01",
+      "severity": "minor",
+      "file": "docs/getting-started/integrating.md",
+      "line": 124
+    },
+    {
+      "id": "second:test-strength-and-docs-02",
+      "severity": "minor",
+      "file": "docs/architecture.md",
+      "line": 134
+    }
+  ],
+  "stabilise_fix_attempt": 0
 }

@@ -70,3 +70,14 @@
 - minor failure-paths-and-lifecycle-02: docs/architecture.md:135 still describes the pre-D10 missing-file behaviour.
 - minor test-strength-and-docs-02: docs/getting-started/integrating.md:120 leaves TooManyRecords out of the recoverable errors.
 - Owner selected all four for the fix wave (13 Nov). No lens raised the checkpoint's 2,048-vs-1,024 batch-cap gap.
+
+## 2026-11-13: stabilise 4b fix wave (wf_47926a06-77d): stable
+
+- Fixed (each test-first, regression-checked, shas on the epic branch): test-strength-and-docs-01 3e65fa5 (docker.yml's smoke job tags weir-server:local and runs CONFIG-STARTUP-05/-08 with WEIR_ACCEPTANCE_DOCKER=1, plus a guard test for that wiring), failure-paths-and-lifecycle-01 6a34175, failure-paths-and-lifecycle-02 6d24577, test-strength-and-docs-02 721144d. Reverted none; regressions none; contract items none; no flaky reruns.
+- Second sweep: severe 0, others 3 (all minor). Stage 4 is stable after two sweeps.
+
+### Open items (minor, not fixed; for a follow-up)
+
+- second:failure-paths-and-lifecycle-01, crates/weir-server/tests/acceptance_config_startup.rs:293: config_startup_01's reference run passes no `--config`, so it reads the host's /etc/weir/weir.toml and fails falsely where weir is installed (0640 root:weir) or the file is malformed; point it at a scratch config or skip like 06/07/10.
+- second:test-strength-and-docs-01, docs/getting-started/integrating.md:124 (and the TooManyRecords doc, crates/weir-client/src/client.rs:132): "split the batch and retry" with `limit` 2048 fails against a daemon on the default max_batch_records = 1024: Nack, the client is poisoned. The docs should say to split to the daemon's max_batch_records. This is the checkpoint's 2,048-vs-1,024 gap; whether the client should learn the daemon's cap is a design question for the owner.
+- second:test-strength-and-docs-02, docs/architecture.md:134: ConfigError's variant list leaves out ConfigFileMissing.
