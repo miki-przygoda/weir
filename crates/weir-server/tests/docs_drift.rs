@@ -2119,3 +2119,62 @@ fn attest_docs_do_not_promise_a_head_recomputable_from_delivered_ids() {
     }
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
+
+const CLIENT_SRC: &str = include_str!("../../weir-client/src/client.rs");
+
+/// The integration guide lists the recoverable `ClientError` variants and then
+/// says "Everything else is non-recoverable and the daemon has closed". When
+/// `TooManyRecords` joined the recoverable set, the guide's list did not, so an
+/// integrator following it rebuilt a perfectly usable client. Every variant
+/// `is_recoverable` returns `true` for must be named in the guide's list.
+#[test]
+fn the_integration_guide_lists_every_recoverable_client_error() {
+    let body = CLIENT_SRC
+        .split("pub fn is_recoverable(&self) -> bool {")
+        .nth(1)
+        .expect("ClientError::is_recoverable not found in weir-client/src/client.rs");
+    let body = &body[..body.find("\n    }\n").expect("end of is_recoverable")];
+    let mut recoverable = Vec::new();
+    let mut arm = String::new();
+    for line in body.lines().map(str::trim) {
+        if line.starts_with("//") || line == "match self {" {
+            continue;
+        }
+        arm.push(' ');
+        arm.push_str(line);
+        if let Some((pats, result)) = arm.split_once("=>") {
+            if result.trim().trim_end_matches(',') == "true" {
+                for pat in pats.split('|') {
+                    let pat = pat.trim();
+                    let name = pat
+                        .strip_prefix("Self::")
+                        .unwrap_or_else(|| panic!("unexpected pattern {pat:?}"));
+                    let name = name.split([' ', '{']).next().unwrap();
+                    recoverable.push(name.to_string());
+                }
+            }
+            arm.clear();
+        }
+    }
+    assert!(
+        recoverable.iter().any(|v| v == "PayloadTooLarge"),
+        "parsed no recoverable variants from is_recoverable: {recoverable:?}"
+    );
+    let guide = prose(INTEGRATING);
+    let para = guide
+        .split("Recoverable (connection untouched, keep using it):")
+        .nth(1)
+        .expect("the guide's 'Recoverable (connection untouched...)' list")
+        .split("Everything else is non-recoverable")
+        .next()
+        .unwrap();
+    let missing: Vec<_> = recoverable
+        .iter()
+        .filter(|v| !para.contains(&format!("`ClientError::{v}")))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "docs/getting-started/integrating.md's recoverable list omits {missing:?} \
+         (is_recoverable returns true for {recoverable:?})"
+    );
+}
