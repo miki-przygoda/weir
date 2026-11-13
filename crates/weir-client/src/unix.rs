@@ -958,6 +958,64 @@ mod tests {
         assert!(!c.is_poisoned(), "a local rejection must not poison");
     }
 
+    /// A batch over the record cap reports a record count, not a byte length,
+    /// sends nothing, and leaves the connection usable for the next push.
+    #[test]
+    fn push_batch_over_record_cap_reports_too_many_records() {
+        let (client_end, server_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut c = WeirClient::from_stream(client_end);
+        let records = vec![[1u8]; weir_core::MAX_BATCH_RECORDS_HARD_CAP + 1];
+        let err = c
+            .push_batch(&records, Durability::Durable)
+            .map(|o| o.all_accepted())
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ClientError::TooManyRecords {
+                    count: 2049,
+                    limit: 2048
+                }
+            ),
+            "expected TooManyRecords {{ count: 2049, limit: 2048 }}, got {err:?}"
+        );
+        assert_eq!(weir_core::MAX_BATCH_RECORDS_HARD_CAP, 2048);
+        assert!(err.is_recoverable(), "a local rejection is recoverable");
+        assert!(!c.is_poisoned(), "a local rejection must not poison");
+
+        // No bytes were sent: the first frame the peer reads is the next push,
+        // not a PushBatch, and the same client completes it.
+        let peer = scripted_peer(server_end, |_, _| {
+            weir_core::Envelope::new(
+                weir_core::Header::new(
+                    weir_core::MessageType::Ack,
+                    weir_core::Durability::Durable,
+                    0,
+                ),
+                vec![],
+            )
+            .encode()
+        });
+        c.push(b"after", Durability::Durable).unwrap();
+        let (h, payload) = peer.join().unwrap();
+        assert_eq!(h.message_type(), weir_core::MessageType::Push);
+        assert_eq!(payload, b"after");
+        assert!(!c.is_poisoned());
+    }
+
+    #[test]
+    fn too_many_records_display_and_classification() {
+        let err = ClientError::TooManyRecords {
+            count: 2049,
+            limit: 2048,
+        };
+        assert_eq!(
+            err.to_string(),
+            "too many records: 2049 exceeds the 2048-record batch hard cap"
+        );
+        assert!(err.is_recoverable());
+    }
+
     #[test]
     fn push_rejects_empty_payload_locally_without_poisoning() {
         // An empty payload is the WAB end-of-records sentinel; the daemon would
