@@ -9,7 +9,9 @@
 //! The Docker tests (CONFIG-STARTUP-05 and -08) need a `weir-server:local`
 //! image built from `deploy/docker/Dockerfile`; they run only when
 //! `WEIR_ACCEPTANCE_DOCKER=1` is set and fail (rather than skip) when it is set
-//! and the image or Docker is missing.
+//! and the image or Docker is missing. docker.yml's smoke job sets it and
+//! runs both against the image it builds (`config_startup_08_docker_tests_run_in_ci`
+//! guards that wiring).
 
 use std::fs;
 use std::io::{BufRead, BufReader, Read};
@@ -599,6 +601,44 @@ fn config_startup_08_docker_image_starts_env_only() {
         "{warn}"
     );
     assert!(!log.contains("passed with --config"), "{log}");
+}
+
+/// CONFIG-STARTUP-05 and -08 skip without WEIR_ACCEPTANCE_DOCKER=1, so a CI
+/// job must set it and run them against the image it built, or the env-only
+/// start (spec flow 2) is never exercised: docker.yml's smoke step always
+/// bind-mounts a config file. This guards that wiring.
+#[test]
+fn config_startup_08_docker_tests_run_in_ci() {
+    let wf = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows/docker.yml"),
+    )
+    .unwrap();
+    let start = wf
+        .find("WEIR_ACCEPTANCE_DOCKER")
+        .expect("a docker.yml step sets WEIR_ACCEPTANCE_DOCKER");
+    // The step runs from its `- name:` line to the next one.
+    let from = wf[..start].rfind("- name:").expect("inside a step");
+    let to = wf[start..].find("- name:").map_or(wf.len(), |i| start + i);
+    let step = &wf[from..to];
+    assert!(
+        step.contains(r#"WEIR_ACCEPTANCE_DOCKER: "1""#),
+        "set to \"1\": {step}"
+    );
+    assert!(
+        step.contains(&format!("docker tag weir-server:smoke {IMAGE}")),
+        "the tests' {IMAGE} is the image the job built: {step}"
+    );
+    assert!(step.contains("--test acceptance_config_startup"), "{step}");
+    for t in [
+        "config_startup_05_default_file_present_is_read",
+        "config_startup_08_docker_image_starts_env_only",
+    ] {
+        assert!(step.contains(t), "runs {t}: {step}");
+    }
+    let build = wf
+        .find("tags: weir-server:smoke")
+        .expect("the smoke job builds weir-server:smoke");
+    assert!(build < from, "runs after the image build");
 }
 
 // ── CONFIG-STARTUP-09 ────────────────────────────────────────────────────────

@@ -35,6 +35,20 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Docker acceptance tests (default config file, env-only start)
+        # CONFIG-STARTUP-05 (a bind-mounted /etc/weir/weir.toml is read) and
+        # -08 (WEIR_* env only, no bind mount: starts, INFO line, NOOP SINK
+        # WARN) skip unless WEIR_ACCEPTANCE_DOCKER=1. The smoke test below
+        # always bind-mounts a config file, so this is the only run of the
+        # env-only start the CMD ["weir-server"] promises.
+        env:
+          WEIR_ACCEPTANCE_DOCKER: "1"
+        run: |
+          docker tag weir-server:smoke weir-server:local
+          cargo test -p weir-server --test acceptance_config_startup -- --exact \
+            config_startup_05_default_file_present_is_read \
+            config_startup_08_docker_image_starts_env_only
+
       - name: Build push_simple example
         # Replaces the smoke-test usage that previously lived in weir-bench.
         # push_simple sends records across all three durability tiers and
