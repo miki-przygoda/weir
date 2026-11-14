@@ -1808,22 +1808,25 @@ fn readonly_wab_dir_prevents_startup() {
     );
 }
 
-/// Spec §3.4 (D10), end to end: an env-only daemon whose `--config` names a
-/// file that does not exist still starts (the Docker image always passes
-/// `--config`), but its log now says so, naming the path and escalating for
-/// the noop sink, and logs the config source. Before this the missing file was
-/// read as an empty layer with no log line at all.
+/// Spec §3.4 (D10), end to end: an explicit `--config` naming a file that does
+/// not exist refuses to start, with the config error naming the path, before
+/// anything touches disk: the (existing, empty) WAB dir stays empty, so no
+/// lock and no shard dirs, and no producer or admin socket is bound.
+/// Before 4.2 it started on env and defaults, which for an unconfigured sink
+/// meant noop: a mistyped path silently turned a durable pipeline into a
+/// discard.
 #[test]
-fn missing_config_file_warns_and_logs_source_at_startup() {
-    use std::io::{BufRead, BufReader};
-    use std::sync::mpsc;
-
+fn missing_explicit_config_file_refuses_to_start() {
     let _lock = process_lock().lock().unwrap_or_else(|e| e.into_inner());
-    let tmp_dir = std::env::temp_dir().join(format!("weir_nocfg_{}", std::process::id()));
+    let tmp_dir = std::env::temp_dir().join(format!("weir_nocfg_x_{}", std::process::id()));
     let wab_dir = tmp_dir.join("wab");
     let socket_dir = tmp_dir.join("run");
     let socket_path = socket_dir.join("weir.sock");
     let missing = tmp_dir.join("no-such-weir.toml");
+    fs::remove_dir_all(&tmp_dir).ok();
+    // The WAB dir exists (as a provisioned volume would), so the only thing
+    // that can stop startup is the missing file, and anything weir wrote
+    // into it would show.
     fs::create_dir_all(&wab_dir).unwrap();
     fs::create_dir_all(&socket_dir).unwrap();
 
@@ -1833,6 +1836,92 @@ fn missing_config_file_warns_and_logs_source_at_startup() {
         .env("WEIR_WAB_DIR", &wab_dir)
         .env("WEIR_METRICS_PORT", free_port().to_string())
         .env("WEIR_LOG_LEVEL", "info")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn weir-server");
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    if status.is_none() {
+        let _ = child.kill();
+    }
+    let out = child.wait_with_output().unwrap();
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let wab_entries: Vec<_> = fs::read_dir(&wab_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    let socket_exists = socket_path.exists();
+    let admin_exists = tmp_dir.join("wab.admin.sock").exists();
+    fs::remove_dir_all(&tmp_dir).ok();
+
+    let status = status.unwrap_or_else(|| panic!("weir-server kept running: {log}"));
+    assert!(!status.success(), "must exit non-zero: {status:?}\n{log}");
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "the existing config-error exit status: {log}"
+    );
+    let expected = format!(
+        "config file {} (passed with --config) does not exist",
+        missing.display()
+    );
+    assert!(log.contains(&expected), "expected {expected:?} in: {log}");
+    assert!(
+        wab_entries.is_empty(),
+        "nothing (no .weir.lock, no shard dir) may be created in the WAB dir: \
+         {wab_entries:?}\n{log}"
+    );
+    assert!(
+        !socket_exists,
+        "the producer socket must not be bound: {log}"
+    );
+    assert!(!admin_exists, "the admin socket must not be bound: {log}");
+}
+
+/// Spec §3.4 (D10), the env-only container case: with no `--config` and no
+/// file at the default path, the daemon starts, logs the config source at
+/// INFO (default path, not loaded) and, since nothing configured a sink, the
+/// NOOP SINK WARN naming the default path.
+#[test]
+fn missing_default_config_file_starts_and_warns_noop() {
+    use std::io::{BufRead, BufReader};
+    use std::sync::mpsc;
+
+    const DEFAULT_PATH: &str = "/etc/weir/weir.toml";
+    if Path::new(DEFAULT_PATH).exists() {
+        eprintln!("skipping: {DEFAULT_PATH} exists on this host");
+        return;
+    }
+
+    let _lock = process_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let tmp_dir = std::env::temp_dir().join(format!("weir_nocfg_d_{}", std::process::id()));
+    let wab_dir = tmp_dir.join("wab");
+    let socket_dir = tmp_dir.join("run");
+    let socket_path = socket_dir.join("weir.sock");
+    fs::remove_dir_all(&tmp_dir).ok();
+    fs::create_dir_all(&wab_dir).unwrap();
+    fs::create_dir_all(&socket_dir).unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_weir-server"))
+        .env("WEIR_SOCKET_PATH", &socket_path)
+        .env("WEIR_WAB_DIR", &wab_dir)
+        .env("WEIR_METRICS_PORT", free_port().to_string())
+        .env("WEIR_LOG_LEVEL", "info")
+        .env_remove("WEIR_SINK_TYPE")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -1857,18 +1946,17 @@ fn missing_config_file_warns_and_logs_source_at_startup() {
     .collect();
     drop(tx);
 
-    let path = missing.display().to_string();
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut log = Vec::new();
-    let (mut warned, mut sourced) = (None, false);
-    while Instant::now() < deadline && !(warned.is_some() && sourced) {
+    let (mut warned, mut sourced) = (None, None);
+    while Instant::now() < deadline && !(warned.is_some() && sourced.is_some()) {
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(line) => {
-                if line.contains(&path) && line.contains("does not exist") {
+                if line.contains("NOOP SINK") {
                     warned = Some(line.clone());
                 }
                 if line.contains("config source") {
-                    sourced = true;
+                    sourced = Some(line.clone());
                 }
                 log.push(line);
             }
@@ -1884,20 +1972,22 @@ fn missing_config_file_warns_and_logs_source_at_startup() {
     }
     fs::remove_dir_all(&tmp_dir).ok();
 
-    let warned = warned.unwrap_or_else(|| panic!("no missing-config WARN naming {path}: {log:#?}"));
-    assert!(warned.contains("WARN"), "must be a WARN: {warned}");
-    assert!(
-        warned.contains("--config"),
-        "explicit --config named: {warned}"
-    );
-    assert!(
-        warned.contains("DISCARDED"),
-        "noop sink escalation: {warned}"
-    );
-    assert!(sourced, "no 'config source' INFO line: {log:#?}");
     assert!(
         still_running,
-        "a missing config file must not stop the daemon: {log:#?}"
+        "a missing default config file must not stop the daemon: {log:#?}"
+    );
+    let sourced = sourced.unwrap_or_else(|| panic!("no 'config source' INFO line: {log:#?}"));
+    assert!(sourced.contains("INFO"), "must be INFO: {sourced}");
+    assert!(sourced.contains(DEFAULT_PATH), "names the path: {sourced}");
+    assert!(sourced.contains("default path"), "origin: {sourced}");
+    assert!(sourced.contains("loaded=false"), "not loaded: {sourced}");
+    let warned = warned.unwrap_or_else(|| panic!("no NOOP SINK WARN: {log:#?}"));
+    assert!(warned.contains("WARN"), "must be a WARN: {warned}");
+    assert!(warned.contains(DEFAULT_PATH), "names the path: {warned}");
+    assert!(warned.contains("DISCARDED"), "noop escalation: {warned}");
+    assert!(
+        !warned.contains("--config"),
+        "the default path was not passed explicitly: {warned}"
     );
 }
 

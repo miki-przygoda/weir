@@ -193,7 +193,10 @@ bounded shutdown. One WAB volume serves one daemon: a second container on
 `wab_data` refuses to start (`locked by`), so do not `--scale` the service.
 Configuration goes in
 `deploy/docker/weir.toml.example` — copy to your own path and
-bind-mount.
+bind-mount it at `/etc/weir/weir.toml`. The image's CMD is `weir-server`
+with no `--config`: it reads `/etc/weir/weir.toml` when that file exists and
+otherwise runs on `WEIR_*` env vars and defaults. Pass `--config` only for a
+file at another path; a `--config` file that does not exist refuses to start.
 
 ### Run with bare `docker run`
 
@@ -250,7 +253,9 @@ For a non-container host, a ready-to-adapt hardened unit ships in
   `ExecStartPre` that creates the `wab/` subdir (the daemon refuses to start
   if `wab_dir` is missing), resource limits, and the sandbox the
   [threat model](../security/threat-model.md) recommends.
-- `weir.toml` — companion config (no secrets) referenced via `--config`.
+- `weir.toml` — companion config (no secrets) referenced via
+  `--config /etc/weir/weir.toml`; without that file the unit fails to start
+  (`config file /etc/weir/weir.toml (passed with --config) does not exist`).
 - `weir.env.example` — `EnvironmentFile` pattern for keeping the sink URL /
   bearer token off-disk and out of `argv` (set it mode `0600`, never commit real
   secrets).

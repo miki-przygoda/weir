@@ -174,3 +174,10 @@
 - At fc034de: quick gate (jq-01M70ARA1TWRTE622WSBXZV2NA) rc=0; docs build rc=0; Windows rc=0 (detached container). Native macOS tests: 20 executables, 0 failing (weir-server bin 991 passed).
 - Pushed epic/cleanup-2026-11 (fc034de) and replaced PR #77's title and body (51 kept fixes: 53 fix trailers less the 2 owner-reverted attest fixes). Not merged.
 - beast: 148 throwaway worktrees removed; 18 dirty ones saved as patches in ~/work/weir/cleanup-2026-11/stale-probes/.
+
+## 2026-11-10: chaos power-cut campaign on f78181d (partial; stopped for a beast shutdown)
+
+- Run as root through claude-head (owner-approved 10 Nov), from `~/work/weir/cleanup-2026-11/owner-chaos` at f78181d (weir-server sha256 c6a46151…); oracle unit tests: 472 ran, OK (1 skipped). Evidence: beast `~/weir-evidence/cleanup-2026-11/`.
+- **shutdown-bounded** (run 2618465502002689): 300 episodes + final pass, **0 violations**, power-loss verdict PASS (301 episodes, no Durable record lost), canary bit 300/300, final-pass WAB post-mortem clean; 504,827 acked = 504,827 distinct delivered, multiplicity 1.031. rc=1 only because of **11 no-progress anomalies** (episodes 61-64, 73-75, 82-85: ~50-60 acks per episode, under the schedule's floor). They come in clusters; the 4.2.0 build's gates were running on beast at the same time, so load contention is the first hypothesis to check. Not yet explained.
+- **shutdown-forced** (run 2618468156438450): stopped by the head at episode 37 for the owner's beast shutdown (campaign script TERM, run.py INT); 37 episodes, 0 violations, 0 anomalies, no final pass. `startup-signal` and `pause-resume-cut` not run. The harness tore down cleanly (no dm devices, mounts or chaos processes left).
+- To finish: re-run shutdown-forced, startup-signal and pause-resume-cut (and gate.py over all four) on a quiet beast; explain the 11 anomalies.

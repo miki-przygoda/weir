@@ -131,8 +131,8 @@ Three-layer configuration: `CLI > env > TOML file > defaults`.
 - Each layer produces a `PartialConfig` (all fields `Option<T>`). `Config::from_layers()` merges and applies defaults; testable without touching real CLI args or env vars.
 - `validate_path(field, path)` — full four-check sequence (absolute, no `..`, no null bytes, `canonicalize()` re-validated against same checks). Used for `wab_dir`. Returns `ConfigError::PathInvalid` with field name on failure.
 - `validate_path_format(field, path)` — format-only check (no `canonicalize()`). Used for `socket_path` and `admin_socket_path`, which do not exist until bind time.
-- `ConfigError` — manual `impl std::error::Error`, no `thiserror`. Variants: `InvalidValue`, `ParseError`, `IoError`, `PathInvalid`.
-- Unknown TOML keys produce a `warn!` log; a missing config file is treated as an empty layer (not an error) but logs a WARN naming the path, escalated when the resolved sink is `noop`. The startup log names the config source.
+- `ConfigError` — manual `impl std::error::Error`, no `thiserror`. Variants: `InvalidValue`, `ParseError`, `IoError`, `PathInvalid`, `ConfigFileMissing` (an explicit `--config` file that does not exist; D10).
+- Unknown TOML keys produce a `warn!` log. A config file passed with `--config` that does not exist is a startup error (D10): the daemon exits 1 before it creates the WAB directory, takes the lock or binds a socket, printing `config file <path> (passed with --config) does not exist`. A missing default file (no `--config`) is an empty layer, not an error; if the resolved sink is then `noop`, startup logs the NOOP SINK WARN naming the default path. The startup log names the config source at INFO (`loaded=false` when the default file is missing). See [operations/configuration.md](operations/configuration.md#a-missing-config-file).
 - See `deploy/docker/weir.toml.example` for all fields, defaults, valid ranges, and `WEIR_*` env-var equivalents.
 
 ### Socket layer (`src/socket/`) — Unix only

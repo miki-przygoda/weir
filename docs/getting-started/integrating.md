@@ -119,8 +119,14 @@ API rather than matching the `#[non_exhaustive]` error enum:
 
 Recoverable (connection untouched, keep using it): the *local* pre-send
 `ClientError::PayloadTooLarge` rejection, the *local* pre-send
-`ClientError::EmptyPayload` rejection (a zero-length payload rejected before any
-bytes are sent), `ClientError::NoDefaultDurability`, and
+`ClientError::TooManyRecords` rejection (a `push_batch` over the record cap,
+e.g. `TooManyRecords { count: 2049, limit: 2048 }`, rejected before any bytes
+are sent: split the batch and push again on the same client; split it to the
+daemon's `max_batch_records`, default 1024, not to `limit`, because a batch
+under the 2048-record hard cap but over the daemon's cap is Nacked and the
+daemon closes the connection), the *local*
+pre-send `ClientError::EmptyPayload` rejection (a zero-length payload rejected
+before any bytes are sent), `ClientError::NoDefaultDurability`, and
 `ClientError::Nack(NackReason::InternalError)` (the one transient Nack the daemon
 keeps the connection open for). Everything else is non-recoverable and the daemon
 has closed (or the socket is dead): all *other* server Nacks, plus

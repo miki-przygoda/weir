@@ -1,0 +1,121 @@
+{
+  "epic": "d10-and-batch-error",
+  "repo": "/home/claude/weir",
+  "branch": "epic/d10-and-batch-error",
+  "base": "main",
+  "default_branch": "main",
+  "spec": "docs/superpowers/temper/d10-and-batch-error/spec.md",
+  "plan": "docs/superpowers/temper/d10-and-batch-error/plan.md",
+  "log": "docs/superpowers/temper/d10-and-batch-error/log.md",
+  "host": {
+    "kind": "local"
+  },
+  "gates": {
+    "quick": "bash \"$(git rev-parse --show-toplevel)/.temper/gate-quick.sh\"",
+    "full": "bash \"$(git rev-parse --show-toplevel)/.temper/gate-full.sh\""
+  },
+  "build_rule": "Build and test only in this box, through the gates: `bash .temper/gate-quick.sh`, `bash .temper/gate-full.sh`, or single cargo runs through `bash .temper/gate-run.sh <cargo args>`. There is no jobq on beast (ops/jobq.md): the box's memory cap (10 GiB) is the limit; at most 2 heavy builds at once, and a workflow at most 2 building agents. Run every gate in the foreground (a session waiting on a background job can end its turn), with a Bash timeout of 600000 ms; if a gate outlasts one call, start it with `setsid nohup bash .temper/gate-full.sh >/dev/null 2>&1 </dev/null &` and poll `/build/weir-gate/logs/<worktree>/latest-<gate>/summary.txt` in the foreground until its last line is `GATE <gate> rc=N`. Never set CARGO_TARGET_DIR or make another target dir: the slots are the build dirs. Never write the CI-skip token in a commit message. Commits carry only the `Temper-Task` trailer: no Co-Authored-By, Claude-Session or \"Generated with\" lines. Never print a secret or token. Push only `cc1/*` branches to gitolite.\nCHANGELOG.md is owned by the wave-1 task changelog-upgrade-notes only; no other task touches it. The `docs_drift` and `demo_drift` tests guard figures and version strings in the docs: if a fix trips one, fix the doc, never weaken the guard.\nFull gate in this box (owner decision, 13 Nov 2026): do NOT install act or any other binary. Judge the full gate on its native steps only (fmt, clippy x4, demo-version, every test step, load-norun, deny, dst-300, build-x86_64-unknown-linux-gnu with its TLS smoke): the gate passes when every native step has rc=0, whatever the script's overall exit status. The container steps (act-*, windows, the cross builds) and msrv (the box has no Rust 1.88 toolchain; owner, 13 Nov: not installed) are expected to fail without act or with docker limits: list them as \"not run in the box (no act); covered by the PR GitHub CI\" and do not count them. Quote each native step's rc from the gate's summary.",
+  "flaky": [],
+  "tasks": [
+    {
+      "id": "d10-hard-error",
+      "title": "an explicit missing --config refuses to start",
+      "wave": 0,
+      "owns": [
+        "crates/weir-server/src/config/mod.rs",
+        "crates/weir-server/src/config/cli.rs",
+        "crates/weir-server/src/config/file.rs",
+        "crates/weir-server/src/main.rs",
+        "crates/weir-server/tests/system.rs",
+        "crates/weir-server/tests/deploy.rs",
+        "deploy/docker/Dockerfile",
+        "deploy/docker/docker-compose.yml",
+        "docs/operations/configuration.md"
+      ],
+      "uses": [],
+      "provides": [
+        "C1"
+      ],
+      "text": "### d10-hard-error: an explicit missing --config refuses to start\n\n- Owns: `crates/weir-server/src/config/mod.rs`, `crates/weir-server/src/config/cli.rs`, `crates/weir-server/src/config/file.rs`, `crates/weir-server/src/main.rs`, `crates/weir-server/tests/system.rs`, `crates/weir-server/tests/deploy.rs`, `deploy/docker/Dockerfile`, `deploy/docker/docker-compose.yml`, `docs/operations/configuration.md`\n- Uses: none\n- Provides: C1\n- Wave: 0\n\nImplement contract C1. Steps, tests first:\n1. In `crates/weir-server/tests/system.rs`, the test near line 1812 asserts that an explicit `--config` to a missing file still starts and WARNs: replace it with one that asserts the new behaviour (non-zero exit with the C1 message, and no WAB dir, lock or socket created), and add one for the implicit default missing (starts; with no sink configured the NOOP SINK WARN appears). Add unit tests in `config/mod.rs` for the explicit-missing error and its Display.\n2. In `config/mod.rs`: return the C1 error from loading when explicit and not found; drop the explicit branch and the \"will become a startup error\" sentence from `missing_config_file_warning` (it now covers only the implicit case); log the config source at INFO for the implicit-missing case, keeping the NOOP SINK WARN.\n3. `deploy/docker/Dockerfile`: `CMD [\"weir-server\"]`; update the comment above it (bind-mount `/etc/weir/weir.toml` to use a file; pass `--config` only for another path). Check `deploy/docker/docker-compose.yml` for an explicit `--config` and keep it consistent; check `crates/weir-server/tests/deploy.rs` for anything pinning the old CMD.\n4. `docs/operations/configuration.md`: the config-file section says an explicit missing `--config` is a startup error and an implicit missing default is not; remove the \"future minor release\" wording. Leave `deploy/systemd/weir.service` unchanged (owner, 10 Nov).\n5. Quick gate green."
+    },
+    {
+      "id": "client-too-many-records",
+      "title": "a batch over the record cap reports a count",
+      "wave": 0,
+      "owns": [
+        "crates/weir-client/src/client.rs",
+        "crates/weir-client/src/unix.rs",
+        "crates/weir-client/tests/client_server.rs",
+        "crates/weir-client/tests/protocol.rs",
+        "crates/weir-client/README.md"
+      ],
+      "uses": [],
+      "provides": [
+        "C2"
+      ],
+      "text": "### client-too-many-records: a batch over the record cap reports a count\n\n- Owns: `crates/weir-client/src/client.rs`, `crates/weir-client/src/unix.rs`, `crates/weir-client/tests/client_server.rs`, `crates/weir-client/tests/protocol.rs`, `crates/weir-client/README.md`\n- Uses: none\n- Provides: C2\n- Wave: 0\n\nImplement contract C2. Steps, tests first:\n1. A test that `push_batch` with `MAX_BATCH_RECORDS_HARD_CAP + 1` one-byte records returns `TooManyRecords { count: 2049, limit: 2048 }`, sends no bytes, and that the same client then pushes successfully; a test of the Display text; a test that `is_recoverable()` is true and `is_poisoned()` false for it. Find every existing test asserting `PayloadTooLarge` for the record-count case (`git grep -n PayloadTooLarge crates/weir-client`) and move it to `TooManyRecords`.\n2. Add the variant, its Display, and its rows in `is_recoverable` / the doc table near line 162; return it where `records.len() > MAX_BATCH_RECORDS_HARD_CAP` (client.rs ~570) and at any other batch entry point with the same check. Update `PayloadTooLarge`'s doc to say bytes only.\n3. Update the crate README if it documents the batch errors.\n4. Quick gate green."
+    },
+    {
+      "id": "changelog-upgrade-notes",
+      "title": "the CHANGELOG for both changes",
+      "wave": 1,
+      "owns": [
+        "CHANGELOG.md"
+      ],
+      "uses": [
+        "C1",
+        "C2"
+      ],
+      "provides": [],
+      "text": "### changelog-upgrade-notes: the CHANGELOG for both changes\n\n- Owns: `CHANGELOG.md`\n- Uses: C1, C2\n- Provides: none\n- Wave: 1\n\nUnder `## [Unreleased]`: in `### Changed`, the D10 entry (an explicit `--config` file that doesn't exist now stops startup; the systemd unit passes one; the Docker image's CMD no longer passes `--config`, so env-only container users are unaffected) and the TooManyRecords entry (callers that matched `PayloadTooLarge` for an over-long batch must also match `TooManyRecords`; `PayloadTooLarge` now means bytes only). In `### Added` if the file's style calls for it: the new variant. Keep the file's style; amend, don't duplicate, any entry #77 already has on these topics. Quick gate green (it runs the drift guards for CHANGELOG changes)."
+    }
+  ],
+  "behaviour_groups": [
+    {
+      "key": "config-startup",
+      "title": "D10 config-file startup behaviour (spec flows 1-3)"
+    },
+    {
+      "key": "client-batch",
+      "title": "The client's batch record-count error (spec flow 4)"
+    }
+  ],
+  "done": [
+    "acceptance:client-batch",
+    "acceptance:config-startup",
+    "behaviour-spec",
+    "changelog-upgrade-notes",
+    "checkpoint",
+    "client-too-many-records",
+    "d10-hard-error",
+    "fix:failure-paths-and-lifecycle-01",
+    "fix:failure-paths-and-lifecycle-02",
+    "fix:test-strength-and-docs-01",
+    "fix:test-strength-and-docs-02"
+  ],
+  "answers": {},
+  "attempt": 0,
+  "gate_slots": 2,
+  "build_attempt": 2,
+  "second_sweep_findings": [
+    {
+      "id": "second:failure-paths-and-lifecycle-01",
+      "severity": "minor",
+      "file": "crates/weir-server/tests/acceptance_config_startup.rs",
+      "line": 293
+    },
+    {
+      "id": "second:test-strength-and-docs-01",
+      "severity": "minor",
+      "file": "docs/getting-started/integrating.md",
+      "line": 124
+    },
+    {
+      "id": "second:test-strength-and-docs-02",
+      "severity": "minor",
+      "file": "docs/architecture.md",
+      "line": 134
+    }
+  ],
+  "stabilise_fix_attempt": 0
+}

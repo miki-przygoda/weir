@@ -722,6 +722,13 @@ A non-Rust client that satisfies the following is wire-compatible:
       record: a batch of records that each fit can still be refused.
       `weir-client`'s `push_batch` checks the encoded body against the hard
       cap locally and returns a recoverable `ClientError::PayloadTooLarge`.
+- [ ] Caps a `PushBatch`'s `record_count` at the daemon's `max_batch_records`
+      (default 1024), not just at `MAX_BATCH_RECORDS_HARD_CAP` (2048): a batch
+      over the daemon's cap gets `Nack(PayloadTooLarge 0x04)` and the
+      connection is closed.
+      `weir-client`'s `push_batch` checks the count against the hard cap
+      locally and returns a recoverable `ClientError::TooManyRecords`
+      `{ count, limit }`; it cannot know a lower configured cap.
 - [ ] Handles connection close mid-stream as "in-flight requests had
       unknown outcomes; retry on a fresh connection."
 

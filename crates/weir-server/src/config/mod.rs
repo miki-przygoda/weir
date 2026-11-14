@@ -36,6 +36,11 @@ pub enum ConfigError {
         field: &'static str,
         reason: String,
     },
+    /// `--config <path>` was passed and the file does not exist (spec §3.4,
+    /// D10). Only the path is printed, never file contents or env values.
+    ConfigFileMissing {
+        path: PathBuf,
+    },
 }
 
 impl fmt::Display for ConfigError {
@@ -51,6 +56,11 @@ impl fmt::Display for ConfigError {
             ConfigError::PathInvalid { field, reason } => {
                 write!(f, "invalid path for '{field}': {reason}")
             }
+            ConfigError::ConfigFileMissing { path } => write!(
+                f,
+                "config file {} (passed with --config) does not exist",
+                path.display()
+            ),
         }
     }
 }
@@ -649,37 +659,29 @@ pub struct Config {
     pub tls_handshake_timeout_secs: u64,
 }
 
-/// The WARN for a config file that does not exist (spec §3.4, D10).
+/// The WARN for a missing implicit default config file (spec §3.4, D10), or
+/// `None` when there is nothing to warn about.
 ///
-/// Not an error in this release: the Docker image's CMD always passes
-/// `--config /etc/weir/weir.toml`, so env-only container users would all fail
-/// to start. The hard error for an explicit `--config` waits for the minor
-/// release that also changes that CMD. When nothing else configured a sink,
-/// `sink_type` resolves to `noop`, which acks and drops every record, so the
-/// wording escalates: that is the case where a mistyped path silently turns
-/// a durable pipeline into a discard.
-fn missing_config_file_warning(source: &ConfigSource, sink_type: &SinkType) -> String {
-    let path = source.path.display();
-    let mut msg = if source.explicit {
-        format!(
-            "config file {path} (passed with --config) does not exist; running on \
-             command-line flags, WEIR_* environment variables and built-in defaults only. \
-             A missing --config file will become a startup error in a future minor release"
-        )
-    } else {
-        format!(
-            "no config file at the default path {path}; running on command-line flags, \
-             WEIR_* environment variables and built-in defaults only"
-        )
-    };
-    if matches!(sink_type, SinkType::Noop) {
-        msg = format!(
-            "NOOP SINK: {msg}. sink_type resolved to \"noop\": every record is \
-             acknowledged and then DISCARDED, and nothing reaches a downstream system. \
-             If a config file was meant to set the sink, check the path"
-        );
+/// An explicit `--config` that does not exist never gets here: it is a startup
+/// error ([`ConfigError::ConfigFileMissing`]). A missing default file is not:
+/// env-only deployments (the Docker image's CMD passes no `--config`) run
+/// without one, and `main`'s INFO `config source` line says it was not loaded.
+/// The one case that still WARNs is a `sink_type` that resolved to `noop`,
+/// which acks and drops every record: a deployment that meant the file to set
+/// the sink would otherwise discard silently.
+fn missing_config_file_warning(source: &ConfigSource, sink_type: &SinkType) -> Option<String> {
+    debug_assert!(!source.explicit, "an explicit missing --config is an error");
+    if !matches!(sink_type, SinkType::Noop) {
+        return None;
     }
-    msg
+    Some(format!(
+        "NOOP SINK: no config file at the default path {}; running on command-line \
+         flags, WEIR_* environment variables and built-in defaults only. sink_type \
+         resolved to \"noop\": every record is acknowledged and then DISCARDED, and \
+         nothing reaches a downstream system. If a config file was meant to set the \
+         sink, check the path",
+        source.path.display()
+    ))
 }
 
 /// Where the config came from, for the startup INFO line (spec §3.4).
@@ -798,7 +800,9 @@ impl Config {
     ///
     /// Returns the validated config plus any **advisory warnings** collected
     /// during loading (unknown TOML keys, feature-gated keys, the small
-    /// dead-letter-cap advisory, a missing config file). The caller is expected
+    /// dead-letter-cap advisory, the NOOP SINK WARN for a missing default
+    /// config file). An explicit `--config` file that does not exist is
+    /// [`ConfigError::ConfigFileMissing`] (D10). The caller is expected
     /// to replay them through `tracing` *after* the subscriber is initialised —
     /// `load()` runs before the subscriber exists, so emitting them here would
     /// silently drop them and a TOML typo would take defaults unnoticed (F54).
@@ -820,6 +824,13 @@ impl Config {
     ) -> Result<(Self, Vec<String>, ConfigSource), ConfigError> {
         let (file, warnings, found) = match file::read(&config_path.path)? {
             Some((file, warnings)) => (file, warnings, true),
+            // D10: an explicit --config that does not exist refuses to start,
+            // before the env layer, preflight, recovery or any bind.
+            None if config_path.explicit => {
+                return Err(ConfigError::ConfigFileMissing {
+                    path: config_path.path,
+                });
+            }
             None => (PartialConfig::empty(), Vec::new(), false),
         };
         let env = env()?;
@@ -829,8 +840,8 @@ impl Config {
             explicit: config_path.explicit,
             found,
         };
-        if !found {
-            warnings.push(missing_config_file_warning(&source, &config.sink_type));
+        if !found && let Some(w) = missing_config_file_warning(&source, &config.sink_type) {
+            warnings.push(w);
         }
         Ok((config, warnings, source))
     }
@@ -2449,31 +2460,39 @@ mod tests {
         assert!(read.is_none(), "a missing file must read as absent");
     }
 
-    // ── §3.4 (D10): a missing config file is no longer silent ────────────────
+    // ── §3.4 (D10): a missing config file ────────────────────────────────────
+
+    type Loaded = Result<(Config, Vec<String>, ConfigSource), ConfigError>;
 
     /// Drives `Config::load_from` with a CLI layer that only sets `wab_dir`
     /// (plus `extra`), the given config path, and an empty env layer.
-    fn load_missing(
-        label: &str,
-        explicit: bool,
-        extra: PartialConfig,
-    ) -> (Config, Vec<String>, ConfigSource, PathBuf) {
+    fn try_load_missing(label: &str, explicit: bool, extra: PartialConfig) -> (Loaded, PathBuf) {
         let dir = tmp_dir(label);
         let path = dir.join("no-such-weir.toml");
         let cli = PartialConfig {
             wab_dir: Some(dir.clone()),
             ..extra
         };
-        let (config, warnings, source) = Config::load_from(
+        let result = Config::load_from(
             cli,
             ConfigPath {
                 path: path.clone(),
                 explicit,
             },
             || Ok(PartialConfig::empty()),
-        )
-        .map_err(|e| e.to_string())
-        .expect("a missing config file must not be an error (D10)");
+        );
+        (result, path)
+    }
+
+    /// The implicit default path missing: loads, it is not an error (D10).
+    fn load_missing_default(
+        label: &str,
+        extra: PartialConfig,
+    ) -> (Config, Vec<String>, ConfigSource, PathBuf) {
+        let (result, path) = try_load_missing(label, false, extra);
+        let (config, warnings, source) = result
+            .map_err(|e| e.to_string())
+            .expect("a missing default config file must not be an error (D10)");
         (config, warnings, source, path)
     }
 
@@ -2491,85 +2510,108 @@ mod tests {
         }
     }
 
-    /// An operator's `--config <path>` that does not exist still loads (the
-    /// Docker image always passes `--config`, so env-only users would break),
-    /// but now WARNs, naming the path and that it was passed explicitly.
+    /// An operator's `--config <path>` that does not exist refuses to start
+    /// (D10): a mistyped path must not turn a durable pipeline into a discard.
+    /// It fails whatever the sink, and before the env layer is read.
     #[test]
-    fn missing_explicit_config_warns_naming_path() {
-        let (_, warnings, source, path) =
-            load_missing("missing_explicit", true, PartialConfig::empty());
-        let hits = missing_warnings(&warnings, &path);
-        assert_eq!(
-            hits.len(),
-            1,
-            "exactly one missing-file warning: {warnings:?}"
+    fn missing_explicit_config_is_an_error() {
+        let (result, path) = try_load_missing("missing_explicit", true, PartialConfig::empty());
+        match result {
+            Err(ConfigError::ConfigFileMissing { path: p }) => assert_eq!(p, path),
+            Err(e) => panic!("wrong error for a missing --config file: {e}"),
+            Ok(_) => panic!("a missing --config file must be an error (D10)"),
+        }
+
+        #[cfg(feature = "http-sink")]
+        {
+            let (result, _) = try_load_missing("missing_explicit_http", true, http_sink());
+            assert!(
+                matches!(result, Err(ConfigError::ConfigFileMissing { .. })),
+                "a configured sink does not excuse a missing --config file"
+            );
+        }
+
+        // The file is checked before the env layer: a bad env var does not
+        // mask the missing file.
+        let dir = tmp_dir("missing_explicit_env");
+        let path = dir.join("no-such-weir.toml");
+        let result = Config::load_from(
+            PartialConfig {
+                wab_dir: Some(dir.clone()),
+                ..PartialConfig::empty()
+            },
+            ConfigPath {
+                path: path.clone(),
+                explicit: true,
+            },
+            || panic!("the env layer must not be read when --config is missing"),
         );
-        assert!(hits[0].contains("--config"), "{hits:?}");
-        assert!(hits[0].contains("does not exist"), "{hits:?}");
+        assert!(
+            matches!(result, Err(ConfigError::ConfigFileMissing { .. })),
+            "a missing --config file must be the D10 error"
+        );
+    }
+
+    /// The D10 error names the path and that it came from `--config`, and
+    /// nothing else (no file contents, no env values).
+    #[test]
+    fn missing_explicit_config_error_display() {
+        let err = ConfigError::ConfigFileMissing {
+            path: PathBuf::from("/etc/weir/missing.toml"),
+        };
+        assert_eq!(
+            err.to_string(),
+            "config file /etc/weir/missing.toml (passed with --config) does not exist"
+        );
+        // Debug is Display: `main` returning the error prints this.
+        assert_eq!(format!("{err:?}"), err.to_string());
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    /// The implicit default path missing with a real sink configured loads with
+    /// no WARN at all: `main`'s INFO `config source` line says the file was not
+    /// loaded. It is not an error and does not claim `--config` was passed.
+    #[test]
+    #[cfg(feature = "http-sink")]
+    fn missing_default_config_with_a_sink_does_not_warn() {
+        let (_, warnings, source, path) = load_missing_default("missing_default", http_sink());
+        assert!(
+            missing_warnings(&warnings, &path).is_empty(),
+            "a configured sink needs no missing-file WARN: {warnings:?}"
+        );
         assert_eq!(
             source,
             ConfigSource {
                 path: path.clone(),
-                explicit: true,
+                explicit: false,
                 found: false
             }
         );
-
-        // Same wording without a noop sink: the path and --config still named.
-        #[cfg(feature = "http-sink")]
-        {
-            let (_, warnings, _, path) = load_missing("missing_explicit_http", true, http_sink());
-            let hits = missing_warnings(&warnings, &path);
-            assert_eq!(hits.len(), 1, "{warnings:?}");
-            assert!(hits[0].contains("--config"), "{hits:?}");
-        }
     }
 
-    /// The implicit default path missing also WARNs, naming the path, and does
-    /// not claim the operator passed `--config`.
+    /// With the default file missing and nothing else configuring a sink,
+    /// `sink_type` resolves to `noop`, which acks and discards every record.
+    /// That is the one WARN left: NOOP SINK, naming the default path.
     #[test]
-    fn missing_default_config_warns() {
-        let (_, warnings, source, path) =
-            load_missing("missing_default", false, PartialConfig::empty());
+    fn missing_default_config_with_noop_sink_warns_loudly() {
+        let (config, warnings, source, path) =
+            load_missing_default("missing_noop", PartialConfig::empty());
+        assert!(matches!(config.sink_type, SinkType::Noop));
         let hits = missing_warnings(&warnings, &path);
-        assert_eq!(
-            hits.len(),
-            1,
-            "exactly one missing-file warning: {warnings:?}"
-        );
+        assert_eq!(hits.len(), 1, "exactly one NOOP SINK warning: {warnings:?}");
+        assert!(hits[0].starts_with("NOOP SINK:"), "{hits:?}");
         assert!(hits[0].contains("default"), "{hits:?}");
+        assert!(hits[0].contains("noop"), "{hits:?}");
+        assert!(hits[0].contains("DISCARDED"), "{hits:?}");
         assert!(
-            !hits[0].contains("passed with --config"),
+            !hits[0].contains("--config"),
             "the default path was not passed explicitly: {hits:?}"
         );
+        assert!(
+            !hits[0].contains("future minor release"),
+            "the old deprecation sentence is gone: {hits:?}"
+        );
         assert!(!source.explicit && !source.found, "{source:?}");
-    }
-
-    /// With the file missing and nothing else configuring a sink, `sink_type`
-    /// resolves to `noop`, which acks and discards every record. The warning
-    /// escalates to say exactly that. A real sink keeps the plain wording.
-    #[test]
-    fn missing_config_with_noop_sink_warns_loudly() {
-        for explicit in [true, false] {
-            let (config, warnings, _, path) =
-                load_missing("missing_noop", explicit, PartialConfig::empty());
-            assert!(matches!(config.sink_type, SinkType::Noop));
-            let hits = missing_warnings(&warnings, &path);
-            assert_eq!(hits.len(), 1, "{warnings:?}");
-            assert!(hits[0].contains("noop"), "{hits:?}");
-            assert!(hits[0].contains("DISCARDED"), "{hits:?}");
-        }
-
-        #[cfg(feature = "http-sink")]
-        for explicit in [true, false] {
-            let (_, warnings, _, path) = load_missing("missing_not_noop", explicit, http_sink());
-            let hits = missing_warnings(&warnings, &path);
-            assert_eq!(hits.len(), 1, "{warnings:?}");
-            assert!(
-                !hits[0].contains("DISCARDED"),
-                "a configured sink must not get the noop wording: {hits:?}"
-            );
-        }
     }
 
     /// A config file that exists produces no missing-file warning and reports
