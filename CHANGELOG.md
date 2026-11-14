@@ -15,6 +15,10 @@ protocol** below.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [4.2.0] - 2026-11-14
+
 ### Changed
 
 - The HTTP sink now prints only the `scheme://host[:port]` of `sink_url`
@@ -4542,6 +4546,7 @@ The five commits making up this pass:
 
 ---
 
+[4.2.0]: https://github.com/miki-przygoda/weir/compare/v4.1.0...v4.2.0
 [4.1.0]: https://github.com/miki-przygoda/weir/compare/v4.0.1...v4.1.0
 [4.0.1]: https://github.com/miki-przygoda/weir/compare/v4.0.0...v4.0.1
 [4.0.0]: https://github.com/miki-przygoda/weir/compare/v3.0.0...v4.0.0
