@@ -2178,3 +2178,68 @@ fn the_integration_guide_lists_every_recoverable_client_error() {
          (is_recoverable returns true for {recoverable:?})"
     );
 }
+
+const QUICKSTART: &str = include_str!("../../../docs/getting-started/quickstart.md");
+const INSTALL: &str = include_str!("../../../docs/getting-started/install.md");
+const WEIR_RS_README: &str = include_str!("../../weir-rs/README.md");
+const WEIR_RS_LIB: &str = include_str!("../../weir-rs/src/lib.rs");
+
+/// The 4.2.0 branch shipped a README that called weir "stable at 4.1", told
+/// readers to depend on `weir-client = "4.1"`, and an install page that said
+/// the published crates were 4.1.0. Every place that names the current release
+/// follows the workspace version; history ("Changed after 4.1.0") is not
+/// checked here.
+#[test]
+fn the_docs_name_the_workspace_release_as_current() {
+    let full = env!("CARGO_PKG_VERSION");
+    let mm = full.rsplit_once('.').expect("x.y.z").0;
+    let mut stale = Vec::new();
+    for (name, doc) in [
+        ("README.md", README),
+        ("docs/getting-started/quickstart.md", QUICKSTART),
+        ("crates/weir-rs/README.md", WEIR_RS_README),
+        ("crates/weir-rs/src/lib.rs", WEIR_RS_LIB),
+    ] {
+        for line in doc.lines() {
+            // `weir-client = "4.2"`, `weir-rs = "4.2"`, `weir-rs = { version = "4.2", ... }`
+            let Some(rest) = ["weir-client = ", "weir-rs = "]
+                .iter()
+                .find_map(|k| line.split_once(k).map(|(_, r)| r))
+            else {
+                continue;
+            };
+            let rest = rest.strip_prefix("{ version = ").unwrap_or(rest);
+            let Some(v) = rest.strip_prefix('"').and_then(|r| r.split('"').next()) else {
+                continue;
+            };
+            if v != mm {
+                stale.push(format!("{name}: {}", line.trim()));
+            }
+        }
+    }
+    let status = README
+        .lines()
+        .find(|l| l.starts_with("weir is stable at "))
+        .expect("README's Project status must open with `weir is stable at <x.y>.`");
+    if !status.starts_with(&format!("weir is stable at {mm}.")) {
+        stale.push(format!("README.md: {status}"));
+    }
+    let published = INSTALL
+        .split("All ten crates are on crates.io")
+        .nth(1)
+        .expect("install.md's cargo-install status note")
+        .split("```")
+        .next()
+        .unwrap();
+    if !published.contains(full) {
+        stale.push(format!(
+            "docs/getting-started/install.md: crates.io note{}",
+            published.replace("\n>", "").trim_end()
+        ));
+    }
+    assert!(
+        stale.is_empty(),
+        "these name a release other than the workspace's {full} as current:\n  {}",
+        stale.join("\n  ")
+    );
+}

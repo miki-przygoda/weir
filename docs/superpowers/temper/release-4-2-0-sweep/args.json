@@ -1,0 +1,121 @@
+{
+  "epic": "release-4-2-0-sweep",
+  "repo": "/home/claude/weir",
+  "branch": "sweep/4.2.0",
+  "base": "v4.1.0",
+  "default_branch": "main",
+  "log": "docs/superpowers/temper/release-4-2-0-sweep/log.md",
+  "host": {
+    "kind": "local"
+  },
+  "gates": {
+    "quick": "bash \"$(git rev-parse --show-toplevel)/.temper/gate-quick.sh\"",
+    "full": "bash \"$(git rev-parse --show-toplevel)/.temper/gate-full.sh\""
+  },
+  "done": [],
+  "lenses": [
+    "security",
+    "failure paths and lifecycle",
+    "test strength and docs",
+    "durability and ack semantics"
+  ],
+  "severity_notes": "- An acked `Durable` record that is not on disk, or does not replay after a crash, is severe.\n- A change to the on-disk WAB format, the wire protocol or a published crate's public API without a version decision is severe: it needs the owner.\n- A panic reachable from a client frame, a stored segment or a config value is critical.\n- A secret reaching a log, a `Debug` string, argv or `/status` is critical.\n- Anything that loosens a security default is severe, and is never fixed without the owner.",
+  "build_rule": "Build and test only in this box, through the gates: `bash .temper/gate-quick.sh`, `bash .temper/gate-full.sh`, or single cargo runs through `bash .temper/gate-run.sh <cargo args>`. There is no jobq on beast (ops/jobq.md): the box's memory cap (10 GiB) is the limit; at most 2 heavy builds at once, and a workflow at most 2 building agents. Run every gate in the foreground (a session waiting on a background job can end its turn), with a Bash timeout of 600000 ms; if a gate outlasts one call, start it with `setsid nohup bash .temper/gate-full.sh >/dev/null 2>&1 </dev/null &` and poll `/build/weir-gate/logs/<worktree>/latest-<gate>/summary.txt` in the foreground until its last line is `GATE <gate> rc=N`. Never set CARGO_TARGET_DIR or make another target dir: the slots are the build dirs. No act, no 1.88 toolchain, no cross targets here (owner, 13 Nov: do not install act): judge the full gate on its native steps; msrv, act, windows, darwin and aarch64 are GitHub CI.s. Say which steps did not run and why. Never write the CI-skip token in a commit message. Commits carry only the `Temper-Task` trailer: no Co-Authored-By, Claude-Session or \"Generated with\" lines. Never print a secret or token. Push only `cc4/*` branches to gitolite. Reviewers read; only verifiers build, and at most 2 agents build at once in this box.",
+  "sweeps": 2,
+  "gate_slots": 1,
+  "part": "fix",
+  "attempt": 0,
+  "selected": [
+    {
+      "id": "test-strength-and-docs-01",
+      "lens": "test strength and docs",
+      "file": "deploy/monitoring/smoke-test.sh",
+      "line": 138,
+      "summary": "The 'drain state = Draining' check takes its expected instance count from the weir_drain_state series that exist. So a non-core instance whose series is missing is left out of both sides of the comparison, and the check still passes.",
+      "input": "Run the smoke test with the levels profile up (jobs weir and weir-levels: weir-min/med/high/max). One level instance, for example weir-med, exports no weir_drain_state series: its family is gone, or it is not scraped yet. The level instances' up check only runs later, at lines 188-193. The core weir instance is draining.",
+      "wrong_result": "drain_instances = count(weir_drain_state{job!=\"weir-chaos\",state=\"draining\"}) counts only the instances that still export the series, so it equals drain_draining. The check prints PASS. CHANGELOG line 262 says the check now fails when a non-chaos instance's weir_drain_state series is missing, but that only holds for the core job=\"weir\" instance. Fix: compare against count(up{job!=\"weir-chaos\"}) (or an equivalent per-instance count) rather than a count of the series under test.",
+      "severity": "important",
+      "kind": "fix"
+    },
+    {
+      "id": "test-strength-and-docs-02",
+      "lens": "test strength and docs",
+      "file": "README.md",
+      "line": 191,
+      "summary": "The README rewritten on this branch still names 4.1 as the current release, while the workspace is version 4.2.0. install.md says the same: 'All ten crates are on crates.io (4.1.0 as of ...)'.",
+      "input": "A reader reads README.md 'Project status', or docs/getting-started/install.md line 269, on the 4.2.0 release branch (Cargo.toml workspace version = \"4.2.0\").",
+      "wrong_result": "The README says 'weir is stable at 4.1' and install.md says the published crates are 4.1.0. The release they ship with is 4.2.0, which adds ClientError::TooManyRecords and changes how RecordId is derived.",
+      "severity": "minor",
+      "kind": "fix"
+    }
+  ],
+  "answers": {},
+  "second_sweep_findings": [
+    {
+      "id": "second:security-01",
+      "lens": "security",
+      "file": "crates/weir-server/src/sink/clickhouse.rs",
+      "line": 334,
+      "summary": "The ClickHouse sink still copies a 3xx Location header into the permanent error unredacted, so a `?password=` it echoes is logged in full. This branch redacted the same query-string password on the transport, health and startup paths, and the CHANGELOG (line 228) and configuration.md say it is scrubbed wherever the SQL sinks log a URL.",
+      "input": "sink_type = \"clickhouse\", sink_url = \"http://ch.internal:8123/?user=default&password=S3CRET\" (the query-parameter auth this branch's fix 126e8a3 covers), behind an http-to-https proxy that answers `return 301 https://$host$request_uri`, so the response carries `Location: https://ch.internal/?user=default&password=S3CRET&query=INSERT...&insert_deduplication_token=...`.",
+      "wrong_result": "commit() builds SqlSinkError::permanent(\"clickhouse\", \"http 301 ...: unexpected redirect to 'https://ch.internal/?user=default&password=S3CRET&query=...'\"). The Location only goes through sanitize_log_excerpt and a 500-char cap, with no redact_password call. The drain then logs it at ERROR as `error!(error = %e, \"drain: permanent sink error; dead-lettering batch\")` (drain/mod.rs:4213), and the same string is stored as the dead-letter reason, so the ClickHouse password reaches the log and the dead-letter store in plaintext. The HTTP sink's matching path was changed on this branch to print only url_origin of the Location (security-r4-01); the ClickHouse path was not.",
+      "severity": "critical",
+      "kind": "fix"
+    },
+    {
+      "id": "second:durability-and-ack-semantics-01",
+      "lens": "durability and ack semantics",
+      "file": "crates/weir-server/src/wab/mod.rs",
+      "line": 2593,
+      "summary": "recover_fsyncs_wab_dir_so_new_shard_dirs_are_durable says recover must fsync wab_dir after creating the shard dirs, but it checks only that some fsync happened, so it cannot catch an fsync done before the dirs exist.",
+      "input": "Move `segment::sync_path(wab_dir)?` in `recover` (mod.rs ~336) above the `for shard_id in 0..shard_count { create_dir_private(..) }` loop, then run the test.",
+      "wrong_result": "The test still passes. The first `recover` call counts one fsync of `dir` (calls >= 1), and the second call (fail=1) still returns EIO because the shard dirs already exist from the first call. But the new `shard_NN` entries are no longer made durable before the first Durable ack, which is the power-loss window the test says it guards. A test that checks the order (fsync count taken after the dirs exist on a fresh dir, or a hook that checks the shard dirs exist when wab_dir is synced) would catch it.",
+      "severity": "important",
+      "kind": "fix"
+    },
+    {
+      "id": "second:durability-and-ack-semantics-02",
+      "lens": "durability and ack semantics",
+      "file": "crates/weir-server/src/wab/recovery.rs",
+      "line": 1474,
+      "summary": "quarantine_fsyncs_wab_dir_after_creating_quarantine_dir and recovery_mid_file_corruption_fsyncs_wab_dir_before_truncating (line 1429) only count wab_dir fsyncs and inject a failure, so they cannot catch an fsync done before quarantine/ is created.",
+      "input": "In `create_quarantine_dir` (recovery.rs ~743), swap the two calls so that `super::segment::fsync_parent_dir(&quarantine_dir)?` (the wab_dir fsync) runs before `super::create_dir_private(quarantine_dir.clone())?`, then run both tests.",
+      "wrong_result": "Both tests still pass. The wab_dir fsync is still called (the call count matches) and an injected EIO still fails before any truncate or rename. But the `quarantine` entry in wab_dir is no longer durable when the caller truncates the original segment. A power loss can then drop quarantine/ and with it the only copy of the acked records after a mid-file corruption, which is the loss these tests say they prevent.",
+      "severity": "important",
+      "kind": "fix"
+    },
+    {
+      "id": "second:failure-paths-and-lifecycle-01",
+      "lens": "failure paths and lifecycle",
+      "file": ".temper/gate-slot.sh",
+      "line": 76,
+      "summary": "latest-<gate> is repointed only after the slot wait and the free-disk check, so a run that is still waiting for a slot, or that exits on the disk floor, leaves latest-<gate>/summary.txt showing the previous run's final `GATE <gate> rc=N` line",
+      "input": "Start `setsid nohup bash .temper/gate-full.sh` the documented way while every slot is busy, or while the slot has less than WEIR_GATE_MIN_FREE_GB free. A previous full run of this worktree ended `GATE full rc=0`. Then poll <logs>/<worktree>/latest-full/summary.txt until its last line is `GATE full rc=N`, as gate-full.sh's header, the README and the build rule say to.",
+      "wrong_result": "The poll stops at once on the old run's `GATE full rc=0`, so the gate reads green for code it never built or tested. In the slot-wait case the real run starts later and overwrites the verdict without anyone watching. In the disk-floor case (`exit 1` at line 41, before OUT exists) the run writes no GATE line and no log at all, and its stderr goes to /dev/null, so the stale green is the only result anyone sees. The README's 'every run writes ... the summary's last line is always GATE' does not hold for these two paths.",
+      "severity": "important",
+      "kind": "fix"
+    },
+    {
+      "id": "second:test-strength-and-docs-01",
+      "lens": "test strength and docs",
+      "file": "crates/weir-server/tests/deploy.rs",
+      "line": 699,
+      "summary": "the_drain_check_fails_when_the_core_instance_is_not_draining cannot catch removal of drain-check.sh's core-instance clause: both of its cases also fail on draining != instances, so a check with the core clause deleted still passes every deploy.rs test.",
+      "input": "Mutate deploy/monitoring/drain-check.sh line 20, replacing `[ \"$(promq 'sum(weir_drain_state{job=\"weir\", state=\"draining\"})')\" = \"1\" ] \\` with `true \\`, then run the deploy.rs drain-check tests. They feed (5,\"5\",\"4\",\"0\") and (1,\"1\",\"0\",\"0\"), and both still fail through the draining/instances comparison, so the tests stay green. A real case the clause exists for: a core-only run (expected=1) with the four level containers left up from an earlier --levels run (the stack is brought up idempotently) and the core `weir` instance down. Then up=4, draining=4, core=0.",
+      "wrong_result": "Reproduced with the shipped check()/gt() from smoke-test.sh and a stub promq. The original check gives FAIL for (expected 1, up 4, draining 4, core 0). The mutated check prints `PASS drain state = Draining (non-chaos, 4/4 draining, 1 expected)`, and the test meant to guard the core instance (and the four other deploy.rs drain tests) still pass. The core `weir` instance being down or not draining goes unreported, and no test catches the regression. Fix: add a case where only the core clause fails, e.g. drain_check(1, \"4\", \"4\", \"0\") must fail.",
+      "severity": "important",
+      "kind": "fix"
+    },
+    {
+      "id": "second:failure-paths-and-lifecycle-02",
+      "lens": "failure paths and lifecycle",
+      "file": ".temper/gate-full.sh",
+      "line": 82,
+      "summary": "act_job removes the fixed-name `weir-smoke` container before and after docker.yml's smoke job without checking whose it is, so two full gates in two slots break each other's smoke job",
+      "input": "WEIR_GATE_SLOTS lists two slots, which gate-slot.sh supports and the README describes. Two worktrees run gate-full.sh at the same time, and one reaches `act_job docker.yml smoke` while the other's smoke job is running.",
+      "wrong_result": "The second gate's `docker rm -f weir-smoke` (before its job) or its cleanup (after its job) kills the first gate's running smoke container. That gate's `act-docker-smoke` step then fails with no defect in the code: a false red on a gate that is supposed to be judged on its steps.",
+      "severity": "minor",
+      "kind": "fix"
+    }
+  ]
+}

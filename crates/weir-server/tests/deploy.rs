@@ -1,5 +1,6 @@
-//! The deploy artefacts, executed: the container HEALTHCHECK command and
-//! `deploy/systemd/weir-readiness.sh`.
+//! The deploy artefacts, executed: the container HEALTHCHECK command,
+//! `deploy/systemd/weir-readiness.sh` and the monitoring smoke test's drain
+//! check (`deploy/monitoring/drain-check.sh`).
 //!
 //! Both are shell, so nothing in the Rust build ever ran them, and both
 //! shipped with semantics nobody had executed. The HEALTHCHECK passed for
@@ -600,4 +601,105 @@ fn the_readiness_script_reports_a_live_daemon_ready() {
     };
     assert_eq!(code, 0, "{out}");
     assert!(out.contains("READY: /readyz ok"), "{out}");
+}
+
+// ── The monitoring smoke test's drain check ───────────────────────────────────
+
+const SMOKE: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../deploy/monitoring/smoke-test.sh"
+);
+const DRAIN_CHECK: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../deploy/monitoring/drain-check.sh"
+);
+
+/// Runs the shipped `drain_check <expected>` with smoke-test.sh's own `check`
+/// and `gt`, and a `promq` that answers as Prometheus would for a fleet with
+/// `up` non-chaos instances up, `draining` of them reporting draining = 1, and
+/// `core` the core instance's draining value. Returns whether the check passed
+/// and its output.
+fn drain_check(expected: u32, up: &str, draining: &str, core: &str) -> (bool, String) {
+    let script = r#"
+set -uo pipefail
+PASS=0; FAIL=0
+eval "$(sed -n '/^check() {/,/^}/p; /^gt() /p' "$SMOKE")"
+promq() {
+  case "$1" in
+    'count(up{job!="weir-chaos"} == 1)') echo "$UP" ;;
+    'sum(weir_drain_state{job!="weir-chaos", state="draining"})') echo "$DRAINING" ;;
+    'sum(weir_drain_state{job="weir", state="draining"})') echo "$CORE" ;;
+    *) echo "unexpected query: $1" >&2; echo 0 ;;
+  esac
+}
+. "$DRAIN_CHECK"
+drain_check "$EXPECTED"
+[ "$PASS" -eq 1 ] && [ "$FAIL" -eq 0 ]
+"#;
+    let mut cmd = Command::new("bash");
+    cmd.arg("-c")
+        .arg(script)
+        .env("SMOKE", SMOKE)
+        .env("DRAIN_CHECK", DRAIN_CHECK)
+        .env("EXPECTED", expected.to_string())
+        .env("UP", up)
+        .env("DRAINING", draining)
+        .env("CORE", core);
+    let (status, out) = run_with_deadline(&mut cmd, Duration::from_secs(20));
+    let status = status.unwrap_or_else(|| panic!("drain_check ran past 20 s:\n{out}"));
+    assert!(
+        !out.contains("unexpected query"),
+        "drain_check asked a query this test does not answer:\n{out}"
+    );
+    (status.success(), out)
+}
+
+#[test]
+fn the_smoke_test_runs_the_shipped_drain_check() {
+    let smoke = std::fs::read_to_string(SMOKE).expect("read smoke-test.sh");
+    assert!(
+        smoke.contains("\n. ./drain-check.sh\n"),
+        "smoke-test.sh no longer sources drain-check.sh"
+    );
+    assert!(
+        smoke.contains("\ndrain_check \"$drain_expected\"\n"),
+        "smoke-test.sh no longer runs drain_check"
+    );
+}
+
+#[test]
+fn the_drain_check_passes_when_every_instance_up_is_draining() {
+    let (ok, out) = drain_check(1, "1", "1", "1");
+    assert!(ok, "core stack:\n{out}");
+    let (ok, out) = drain_check(5, "5", "5", "1");
+    assert!(ok, "levels profile:\n{out}");
+    assert!(out.contains("5/5 draining"), "{out}");
+}
+
+#[test]
+fn the_drain_check_fails_when_a_level_instance_has_no_drain_series() {
+    // weir-med is up but exports no weir_drain_state (or its drain stopped):
+    // 4 of the 5 instances up are draining. Counting the drain series that
+    // exist made this 4/4 and passed.
+    let (ok, out) = drain_check(5, "5", "4", "1");
+    assert!(
+        !ok,
+        "a level instance without a draining series passed:\n{out}"
+    );
+    assert!(out.contains("4/5 draining"), "{out}");
+}
+
+#[test]
+fn the_drain_check_fails_when_an_expected_instance_is_not_up() {
+    let (ok, out) = drain_check(5, "4", "4", "1");
+    assert!(!ok, "4 of the 5 expected instances passed:\n{out}");
+}
+
+#[test]
+fn the_drain_check_fails_when_the_core_instance_is_not_draining() {
+    let (ok, out) = drain_check(5, "5", "4", "0");
+    assert!(!ok, "{out}");
+    // No weir_drain_state family at all: promq reads the empty sums as 0.
+    let (ok, out) = drain_check(1, "1", "0", "0");
+    assert!(!ok, "a missing family passed:\n{out}");
 }

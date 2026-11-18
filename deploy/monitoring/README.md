@@ -127,6 +127,7 @@ job); the `--levels`/`--chaos` scenarios are for local verification.
 | `chaos-failmock.conf` | `nginx` config returning HTTP 400 to every request (permanent → dead-letter). |
 | `grafana/provisioning/` | Auto-loads the Prometheus datasource + the dashboards. |
 | `smoke-test.sh` | End-to-end test: launch → load → assert metrics + dashboard data (`--levels`/`--chaos`). |
+| `drain-check.sh` | The smoke test's "drain state = Draining" check, sourced by `smoke-test.sh` and unit-tested in `crates/weir-server/tests/deploy.rs`. |
 | `../grafana/weir-dashboard.json` | The overview dashboard (importable anywhere). |
 | `../grafana/gen-dashboards.py` | Generates the per-instance dashboards (DRY, one panel definition). |
 | `../grafana/dashboards/` | The generated per-instance dashboards (`weir-min/med/high/max/chaos`). |

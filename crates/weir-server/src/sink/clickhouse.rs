@@ -330,19 +330,29 @@ impl Sink for ClickHouseSink {
             // Surfaces only because redirect-following is disabled (G01). An
             // INSERT endpoint that redirects is a misconfiguration; dead-letter
             // (permanent), never commit — the rows were not inserted here.
-            let raw_location = resp
+            // Only `scheme://host[:port]` of the Location is reported, as in the
+            // HTTP sink: a redirector may echo the request's `?password=` query
+            // auth or a `user:pass@` userinfo, and a denylist of query keys would
+            // miss one it doesn't name (second:security-01). A relative Location
+            // is resolved against the request URL first.
+            let location = match resp
                 .headers()
                 .get(reqwest::header::LOCATION)
                 .and_then(|v| v.to_str().ok())
-                .unwrap_or("<no Location header>");
+            {
+                Some(raw) => resp.url().join(raw).map_or_else(
+                    |_| "<unparseable>".to_string(),
+                    |u| crate::status::config_view::url_origin(u.as_str()),
+                ),
+                None => "<no Location header>".to_string(),
+            };
             // The Location header is downstream-controlled and is logged / stored
             // in the dead-letter reason, so sanitize + bound it the same way as the
             // permanent-body detail below (S29 log-forging defense). reqwest already
             // rejects CR/LF in header values, so this is defense in depth plus
             // capping an otherwise-unbounded header value.
-            let location = crate::sink::sanitize_log_excerpt(
-                &raw_location.chars().take(500).collect::<String>(),
-            );
+            let location =
+                crate::sink::sanitize_log_excerpt(&location.chars().take(500).collect::<String>());
             Err(sql_common::SqlSinkError::permanent(
                 "clickhouse",
                 format!(
@@ -902,6 +912,42 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("302"), "{msg}");
         assert!(msg.contains("redirect"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn commit_redirect_never_echoes_location_credentials() {
+        // second:security-01: the Location is downstream-controlled and lands in
+        // the ERROR log and the dead-letter reason. A redirect that echoes
+        // ClickHouse query auth (`?password=`) or userinfo must not leak it;
+        // only the Location's origin is reported, as in the HTTP sink.
+        for (status_line, origin) in [
+            (
+                "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/?user=weir&password=s3cret",
+                Some("http://127.0.0.1:1"),
+            ),
+            (
+                "HTTP/1.1 301 Moved Permanently\r\nLocation: http://weir:s3cret@127.0.0.1:1/x",
+                Some("http://127.0.0.1:1"),
+            ),
+            (
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: /?quota_key=s3cret&password=s3cret",
+                None,
+            ),
+        ] {
+            let (url, _c) = spawn_ch_mock(status_line, "", Duration::ZERO).await;
+            let sink = ClickHouseSink::new(cfg(&url, "weir_records", "payload")).unwrap();
+            let err = sink
+                .commit(SinkBatch::from(vec![p(b"a")]))
+                .await
+                .unwrap_err();
+            assert!(!err.is_transient(), "a redirect must be permanent: {err}");
+            let msg = err.to_string();
+            assert!(!msg.contains("s3cret"), "Location secret leaked: {msg}");
+            assert!(msg.contains("redirect"), "{msg}");
+            if let Some(origin) = origin {
+                assert!(msg.contains(&format!("'{origin}'")), "origin lost: {msg}");
+            }
+        }
     }
 
     #[tokio::test]

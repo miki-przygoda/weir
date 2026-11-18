@@ -230,6 +230,11 @@ Nothing yet.
   in the drain's WARN retry log, the sink failure status, the health
   probe's error or the startup error for a non-http(s) URL such as a
   `tcp://` native-protocol DSN.
+- The ClickHouse sink's 3xx dead-letter reason now names only the
+  `scheme://host[:port]` of the response's `Location`, as the HTTP sink's
+  does. A redirector that echoed the request (an http-to-https proxy
+  answering `301 https://$host$request_uri`) put the `?password=` query
+  auth, or a `user:pass@`, into the ERROR log and the dead-letter store.
 - A failed timed seal (`segment_max_age` or `segment_max_lifetime`) no longer
   logs that the segment "stays active" and will be retried: it was already
   retired, so its acked records were silently stranded in the unsealed `.wab`
@@ -260,9 +265,13 @@ Nothing yet.
   name; anything else is logged as a WARN and the daemon logs at `info`. A
   single target is still written `target=level`.
 - The monitoring smoke test's "drain state = Draining" check now fails when a
-  non-chaos instance's drain has stopped or its `weir_drain_state` series is
-  missing: it summed only the `retrying_transient` and
-  `blocked_dead_letter_full` states, so a drain that had exited passed.
+  non-chaos instance that Prometheus scrapes has a stopped drain or no
+  `weir_drain_state` series, or when fewer instances are up than the run
+  started (the core `weir`, plus four with `--levels`): it summed only the
+  `retrying_transient` and `blocked_dead_letter_full` states, so a drain that
+  had exited passed. The check counts instances from `up`, not from the drain
+  series under test, and lives in `deploy/monitoring/drain-check.sh` so the
+  `deploy` tests run it against a stub Prometheus.
 - `deploy/smoke-test.sh` now fails when `weir-server` exits non-zero or
   crashes on SIGTERM, and prints its log: the shutdown step only polled
   `kill -0` and never read the exit status, so a failed shutdown passed as

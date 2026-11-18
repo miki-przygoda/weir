@@ -81,7 +81,7 @@ weir-ctl push --socket /tmp/weir/run/weir.sock 'hello, weir!'
 # ack  12 bytes, Durable
 ```
 
-Or from Rust, with `weir-client = "4.1"`:
+Or from Rust, with `weir-client = "4.2"`:
 
 ```rust
 use weir_client::{Durability, WeirClient};
@@ -182,13 +182,13 @@ traces to the storage rather than to weir. Measure on your own hardware:
 cargo test -p weir-server --test load --release -- --nocapture
 ```
 
-The published CI benchmarks, 4.1.0 as of 2026-10-26, run on a shared 2-vCPU
+The published CI benchmarks, 4.2.0 as of 2026-11-14, run on a shared 2-vCPU
 runner and are tracked for regressions, not quoted as performance
 ([benchmarks](docs/benchmarks.md)).
 
 ## Project status
 
-weir is stable at 4.1. The wire protocol and the public Rust API are under
+weir is stable at 4.2. The wire protocol and the public Rust API are under
 [Semantic Versioning](https://semver.org/). The wire protocol has not changed
 since 1.0, so a 1.x producer still works against a 4.x daemon. The on-disk
 buffer format is stable, and unconfirmed segments replay on restart.

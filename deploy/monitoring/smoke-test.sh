@@ -69,6 +69,10 @@ print(n)" 2>/dev/null || echo 0
 # float comparison helper: gt A B → exit 0 iff A > B
 gt() { python3 -c "import sys;sys.exit(0 if float('$1')>float('$2') else 1)" 2>/dev/null; }
 
+# drain_check: the "drain state = Draining" assertion, kept in its own file so
+# crates/weir-server/tests/deploy.rs can run it against a stub Prometheus.
+. ./drain-check.sh
+
 echo "── weir monitoring smoke test ─────────────────────────────────────────────"
 echo "[setup] bringing the stack up (idempotent, builds if needed)...${PROFILE_ARGS:+ profiles:$PROFILE_ARGS}"
 # Capture rather than discard. This used to be `>/dev/null 2>&1`, so a failure
@@ -132,14 +136,16 @@ echo "[invariants] durability + health (healthy fleet; chaos excluded)..."
 # Assert the healthy state, not the absence of two bad ones. Summing only
 # retrying_transient and blocked_dead_letter_full passed a drain that had
 # EXITED (state="stopped") and a family that had vanished (promq reads an empty
-# result as 0). Every non-chaos instance must report draining=1: the draining
-# sum must equal the number of instances exporting the family, and the core
-# `weir` instance must be one of them.
-drain_instances=$(promq 'count(weir_drain_state{job!="weir-chaos", state="draining"})')
-drain_draining=$(promq 'sum(weir_drain_state{job!="weir-chaos", state="draining"})')
-[ "$(promq 'sum(weir_drain_state{job="weir", state="draining"})')" = "1" ] \
-  && gt "$drain_instances" "0" && [ "$drain_draining" = "$drain_instances" ]
-check "drain state = Draining (non-chaos, $drain_draining/$drain_instances draining)" $?
+# result as 0). Every non-chaos instance that is up must report draining=1
+# (drain-check.sh). Wait first for the instances this run started (the core
+# `weir`, plus the four level instances with --levels) to be scraped, so the
+# check sees all of them rather than the ones Prometheus reached first.
+drain_expected=$((1 + 4 * LEVELS))
+for _ in $(seq 1 30); do
+  gt "$drain_expected" "$(promq 'count(up{job!="weir-chaos"} == 1)')" || break
+  sleep 2
+done
+drain_check "$drain_expected"
 
 # Grafana's HTTP API comes up AFTER the container reports healthy, and the setup
 # wait above only blocks on Prometheus having scraped weir. Nothing waited on
