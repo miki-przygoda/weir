@@ -230,6 +230,11 @@ Nothing yet.
   in the drain's WARN retry log, the sink failure status, the health
   probe's error or the startup error for a non-http(s) URL such as a
   `tcp://` native-protocol DSN.
+- The ClickHouse sink's 3xx dead-letter reason now names only the
+  `scheme://host[:port]` of the response's `Location`, as the HTTP sink's
+  does. A redirector that echoed the request (an http-to-https proxy
+  answering `301 https://$host$request_uri`) put the `?password=` query
+  auth, or a `user:pass@`, into the ERROR log and the dead-letter store.
 - A failed timed seal (`segment_max_age` or `segment_max_lifetime`) no longer
   logs that the segment "stays active" and will be retried: it was already
   retired, so its acked records were silently stranded in the unsealed `.wab`
