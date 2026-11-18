@@ -260,9 +260,13 @@ Nothing yet.
   name; anything else is logged as a WARN and the daemon logs at `info`. A
   single target is still written `target=level`.
 - The monitoring smoke test's "drain state = Draining" check now fails when a
-  non-chaos instance's drain has stopped or its `weir_drain_state` series is
-  missing: it summed only the `retrying_transient` and
-  `blocked_dead_letter_full` states, so a drain that had exited passed.
+  non-chaos instance that Prometheus scrapes has a stopped drain or no
+  `weir_drain_state` series, or when fewer instances are up than the run
+  started (the core `weir`, plus four with `--levels`): it summed only the
+  `retrying_transient` and `blocked_dead_letter_full` states, so a drain that
+  had exited passed. The check counts instances from `up`, not from the drain
+  series under test, and lives in `deploy/monitoring/drain-check.sh` so the
+  `deploy` tests run it against a stub Prometheus.
 - `deploy/smoke-test.sh` now fails when `weir-server` exits non-zero or
   crashes on SIGTERM, and prints its log: the shutdown step only polled
   `kill -0` and never read the exit status, so a failed shutdown passed as
