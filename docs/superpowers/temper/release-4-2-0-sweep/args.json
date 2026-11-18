@@ -23,6 +23,31 @@
   "build_rule": "Build and test only in this box, through the gates: `bash .temper/gate-quick.sh`, `bash .temper/gate-full.sh`, or single cargo runs through `bash .temper/gate-run.sh <cargo args>`. There is no jobq on beast (ops/jobq.md): the box's memory cap (10 GiB) is the limit; at most 2 heavy builds at once, and a workflow at most 2 building agents. Run every gate in the foreground (a session waiting on a background job can end its turn), with a Bash timeout of 600000 ms; if a gate outlasts one call, start it with `setsid nohup bash .temper/gate-full.sh >/dev/null 2>&1 </dev/null &` and poll `/build/weir-gate/logs/<worktree>/latest-<gate>/summary.txt` in the foreground until its last line is `GATE <gate> rc=N`. Never set CARGO_TARGET_DIR or make another target dir: the slots are the build dirs. No act, no 1.88 toolchain, no cross targets here (owner, 13 Nov: do not install act): judge the full gate on its native steps; msrv, act, windows, darwin and aarch64 are GitHub CI.s. Say which steps did not run and why. Never write the CI-skip token in a commit message. Commits carry only the `Temper-Task` trailer: no Co-Authored-By, Claude-Session or \"Generated with\" lines. Never print a secret or token. Push only `cc4/*` branches to gitolite. Reviewers read; only verifiers build, and at most 2 agents build at once in this box.",
   "sweeps": 2,
   "gate_slots": 1,
-  "part": "sweep",
-  "attempt": 0
+  "part": "fix",
+  "attempt": 0,
+  "selected": [
+    {
+      "id": "test-strength-and-docs-01",
+      "lens": "test strength and docs",
+      "file": "deploy/monitoring/smoke-test.sh",
+      "line": 138,
+      "summary": "The 'drain state = Draining' check takes its expected instance count from the weir_drain_state series that exist. So a non-core instance whose series is missing is left out of both sides of the comparison, and the check still passes.",
+      "input": "Run the smoke test with the levels profile up (jobs weir and weir-levels: weir-min/med/high/max). One level instance, for example weir-med, exports no weir_drain_state series: its family is gone, or it is not scraped yet. The level instances' up check only runs later, at lines 188-193. The core weir instance is draining.",
+      "wrong_result": "drain_instances = count(weir_drain_state{job!=\"weir-chaos\",state=\"draining\"}) counts only the instances that still export the series, so it equals drain_draining. The check prints PASS. CHANGELOG line 262 says the check now fails when a non-chaos instance's weir_drain_state series is missing, but that only holds for the core job=\"weir\" instance. Fix: compare against count(up{job!=\"weir-chaos\"}) (or an equivalent per-instance count) rather than a count of the series under test.",
+      "severity": "important",
+      "kind": "fix"
+    },
+    {
+      "id": "test-strength-and-docs-02",
+      "lens": "test strength and docs",
+      "file": "README.md",
+      "line": 191,
+      "summary": "The README rewritten on this branch still names 4.1 as the current release, while the workspace is version 4.2.0. install.md says the same: 'All ten crates are on crates.io (4.1.0 as of ...)'.",
+      "input": "A reader reads README.md 'Project status', or docs/getting-started/install.md line 269, on the 4.2.0 release branch (Cargo.toml workspace version = \"4.2.0\").",
+      "wrong_result": "The README says 'weir is stable at 4.1' and install.md says the published crates are 4.1.0. The release they ship with is 4.2.0, which adds ClientError::TooManyRecords and changes how RecordId is derived.",
+      "severity": "minor",
+      "kind": "fix"
+    }
+  ],
+  "answers": {}
 }

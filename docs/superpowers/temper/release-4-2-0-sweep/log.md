@@ -47,3 +47,8 @@ The security, failure paths and lifecycle, and durability and ack semantics lens
 The reviewers built nothing. Verifier 01 ran a shell stub with no cargo build.
 
 Throwaway worktrees remain under `.temper/worktrees/release-4-2-0-sweep/tmp/` (6, detached at c408b22). They are left for `temper:cleanup`, as the run skill says, and were not removed by hand.
+
+## 4b (part fix)
+
+- Selected by the owner (18 Nov): both verified findings, test-strength-and-docs-01 (important) and test-strength-and-docs-02 (minor). Nothing goes to open items from 4a.
+- 2026-11-18 launch stabilise part fix attempt 0 (gate_slots 1, done [])
