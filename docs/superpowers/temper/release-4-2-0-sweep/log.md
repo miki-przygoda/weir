@@ -10,3 +10,7 @@ changes since 4.1.0, before the v4.2.0 tag. The owner picks what to fix from the
 - Already decided, not defects: D10 as a hard error; the coordinate dedup key and RecordId format
   change; the reverted attest gap fixes (attest-disposal-log); `PayloadTooLarge` count-as-bytes;
   a 2,048-record batch passing the client cap but Nacked by a default daemon.
+
+## Runs
+
+- 2026-11-18 launch stabilise part sweep attempt 0, run wf_30107a5c-7d1 (lenses: security; failure paths and lifecycle; test strength and docs; durability and ack semantics)
