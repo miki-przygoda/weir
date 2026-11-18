@@ -1,0 +1,28 @@
+{
+  "epic": "release-4-2-0-sweep",
+  "repo": "/home/claude/weir",
+  "branch": "sweep/4.2.0",
+  "base": "v4.1.0",
+  "default_branch": "main",
+  "log": "docs/superpowers/temper/release-4-2-0-sweep/log.md",
+  "host": {
+    "kind": "local"
+  },
+  "gates": {
+    "quick": "bash \"$(git rev-parse --show-toplevel)/.temper/gate-quick.sh\"",
+    "full": "bash \"$(git rev-parse --show-toplevel)/.temper/gate-full.sh\""
+  },
+  "done": [],
+  "lenses": [
+    "security",
+    "failure paths and lifecycle",
+    "test strength and docs",
+    "durability and ack semantics"
+  ],
+  "severity_notes": "- An acked `Durable` record that is not on disk, or does not replay after a crash, is severe.\n- A change to the on-disk WAB format, the wire protocol or a published crate's public API without a version decision is severe: it needs the owner.\n- A panic reachable from a client frame, a stored segment or a config value is critical.\n- A secret reaching a log, a `Debug` string, argv or `/status` is critical.\n- Anything that loosens a security default is severe, and is never fixed without the owner.",
+  "build_rule": "Build and test only in this box, through the gates: `bash .temper/gate-quick.sh`, `bash .temper/gate-full.sh`, or single cargo runs through `bash .temper/gate-run.sh <cargo args>`. There is no jobq on beast (ops/jobq.md): the box's memory cap (10 GiB) is the limit; at most 2 heavy builds at once, and a workflow at most 2 building agents. Run every gate in the foreground (a session waiting on a background job can end its turn), with a Bash timeout of 600000 ms; if a gate outlasts one call, start it with `setsid nohup bash .temper/gate-full.sh >/dev/null 2>&1 </dev/null &` and poll `/build/weir-gate/logs/<worktree>/latest-<gate>/summary.txt` in the foreground until its last line is `GATE <gate> rc=N`. Never set CARGO_TARGET_DIR or make another target dir: the slots are the build dirs. No act, no 1.88 toolchain, no cross targets here (owner, 13 Nov: do not install act): judge the full gate on its native steps; msrv, act, windows, darwin and aarch64 are GitHub CI.s. Say which steps did not run and why. Never write the CI-skip token in a commit message. Commits carry only the `Temper-Task` trailer: no Co-Authored-By, Claude-Session or \"Generated with\" lines. Never print a secret or token. Push only `cc4/*` branches to gitolite. Reviewers read; only verifiers build, and at most 2 agents build at once in this box.",
+  "sweeps": 2,
+  "gate_slots": 1,
+  "part": "sweep",
+  "attempt": 0
+}
