@@ -90,3 +90,7 @@ Stage 4 is stable (2026-11-18). Throwaway worktrees from both runs remain under 
 ### Owner-directed fix (2026-11-18, outside stage 4)
 
 - **second:security-01**: 32398f4 `fix(clickhouse): report only the origin of a 3xx Location`. The owner decided (18 Nov) to fix it before v4.2.0, by hand, with no new sweep. The 3xx dead-letter reason now carries `url_origin` of the `Location` (resolved against the request URL when relative), as the HTTP sink's does; the S29 sanitize and 500-char cap stay. `url_origin` over `redact_password`: it drops userinfo, path and query whole, where the query-key denylist misses a key it doesn't name. New test `commit_redirect_never_echoes_location_credentials` (`?password=`, `user:pass@`, relative `?quota_key=`): red before, green after. Other sinks: HTTP already origin-only; S3 never reads `Location`; Postgres/MySQL have no downstream URL. CHANGELOG 4.2.0 `### Fixed` line added.
+
+### Released and cleaned up (2026-11-18)
+
+Merged as PR #80 (5ad6591); the ten crates published at 4.2.0 and `v4.2.0` tagged on 5ad6591, the release workflow green (4 binaries). `temper:cleanup` removed the 18 throwaway worktrees and the local `sweep/4.2.0` branch (all its commits in main). Open items: the five second-sweep findings above, on Workbench as one P2 item.
