@@ -15,7 +15,14 @@ protocol** below.
 
 ## [Unreleased]
 
-Nothing yet.
+### Security
+
+- **`url` bumped 2.5.8 -> 2.5.9** (lockfile only; `form_urlencoded` 1.2.2 ->
+  1.2.3 comes with it) for
+  [RUSTSEC-2026-0592](https://rustsec.org/advisories/RUSTSEC-2026-0592): a
+  stack overflow in `Url::origin()` on nested `blob:` URLs. Not reached by
+  Weir's code as far as checked: Weir has no direct `url` dependency and
+  never calls `Url::origin()`.
 
 ## [4.2.0] - 2026-11-14
 
