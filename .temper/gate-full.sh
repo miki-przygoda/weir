@@ -78,6 +78,10 @@ else
     step "act-${1%.yml}-$2" "cd '$clone' && $ACT --pull=false --rm -W .github/workflows/$1 -j $2 --env CARGO_BUILD_JOBS=$JOBS $extra"
     if [ -n "$extra" ]; then
       # The smoke job's fixed-name container outlives the job, pass or fail.
+      # Two full gates run in parallel on one Docker host would collide on
+      # that fixed name (each removes the other's container). Left as is on
+      # purpose: one act-capable box runs Weir's full gate today (owner,
+      # 27 Nov 2026); give the container a per-run name if that changes.
       docker rm -f weir-smoke >/dev/null 2>&1
       docker run --rm -v "$shared:/s" alpine sh -c 'rm -rf /s/* /s/.[!.]*' >/dev/null 2>&1; rmdir "$shared" 2>/dev/null
     fi
