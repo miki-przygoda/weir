@@ -2594,13 +2594,30 @@ mod tests {
         use crate::wab::segment::sync_hook;
         let dir = tmp_dir("recover_fsyncs_wab_dir");
         let metrics = Arc::new(Metrics::new().0);
+        // The order check below means something only if `recover` creates the
+        // shard dirs: leftovers from an earlier run would satisfy it.
+        for shard in ["shard_00", "shard_01"] {
+            assert!(
+                !dir.join(shard).exists(),
+                "scratch dir must start without {shard}"
+            );
+        }
 
         sync_hook::fail(&dir, libc::EIO, 0);
         recover(&dir, 2, &metrics).unwrap();
-        assert!(
-            sync_hook::calls(&dir) >= 1,
-            "recover must fsync wab_dir after creating the shard dirs"
-        );
+        // The order is the point: a sync of `dir` taken before the shard dirs
+        // exist makes nothing durable. On this fresh dir the first sync must
+        // already see both entries.
+        let seen = sync_hook::listings(&dir);
+        let first = seen
+            .first()
+            .expect("recover must fsync wab_dir after creating the shard dirs");
+        for shard in ["shard_00", "shard_01"] {
+            assert!(
+                first.iter().any(|n| n == shard),
+                "recover fsynced wab_dir before creating {shard}: {first:?}"
+            );
+        }
 
         sync_hook::fail(&dir, libc::EIO, 1);
         let err = recover(&dir, 2, &metrics).unwrap_err();

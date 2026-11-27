@@ -22,51 +22,10 @@ SLOTS=${WEIR_GATE_SLOTS:-$gate_base/slot-a}
 JOBS=${WEIR_GATE_JOBS:-4}
 STEP_TIMEOUT=${WEIR_GATE_STEP_TIMEOUT:-3600}
 
-T=
-echo "gate: waiting for a gate slot" >&2
-while [ -z "$T" ]; do
-  for s in $SLOTS; do
-    mkdir -p "$s" || continue
-    exec 9>"$s/gate.lock"
-    if flock -n 9; then T=$s; break; fi
-    exec 9>&-
-  done
-  [ -n "$T" ] || sleep 10
-done
-echo "gate: slot $T" >&2
-
-free_gb=$(df -Pk "$T" | awk 'NR==2 { print int($4 / 1048576) }')
-if [ "$free_gb" -lt "${WEIR_GATE_MIN_FREE_GB:-20}" ]; then
-  echo "gate: only ${free_gb} GB free under $T (floor ${WEIR_GATE_MIN_FREE_GB:-20} GB); clear your own leftovers first" >&2
-  exit 1
-fi
-
-export CARGO_TARGET_DIR="$T/target" CARGO_BUILD_JOBS=$JOBS RUST_TEST_THREADS=$JOBS CARGO_INCREMENTAL=0
-export CARGO_PROFILE_DEV_DEBUG=line-tables-only CARGO_TERM_COLOR=never PYTHONDONTWRITEBYTECODE=1
-if command -v sccache >/dev/null 2>&1; then
-  export RUSTC_WRAPPER=sccache SCCACHE_DIR=${SCCACHE_DIR:-$gate_base/sccache} SCCACHE_CACHE_SIZE=${SCCACHE_CACHE_SIZE:-25G}
-fi
-# mold links when installed. Exported so the per-step `bash -c` sees it.
-if command -v mold >/dev/null 2>&1; then cargo() { mold -run cargo "$@"; }; export -f cargo; fi
-
-# Tests' scratch dir (CARGO_TARGET_TMPDIR is <target dir>/tmp) lives under
-# WEIR_GATE_TMP, one per slot, so tests of two gates never share one.
-tmp_root=${WEIR_GATE_TMP:-$gate_base/tmp}/$(basename "$T")
-mkdir -p "$CARGO_TARGET_DIR" "$tmp_root/cargo"
-[ -L "$CARGO_TARGET_DIR/tmp" ] || { rm -rf "$CARGO_TARGET_DIR/tmp"; ln -s "$tmp_root/cargo" "$CARGO_TARGET_DIR/tmp"; }
-
-# Cargo calls a workspace crate fresh when its sources are older than its last
-# build, from any worktree, so a slot last used by another worktree could test
-# that worktree's code. The slot records the worktree that last built in it, and
-# this worktree's tracked sources are touched only when that changed.
-stamp="$T/.built-from"
-if [ "$(cat "$stamp" 2>/dev/null)" != "$top" ]; then
-  git -C "$top" ls-files -z -- crates Cargo.toml Cargo.lock | (cd "$top" && xargs -0 touch)
-  printf '%s\n' "$top" > "$stamp"
-fi
-
 # Logs: <logs>/<worktree>/<gate>-<UTC>/, with <logs>/<worktree>/latest-<gate>
-# pointing at the newest run.
+# pointing at the newest run. Set up before the slot wait and the disk check, so
+# a run that is still waiting, or that stops on the disk floor, never leaves
+# latest-<gate> showing the previous run's verdict.
 gate_logs=${WEIR_GATE_LOGS:-$gate_base/logs}/$(basename "$top")
 OUT="$gate_logs/$GATE_NAME-$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$OUT"
@@ -96,3 +55,50 @@ finish() {
   echo "GATE $GATE_NAME rc=$rc ($FAILED failed)" | tee -a "$OUT/summary.txt"
   exit "$rc"
 }
+
+T=
+echo "gate: waiting for a gate slot" | tee -a "$OUT/summary.txt" >&2
+while [ -z "$T" ]; do
+  for s in $SLOTS; do
+    mkdir -p "$s" || continue
+    exec 9>"$s/gate.lock"
+    if flock -n 9; then T=$s; break; fi
+    exec 9>&-
+  done
+  [ -n "$T" ] || sleep 10
+done
+# The header above is written before the wait, so name the commit actually
+# tested once the slot is ours: HEAD may have moved while this run waited.
+echo "gate: slot $T at $(git -C "$top" rev-parse --short HEAD)" | tee -a "$OUT/summary.txt" >&2
+
+free_gb=$(df -Pk "$T" | awk 'NR==2 { print int($4 / 1048576) }')
+if [ "$free_gb" -lt "${WEIR_GATE_MIN_FREE_GB:-20}" ]; then
+  echo "gate: only ${free_gb} GB free under $T (floor ${WEIR_GATE_MIN_FREE_GB:-20} GB); clear your own leftovers first" | tee -a "$OUT/summary.txt" >&2
+  FAILED=1
+  finish
+fi
+
+export CARGO_TARGET_DIR="$T/target" CARGO_BUILD_JOBS=$JOBS RUST_TEST_THREADS=$JOBS CARGO_INCREMENTAL=0
+export CARGO_PROFILE_DEV_DEBUG=line-tables-only CARGO_TERM_COLOR=never PYTHONDONTWRITEBYTECODE=1
+if command -v sccache >/dev/null 2>&1; then
+  export RUSTC_WRAPPER=sccache SCCACHE_DIR=${SCCACHE_DIR:-$gate_base/sccache} SCCACHE_CACHE_SIZE=${SCCACHE_CACHE_SIZE:-25G}
+fi
+# mold links when installed. Exported so the per-step `bash -c` sees it.
+if command -v mold >/dev/null 2>&1; then cargo() { mold -run cargo "$@"; }; export -f cargo; fi
+
+# Tests' scratch dir (CARGO_TARGET_TMPDIR is <target dir>/tmp) lives under
+# WEIR_GATE_TMP, one per slot, so tests of two gates never share one.
+tmp_root=${WEIR_GATE_TMP:-$gate_base/tmp}/$(basename "$T")
+mkdir -p "$CARGO_TARGET_DIR" "$tmp_root/cargo"
+[ -L "$CARGO_TARGET_DIR/tmp" ] || { rm -rf "$CARGO_TARGET_DIR/tmp"; ln -s "$tmp_root/cargo" "$CARGO_TARGET_DIR/tmp"; }
+
+# Cargo calls a workspace crate fresh when its sources are older than its last
+# build, from any worktree, so a slot last used by another worktree could test
+# that worktree's code. The slot records the worktree that last built in it, and
+# this worktree's tracked sources are touched only when that changed.
+stamp="$T/.built-from"
+if [ "$(cat "$stamp" 2>/dev/null)" != "$top" ]; then
+  git -C "$top" ls-files -z -- crates Cargo.toml Cargo.lock | (cd "$top" && xargs -0 touch)
+  printf '%s\n' "$top" > "$stamp"
+fi
+

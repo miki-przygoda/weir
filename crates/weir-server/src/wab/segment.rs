@@ -1024,6 +1024,10 @@ pub(crate) mod sync_hook {
         errno: i32,
         fail_left: u32,
         calls: u64,
+        /// The entry names of `path`, sorted, as each sync saw them (empty
+        /// when `path` is not a listable directory): what a directory fsync
+        /// made durable, so a test can check it ran after an entry existed.
+        seen: Vec<Vec<String>>,
     }
 
     static HOOKS: Mutex<Option<HashMap<PathBuf, Entry>>> = Mutex::new(None);
@@ -1043,6 +1047,7 @@ pub(crate) mod sync_hook {
                     errno,
                     fail_left: times,
                     calls: 0,
+                    seen: Vec::new(),
                 },
             )
         });
@@ -1062,6 +1067,12 @@ pub(crate) mod sync_hook {
         with(|m| m.get(path).map_or(0, |e| e.calls))
     }
 
+    /// For each sync of `path` since it was registered, the sorted entry
+    /// names the directory held at that sync (failed syncs included).
+    pub(crate) fn listings(path: &Path) -> Vec<Vec<String>> {
+        with(|m| m.get(path).map_or_else(Vec::new, |e| e.seen.clone()))
+    }
+
     /// Stops tracking `path`.
     pub(crate) fn forget(path: &Path) {
         with(|m| m.remove(path));
@@ -1071,6 +1082,15 @@ pub(crate) mod sync_hook {
         with(|m| {
             let e = m.get_mut(path)?;
             e.calls += 1;
+            let mut names: Vec<String> = std::fs::read_dir(path)
+                .map(|rd| {
+                    rd.filter_map(Result::ok)
+                        .map(|d| d.file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            names.sort();
+            e.seen.push(names);
             if e.fail_left == 0 {
                 return None;
             }
