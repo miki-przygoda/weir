@@ -2594,6 +2594,14 @@ mod tests {
         use crate::wab::segment::sync_hook;
         let dir = tmp_dir("recover_fsyncs_wab_dir");
         let metrics = Arc::new(Metrics::new().0);
+        // The order check below means something only if `recover` creates the
+        // shard dirs: leftovers from an earlier run would satisfy it.
+        for shard in ["shard_00", "shard_01"] {
+            assert!(
+                !dir.join(shard).exists(),
+                "scratch dir must start without {shard}"
+            );
+        }
 
         sync_hook::fail(&dir, libc::EIO, 0);
         recover(&dir, 2, &metrics).unwrap();

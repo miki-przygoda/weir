@@ -1486,6 +1486,12 @@ mod tests {
         crate::testutil::mkdir_p(&shard);
         let seg = shard.join("seg_00000001.wab");
         fs::write(&seg, b"corrupt").unwrap();
+        // The order check below means something only if this call creates
+        // `quarantine/`: a leftover from an earlier run would satisfy it.
+        assert!(
+            !wab_dir.join("quarantine").exists(),
+            "scratch dir must start without quarantine/"
+        );
 
         sync_hook::fail(&wab_dir, libc::EIO, 1);
         let err = quarantine(&seg, &wab_dir, "test").unwrap_err();
