@@ -702,4 +702,11 @@ fn the_drain_check_fails_when_the_core_instance_is_not_draining() {
     // No weir_drain_state family at all: promq reads the empty sums as 0.
     let (ok, out) = drain_check(1, "1", "0", "0");
     assert!(!ok, "a missing family passed:\n{out}");
+    // Only the core clause can fail this one: a core-only run with the four
+    // level containers left up from an earlier --levels run, all four
+    // draining, and the core `weir` instance down. Without the core clause
+    // the check reads 4/4 draining of 1 expected and passes.
+    let (ok, out) = drain_check(1, "4", "4", "0");
+    assert!(!ok, "the core instance down passed:\n{out}");
+    assert!(out.contains("4/4 draining, 1 expected"), "{out}");
 }
