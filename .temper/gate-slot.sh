@@ -67,7 +67,9 @@ while [ -z "$T" ]; do
   done
   [ -n "$T" ] || sleep 10
 done
-echo "gate: slot $T" | tee -a "$OUT/summary.txt" >&2
+# The header above is written before the wait, so name the commit actually
+# tested once the slot is ours: HEAD may have moved while this run waited.
+echo "gate: slot $T at $(git -C "$top" rev-parse --short HEAD)" | tee -a "$OUT/summary.txt" >&2
 
 free_gb=$(df -Pk "$T" | awk 'NR==2 { print int($4 / 1048576) }')
 if [ "$free_gb" -lt "${WEIR_GATE_MIN_FREE_GB:-20}" ]; then
