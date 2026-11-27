@@ -1453,6 +1453,14 @@ mod tests {
             sync_hook::calls(&dir) >= 1,
             "recovery must fsync wab_dir after creating quarantine/"
         );
+        // A sync of `dir` before `quarantine/` exists makes nothing durable:
+        // every sync here must already see the entry.
+        for seen in sync_hook::listings(&dir) {
+            assert!(
+                seen.iter().any(|n| n == "quarantine"),
+                "recovery fsynced wab_dir before creating quarantine/: {seen:?}"
+            );
+        }
         assert_eq!(
             fs::read(&path).unwrap(),
             bytes,
@@ -1485,6 +1493,14 @@ mod tests {
         assert!(
             seg.exists(),
             "a failed fsync must leave the segment in place"
+        );
+        // The order is the point: `quarantine/` did not exist before this
+        // call, so a wab_dir sync taken before creating it would see no entry.
+        let seen = sync_hook::listings(&wab_dir);
+        assert!(
+            seen.first()
+                .is_some_and(|l| l.iter().any(|n| n == "quarantine")),
+            "quarantine fsynced wab_dir before creating quarantine/: {seen:?}"
         );
 
         quarantine(&seg, &wab_dir, "test").unwrap();
